@@ -2,7 +2,11 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="theme-color" content="#05080c" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 <title>Planelands · 航天飞机自主返场</title>
 <link rel="stylesheet" href="./css/style.css" />
 <script type="importmap">
@@ -31,6 +35,13 @@
     <span class="pill" id="pill-guid"><b>制导</b><em>—</em></span>
     <span class="pill" id="pill-time"><b>T+</b><em>0.0 s</em></span>
     <span class="pill" id="pill-fps"><b>FPS</b><em>—</em></span>
+  </div>
+  <!-- mobile: always-visible key readouts (mirrored from the flight panel) -->
+  <div id="mstrip">
+    <div><label>高度</label><b data-m="alt">—</b><small>m</small></div>
+    <div><label>空速</label><b data-m="keas">—</b><small>kt</small></div>
+    <div><label>升降率</label><b data-m="vs">—</b><small>m/s</small></div>
+    <div><label>距跑道</label><b data-m="rng">—</b><small>km</small></div>
   </div>
 </header>
 
@@ -108,6 +119,7 @@
     <div class="row chk"><label><input type="checkbox" id="show-mpc" checked> 显示 MPC 预测时域</label></div>
     <div class="row chk"><label><input type="checkbox" id="show-appr" checked> 显示进近下滑通道</label></div>
     <div class="row"><label>制导律</label><select id="guid-sel"><option value="scp_mpc">SCP + MPC</option><option value="hold_glide">占位滑翔</option></select><output></output></div>
+    <p class="note m-only">手机手动模式：左下摇杆控制俯仰 / 滚转（下拉 = 抬头），右侧按钮控制偏航、减速板、起落架、减速伞和刹车。</p>
     <p class="note">AUTO = <b>SCP</b> 全程航迹规划 + <b>MPC</b> 滚动跟踪 → 电传飞控。手动：W/S 俯仰 · A/D 滚转 · Q/E 偏航 · Z/X 减速板 · G 起落架 · B 刹车 · C 减速伞。</p>
   </section>
   <section data-pane="wx">
@@ -149,13 +161,40 @@
   </section>
 </aside>
 
-<canvas id="vsit" width="300" height="160" class="glass" title="垂直剖面 VERT SIT：高度 – 待飞距离"></canvas>
-<canvas id="map" width="300" height="240" class="glass"></canvas>
+<div id="navpanel">
+  <h3 class="m-only">垂直剖面 <span class="dim">VERT SIT</span></h3>
+  <canvas id="vsit" width="300" height="160" class="glass" title="垂直剖面 VERT SIT：高度 – 待飞距离"></canvas>
+  <h3 class="m-only">导航地图 <span class="dim">MAP</span></h3>
+  <canvas id="map" width="300" height="240" class="glass"></canvas>
+</div>
 
 <footer id="camerabar">
+  <h3 class="m-only">视角 <span class="dim">CAMERA</span></h3>
   <div class="cams" id="cams"></div>
   <div class="hints">鼠标拖动：环视 · 滚轮：缩放 · 1–7：切换视角 · P：暂停 · R：重新放置 · H：隐藏界面</div>
+  <div class="hints-touch">单指拖动：环视 · 双指捏合：缩放</div>
 </footer>
+
+<!-- mobile: manual flight controls (shown in MANUAL mode) -->
+<div id="touchctl">
+  <div id="stick" title="拖动：俯仰 / 滚转（下拉 = 抬头）"><i></i></div>
+  <div class="tc-btns">
+    <button data-hold="yawL">◀ 偏航</button><button data-hold="yawR">偏航 ▶</button>
+    <div class="tc-sb"><span>减速板</span><div><i id="tc-sb"></i></div></div>
+    <button data-hold="sbDn">减速板 −</button><button data-hold="sbUp">减速板 ＋</button>
+    <button data-tog="gear" id="tc-gear">起落架</button><button data-tog="chute" id="tc-chute">减速伞</button>
+    <button data-hold="brake" class="wide">刹车（按住）</button>
+  </div>
+</div>
+
+<!-- mobile: bottom dock / landscape side rail -->
+<nav id="dock">
+  <button data-sheet="flight"><svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg><span>数据</span></button>
+  <button data-sheet="navpanel"><svg viewBox="0 0 24 24"><path d="M9 4 3 6v14l6-2 6 2 6-2V4l-6 2-6-2zM9 4v14M15 6v14"/></svg><span>地图</span></button>
+  <button id="dock-pause" class="mid"><svg viewBox="0 0 24 24"><g class="i-pause"><path d="M8 5v14M16 5v14"/></g><g class="i-play"><path d="M7 4.5v15l13-7.5z"/></g></svg><span class="l-pause">暂停</span><span class="l-play">继续</span></button>
+  <button data-sheet="camerabar"><svg viewBox="0 0 24 24"><rect x="2.5" y="6" width="13" height="12" rx="2"/><path d="m15.5 10.5 6-3.5v10l-6-3.5"/></svg><span>视角</span></button>
+  <button data-sheet="settings"><svg viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg><span>设置</span></button>
+</nav>
 
 <div id="toasts"></div>
 

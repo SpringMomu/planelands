@@ -29,10 +29,34 @@ export class CameraRig {
 
   _initInput() {
     let drag = false, lx = 0, ly = 0, button = 0;
+    // touch: one finger orbits / looks, two fingers pinch-zoom (same effect as the mouse wheel)
+    const pts = new Map();
+    let pinchD = 0;
+    const spread = () => { const [a, b] = [...pts.values()]; return Math.hypot(a.x - b.x, a.y - b.y); };
     this.dom.addEventListener('contextmenu', (e) => e.preventDefault());
-    this.dom.addEventListener('pointerdown', (e) => { drag = true; lx = e.clientX; ly = e.clientY; button = e.button; this.dom.setPointerCapture(e.pointerId); });
-    this.dom.addEventListener('pointerup', (e) => { drag = false; this.dom.releasePointerCapture(e.pointerId); });
+    this.dom.addEventListener('pointerdown', (e) => {
+      pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      this.dom.setPointerCapture(e.pointerId);
+      if (pts.size === 2) { drag = false; pinchD = spread(); return; }
+      if (pts.size > 2) return;
+      drag = true; lx = e.clientX; ly = e.clientY; button = e.button;
+    });
+    const up = (e) => {
+      pts.delete(e.pointerId);
+      // after a pinch, the remaining finger does not start orbiting (avoids a jump)
+      drag = false; if (pts.size < 2) pinchD = 0;
+      if (this.dom.hasPointerCapture(e.pointerId)) this.dom.releasePointerCapture(e.pointerId);
+    };
+    this.dom.addEventListener('pointerup', up);
+    this.dom.addEventListener('pointercancel', up);
     this.dom.addEventListener('pointermove', (e) => {
+      if (pts.has(e.pointerId)) pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (pts.size === 2) {
+        const d = spread();
+        if (pinchD > 0 && d > 0) this._zoom(pinchD / d);
+        pinchD = d;
+        return;
+      }
       if (!drag) return;
       const dx = (e.clientX - lx) / this.dom.clientHeight, dy = (e.clientY - ly) / this.dom.clientHeight;
       lx = e.clientX; ly = e.clientY;
@@ -43,14 +67,18 @@ export class CameraRig {
     });
     this.dom.addEventListener('wheel', (e) => {
       e.preventDefault();
-      const k = Math.exp(e.deltaY * 0.0012);
-      if (this.mode === 'chase') this.dist = THREE.MathUtils.clamp(this.dist * k, 22, 6000);
-      else if (this.mode === 'overview') this.dist = THREE.MathUtils.clamp(this.dist * k, 2000, 400000);
-      else if (this.mode === 'free') this.free.speed = THREE.MathUtils.clamp(this.free.speed / k, 5, 20000);
-      else this.fov = THREE.MathUtils.clamp(this.fov * k, 0.5, 75);
+      this._zoom(Math.exp(e.deltaY * 0.0012));
     }, { passive: false });
     window.addEventListener('keydown', (e) => { if (!e.target.closest || !e.target.closest('input,select,textarea')) this.keys.add(e.code); });
     window.addEventListener('keyup', (e) => this.keys.delete(e.code));
+  }
+
+  /** k > 1 zooms out, k < 1 zooms in (mouse wheel / pinch) */
+  _zoom(k) {
+    if (this.mode === 'chase') this.dist = THREE.MathUtils.clamp(this.dist * k, 22, 6000);
+    else if (this.mode === 'overview') this.dist = THREE.MathUtils.clamp(this.dist * k, 2000, 400000);
+    else if (this.mode === 'free') this.free.speed = THREE.MathUtils.clamp(this.free.speed / k, 5, 20000);
+    else this.fov = THREE.MathUtils.clamp(this.fov * k, 0.5, 75);
   }
 
   setMode(m) {

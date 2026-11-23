@@ -121,15 +121,11 @@ body.ui-hidden #vsit { display: none; }
   #settings { width: 280px; }
   .hints { display: none; }
 }
-@media (max-width: 760px) {
-  #flight, #map, #vsit { display: none; }
-  #settings { left: 12px; right: 12px; width: auto; top: auto; bottom: 64px; max-height: 40vh; }
-  .pills .pill:nth-child(n+4) { display: none; }
-}
 
 /* GNC panel */
 .phases { display: flex; gap: 3px; margin: 2px 0 8px; }
 .phases span { flex: 1; text-align: center; padding: 3px 0; font-size: 10.5px; color: var(--dim); background: rgba(255,255,255,0.04); border: 1px solid var(--line); border-radius: 4px; white-space: nowrap; }
+#flight .phases span { text-align: center; font-family: var(--sans); }
 .phases span.done { color: #9fb2c6; background: rgba(89,210,255,0.06); }
 .phases span.on { color: #fff; background: rgba(255,181,71,0.22); border-color: rgba(255,181,71,0.7); box-shadow: 0 0 10px rgba(255,181,71,0.25); }
 .ebar { position: relative; height: 6px; margin: 6px 0 8px; background: linear-gradient(90deg, rgba(89,140,255,0.25), rgba(255,255,255,0.06) 50%, rgba(255,120,80,0.25)); border-radius: 3px; }
@@ -151,3 +147,212 @@ select option { background: #10161e; }
 #flight .grid2 span { font-family: var(--mono); color: var(--dim); font-size: 10.5px; white-space: nowrap; }
 #flight .grid2 span b { color: var(--text); font-weight: 500; font-size: 11.5px; }
 #flight h3:not(:first-child) { margin-top: 10px; }
+
+/* ======================================================================
+   Mobile layout
+   portrait  : top status + key readouts, bottom dock, panels as bottom sheets
+   landscape : dock becomes a right-side rail, panels open as a side drawer
+   ====================================================================== */
+#mstrip, #dock, #touchctl, .hints-touch, .m-only { display: none; }
+
+@media (max-width: 760px), (pointer: coarse) and (max-height: 540px) {
+  :root {
+    --sl: calc(env(safe-area-inset-left, 0px) + 8px);
+    --sr: calc(env(safe-area-inset-right, 0px) + 8px);
+    --st: calc(env(safe-area-inset-top, 0px) + 8px);
+    --sb: calc(env(safe-area-inset-bottom, 0px) + 8px);
+    --dock-h: 60px;
+    --rail-w: 64px;
+    --sheet-bg: rgba(10, 15, 22, 0.88);
+  }
+  html, body { font-size: 13px; -webkit-tap-highlight-color: transparent; }
+  button, select, label { touch-action: manipulation; }
+  .hints { display: none; }
+  .m-only { display: block; }
+  body.ui-hidden #dock, body.ui-hidden #touchctl { display: none; }
+
+  /* loading */
+  .ld-title { font-size: 24px; letter-spacing: 0.26em; }
+  .ld-sub { letter-spacing: 0.12em; }
+
+  /* ---- top: status pills + key readouts */
+  #topbar { top: var(--st); left: var(--sl); right: var(--sr); flex-wrap: wrap; gap: 6px; }
+  .brand { display: none; }
+  .pills { flex: 1 1 100%; flex-wrap: nowrap; gap: 5px; min-width: 0; }
+  .pill { padding: 6px 10px; font-size: 11.5px; min-width: 0; }
+  .pill em { overflow: hidden; text-overflow: ellipsis; }
+  #pill-status, #pill-mode, #pill-fps, #pill-link b, #pill-guid b { display: none; }
+  #pill-link, #pill-time { flex: none; }
+  #pill-time { margin-left: auto; }
+  #mstrip {
+    display: grid; grid-template-columns: repeat(4, 1fr); flex: 1 1 100%;
+    padding: 7px 2px; background: var(--glass-strong); border: 1px solid var(--line); border-radius: 12px;
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+  }
+  #mstrip div { text-align: center; min-width: 0; white-space: nowrap; }
+  #mstrip div + div { border-left: 1px solid var(--line); }
+  #mstrip label { display: block; font-size: 10px; color: var(--dim); letter-spacing: 0.06em; margin-bottom: 1px; }
+  #mstrip b { font: 500 15px/1.2 var(--mono); color: var(--text); }
+  #mstrip small { font-size: 10px; color: var(--dim); margin-left: 2px; }
+
+  #toasts { top: calc(var(--st) + 96px); width: calc(100vw - 24px); }
+  .toast { max-width: 100%; font-size: 12.5px; text-align: center; }
+
+  /* ---- sheets: flight data / map / camera / settings */
+  #flight, #settings, #navpanel, #camerabar {
+    position: fixed; display: block; z-index: 7;
+    left: var(--sl); right: var(--sr); top: auto; width: auto; min-height: 0;
+    bottom: calc(var(--sb) + var(--dock-h) + 8px);
+    max-height: min(62vh, calc(100vh - 210px));
+    max-height: min(62dvh, calc(100dvh - 210px));
+    overflow: auto; overscroll-behavior: contain; scrollbar-width: thin;
+    padding: 14px 14px 16px;
+    background: var(--sheet-bg); border: 1px solid var(--line); border-radius: 18px;
+    backdrop-filter: blur(18px) saturate(1.2); -webkit-backdrop-filter: blur(18px) saturate(1.2);
+    box-shadow: 0 -8px 40px rgba(0, 0, 0, 0.45);
+    opacity: 0; visibility: hidden; pointer-events: none; transform: translateY(16px);
+    transition: opacity .18s ease, transform .24s cubic-bezier(.2, .8, .2, 1), visibility 0s linear .24s;
+  }
+  body[data-sheet="flight"] #flight, body[data-sheet="settings"] #settings,
+  body[data-sheet="navpanel"] #navpanel, body[data-sheet="camerabar"] #camerabar {
+    opacity: 1; visibility: visible; pointer-events: auto; transform: none; transition-delay: 0s;
+  }
+  #navpanel h3, #camerabar h3 { margin: 2px 0 8px; font: 600 11px/1 var(--sans); letter-spacing: 0.14em; color: #fff; }
+  #navpanel h3:not(:first-child) { margin-top: 14px; }
+
+  /* flight data */
+  #flight .grid2 { gap: 2px 16px; }
+  #flight .grid2 div { padding: 3px 0; }
+  #flight .grid2 label, #flight label { font-size: 12px; }
+  #flight .grid2 span b, #flight span b { font-size: 13px; }
+  #flight .grid { gap: 5px 10px; }
+  .phases span { font-size: 11.5px; padding: 5px 0; }
+  .refact { font-size: 12px; }
+  .refact td, .refact th { padding: 3px 4px; }
+  .gstat { font-size: 11.5px; padding: 2px 0; }
+  #surf { max-width: 280px; margin: 4px auto 0; }
+
+  /* map + vertical situation */
+  #navpanel #vsit, #navpanel #map {
+    position: static; display: block; width: 100%; height: auto;
+    border-radius: 12px; box-shadow: none; backdrop-filter: none; -webkit-backdrop-filter: none;
+    background: rgba(0, 0, 0, 0.25);
+  }
+
+  /* camera picker */
+  #camerabar { transform: translateY(16px); }
+  .cams { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; padding: 0; background: none; border: 0; backdrop-filter: none; -webkit-backdrop-filter: none; }
+  .cams button { padding: 13px 4px; font-size: 13px; }
+  .cams button kbd { display: none; }
+  .hints-touch { display: block; margin-top: 12px; text-align: center; color: var(--dim); font-size: 11.5px; }
+
+  /* settings: sticky tabs, larger touch targets */
+  #settings .tabs { position: sticky; top: -14px; z-index: 1; margin: -14px -14px 6px; padding: 12px 14px 10px; background: #0c1118; border-bottom: 1px solid var(--line); }
+  button { font-size: 12.5px; padding: 10px 8px; border-radius: 9px; }
+  .tabs button { padding: 10px 4px; }
+  .row { grid-template-columns: 80px 1fr 58px; gap: 10px; margin: 12px 0; }
+  .row label { font-size: 12px; }
+  .row output { font-size: 12px; }
+  .row.seg label { width: 80px; flex: none; }
+  .row.chk { margin: 14px 0; }
+  .row.chk label { font-size: 12.5px; line-height: 1.4; }
+  input[type=checkbox] { width: 18px; height: 18px; flex: none; margin: 0; }
+  select { font-size: 13px; padding: 8px 8px; border-radius: 8px; }
+  .note { font-size: 12px; }
+  input[type=range] {
+    height: 28px; background: linear-gradient(rgba(255,255,255,0.16), rgba(255,255,255,0.16)) center / 100% 4px no-repeat;
+    touch-action: pan-y;
+  }
+  input[type=range]::-webkit-slider-thumb { width: 22px; height: 22px; border-width: 3px; box-shadow: 0 1px 6px rgba(0,0,0,0.5); }
+  input[type=range]::-moz-range-thumb { width: 18px; height: 18px; border-width: 3px; }
+
+  /* ---- dock */
+  #dock {
+    display: flex; position: fixed; z-index: 9; align-items: stretch; gap: 2px;
+    left: var(--sl); right: var(--sr); bottom: var(--sb); height: var(--dock-h); padding: 6px;
+    background: rgba(10, 15, 22, 0.84); border: 1px solid var(--line); border-radius: 20px;
+    backdrop-filter: blur(16px) saturate(1.2); -webkit-backdrop-filter: blur(16px) saturate(1.2);
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  }
+  #dock button {
+    flex: 1 1 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px;
+    padding: 0; border: 0; border-radius: 14px; background: transparent; color: var(--dim);
+    font: 500 10.5px/1 var(--sans); transition: color .15s, background .15s;
+  }
+  #dock button:active { background: rgba(255, 255, 255, 0.08); }
+  #dock button.on { color: #fff; background: rgba(89, 210, 255, 0.14); }
+  #dock button.on svg { stroke: var(--accent2); }
+  #dock svg { width: 21px; height: 21px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+  #dock .mid {
+    flex: 0 0 48px; width: 48px; height: 48px; align-self: center; margin: 0 4px; border-radius: 50%;
+    color: var(--accent); background: rgba(255, 181, 71, 0.16); border: 1px solid rgba(255, 181, 71, 0.6);
+    box-shadow: 0 0 16px rgba(255, 181, 71, 0.18);
+  }
+  #dock .mid span { display: none; }
+  #dock .mid svg { stroke-width: 2.6; }
+  #dock .i-play { display: none; }
+  #dock .i-play path { fill: currentColor; stroke-width: 1.6; }
+  #dock-pause.paused .i-play { display: inline; }
+  #dock-pause.paused .i-pause { display: none; }
+
+  /* ---- manual flight: virtual stick + buttons */
+  #touchctl {
+    position: fixed; z-index: 6; left: var(--sl); right: var(--sr);
+    bottom: calc(var(--sb) + var(--dock-h) + 14px);
+    justify-content: space-between; align-items: flex-end; pointer-events: none;
+  }
+  body.manual #touchctl { display: flex; }
+  body[data-sheet] #touchctl { display: none; }
+  #stick {
+    position: relative; flex: none; width: 136px; height: 136px; border-radius: 50%; pointer-events: auto; touch-action: none;
+    background: radial-gradient(circle, rgba(255, 255, 255, 0.05) 0 30%, rgba(10, 15, 22, 0.55) 72%);
+    border: 1px solid rgba(160, 190, 220, 0.3);
+    backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+  }
+  #stick::before, #stick::after { content: ""; position: absolute; background: rgba(160, 190, 220, 0.18); }
+  #stick::before { left: 50%; top: 14px; bottom: 14px; width: 1px; }
+  #stick::after { top: 50%; left: 14px; right: 14px; height: 1px; }
+  #stick i {
+    position: absolute; z-index: 1; left: 50%; top: 50%; width: 56px; height: 56px; margin: -28px 0 0 -28px; border-radius: 50%;
+    background: rgba(220, 230, 240, 0.16); border: 1.5px solid rgba(89, 210, 255, 0.75);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45); transition: transform .14s ease-out;
+  }
+  #stick.on i { transition: none; background: rgba(89, 210, 255, 0.3); }
+  .tc-btns { display: grid; grid-template-columns: repeat(2, 78px); gap: 6px; pointer-events: auto; }
+  .tc-btns button {
+    height: 40px; padding: 0 4px; font-size: 12px; border-radius: 10px; touch-action: none;
+    user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+    background: rgba(10, 15, 22, 0.62); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+  }
+  .tc-btns button.held { background: rgba(89, 210, 255, 0.3); border-color: rgba(89, 210, 255, 0.7); }
+  .tc-btns .wide { grid-column: span 2; }
+  .tc-sb { grid-column: span 2; display: flex; align-items: center; gap: 8px; height: 26px; padding: 0 10px; font-size: 11px; color: var(--dim); border-radius: 10px; background: rgba(10, 15, 22, 0.62); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
+  .tc-sb div { flex: 1; height: 5px; border-radius: 3px; overflow: hidden; background: rgba(255, 255, 255, 0.14); }
+  .tc-sb i { display: block; width: 0; height: 100%; background: var(--accent); }
+}
+
+/* landscape phones: side rail + drawer */
+@media (pointer: coarse) and (max-height: 540px) and (orientation: landscape) {
+  #topbar { right: calc(var(--sr) + var(--rail-w) + 10px); }
+  .pills { flex: 0 1 auto; }
+  #pill-time { margin-left: 0; }
+  #mstrip { flex: 0 1 380px; padding: 5px 2px; }
+  #mstrip b { font-size: 14px; }
+  #toasts { top: calc(var(--st) + 48px); width: min(60vw, 480px); }
+
+  #dock {
+    flex-direction: column; left: auto; right: var(--sr); top: var(--st); bottom: var(--sb);
+    width: var(--rail-w); height: auto;
+  }
+  #dock .mid { flex: 0 0 46px; width: 46px; height: 46px; margin: 4px 0; }
+
+  #flight, #settings, #navpanel, #camerabar {
+    left: auto; right: calc(var(--sr) + var(--rail-w) + 8px); top: var(--st); bottom: var(--sb);
+    width: min(380px, 52vw); max-height: none; transform: translateX(16px);
+  }
+  #camerabar { transform: translateX(16px); }
+  .cams { grid-template-columns: repeat(3, 1fr); }
+
+  #touchctl { bottom: var(--sb); right: calc(var(--sr) + var(--rail-w) + 12px); }
+  #stick { width: 124px; height: 124px; }
+}

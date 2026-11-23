@@ -21,6 +21,14 @@ import { Hud } from './ui/hud.js';
 const $ = (s) => document.querySelector(s);
 const ld = (txt, f) => { $('#ld-text').textContent = txt; if (f !== undefined) $('#ld-fill').style.width = `${Math.round(f * 100)}%`; };
 const nextFrame = () => new Promise((r) => requestAnimationFrame(() => r()));
+// keep in sync with the mobile @media block in css/style.css
+const MOBILE_MQ = matchMedia('(max-width: 760px), (pointer: coarse) and (max-height: 540px)');
+
+// mobile sheets (flight / navpanel / camerabar / settings): one open at a time, null closes
+function openSheet(name) {
+  if (name) document.body.dataset.sheet = name; else delete document.body.dataset.sheet;
+  document.querySelectorAll('#dock [data-sheet]').forEach((b) => b.classList.toggle('on', b.dataset.sheet === name));
+}
 
 const QUALITY = {
   low: { cloudScale: 0.35, steps: 48, light: 4, ap: 8, pr: 0.75 },
@@ -116,7 +124,10 @@ async function main() {
 
   // ------------------------------------------------------------------ render targets / resize
   let sceneRT = null;
-  let quality = 'high', renderScale = 1.0;
+  // phones / small touch screens start on the low preset (volumetric clouds are fill-rate heavy)
+  let quality = MOBILE_MQ.matches ? 'low' : 'high', renderScale = 1.0;
+  $('#csteps').value = QUALITY[quality].steps; $('#csteps-o').textContent = QUALITY[quality].steps;
+  document.querySelectorAll('#q-seg button').forEach((x) => x.classList.toggle('on', x.dataset.q === quality));
   const settings = { exposureEV: 0, bloom: 0.06, showHud: false, showTrail: true, showForces: false };
   function resize() {
     const q = QUALITY[quality];
@@ -245,7 +256,10 @@ async function main() {
   document.querySelectorAll('#mode-seg button').forEach((b) => b.addEventListener('click', () => {
     simMode = b.dataset.mode;
     document.querySelectorAll('#mode-seg button').forEach((x) => x.classList.toggle('on', x === b));
+    document.body.classList.toggle('manual', simMode === 'MANUAL');
     link.send({ type: 'mode', mode: simMode });
+    // phone: switching to manual flight closes the sheet so the virtual stick shows up
+    if (simMode === 'MANUAL' && MOBILE_MQ.matches) openSheet(null);
   }));
   document.querySelectorAll('#q-seg button').forEach((b) => b.addEventListener('click', () => {
     quality = b.dataset.q;
@@ -274,14 +288,31 @@ async function main() {
   $('#btn-final').addEventListener('click', () => {
     link.send({ type: 'sim', action: 'reset', scenario: 'final' }); clearEpisode();
     simMode = 'AUTO'; document.querySelectorAll('#mode-seg button').forEach((x) => x.classList.toggle('on', x.dataset.mode === 'AUTO'));
+    document.body.classList.remove('manual');
     link.send({ type: 'mode', mode: 'AUTO' });
   });
+
+  // ------------------------------------------------------------------ mobile: dock + sheets
+  document.querySelectorAll('#dock [data-sheet]').forEach((b) => b.addEventListener('click', () => {
+    openSheet(document.body.dataset.sheet === b.dataset.sheet ? null : b.dataset.sheet);
+  }));
+  const dockPause = $('#dock-pause');
+  dockPause.addEventListener('click', () => link.send({ type: 'sim', action: 'toggle_pause' }));
+  // a quick tap on the 3D view closes the open sheet (drags still orbit the camera)
+  let tap = null;
+  canvas.addEventListener('pointerdown', (e) => { tap = e.isPrimary ? { x: e.clientX, y: e.clientY, t: performance.now() } : null; });
+  canvas.addEventListener('pointerup', (e) => {
+    if (tap && e.isPrimary && performance.now() - tap.t < 350 && Math.hypot(e.clientX - tap.x, e.clientY - tap.y) < 8) openSheet(null);
+    tap = null;
+  });
+  MOBILE_MQ.addEventListener('change', (e) => { if (!e.matches) openSheet(null); });
+  const mstrip = [...document.querySelectorAll('#mstrip [data-m]')].map((el) => [el, $(`#flight [data-f="${el.dataset.m}"]`)]);
   const cams = $('#cams');
   CAMERA_MODES.forEach((m, i) => {
     const b = document.createElement('button');
     b.innerHTML = `<kbd>${i + 1}</kbd>${CAMERA_LABELS[m]}`;
     b.dataset.cam = m;
-    b.addEventListener('click', () => setCam(m));
+    b.addEventListener('click', () => { setCam(m); if (MOBILE_MQ.matches) openSheet(null); });
     cams.appendChild(b);
   });
   function setCam(m) {
@@ -308,17 +339,59 @@ async function main() {
     }
   });
   addEventListener('keyup', (e) => keys.delete(e.code));
+
+  // touch: virtual stick (drag down = pull = nose up, like S / ArrowDown) + hold / toggle buttons
+  const touch = { pitch: 0, roll: 0, yawL: false, yawR: false, sbUp: false, sbDn: false, brake: false };
+  {
+    const stick = $('#stick'), knob = stick.querySelector('i');
+    const expo = (v) => Math.sign(v) * Math.abs(v) ** 1.5;   // finer control around centre
+    let sid = null;
+    const move = (e) => {
+      const r = stick.getBoundingClientRect(), R = r.width / 2;
+      let x = (e.clientX - r.left - R) / R, y = (e.clientY - r.top - R) / R;
+      const m = Math.hypot(x, y);
+      if (m > 1) { x /= m; y /= m; }
+      touch.roll = expo(x); touch.pitch = expo(y);
+      knob.style.transform = `translate(${x * R * 0.6}px, ${y * R * 0.6}px)`;
+    };
+    const end = (e) => {
+      if (e.pointerId !== sid) return;
+      sid = null; touch.roll = touch.pitch = 0;
+      knob.style.transform = ''; stick.classList.remove('on');
+    };
+    stick.addEventListener('pointerdown', (e) => { sid = e.pointerId; stick.setPointerCapture(sid); stick.classList.add('on'); move(e); });
+    stick.addEventListener('pointermove', (e) => { if (e.pointerId === sid) move(e); });
+    stick.addEventListener('pointerup', end);
+    stick.addEventListener('pointercancel', end);
+    document.querySelectorAll('#touchctl [data-hold]').forEach((b) => {
+      const set = (v) => { touch[b.dataset.hold] = v; b.classList.toggle('held', v); };
+      b.addEventListener('pointerdown', (e) => { b.setPointerCapture(e.pointerId); set(true); });
+      b.addEventListener('pointerup', () => set(false));
+      b.addEventListener('pointercancel', () => set(false));
+      b.addEventListener('contextmenu', (e) => e.preventDefault());
+    });
+    document.querySelectorAll('#touchctl [data-tog]').forEach((b) => b.addEventListener('click', () => {
+      if (rig.mode === 'free') return;
+      const k = b.dataset.tog;
+      ctl[k] = !ctl[k];
+      toast(k === 'gear' ? (ctl.gear ? '起落架放下指令' : '起落架收起指令') : (ctl.chute ? '减速伞展开指令' : '减速伞抛离指令'));
+    }));
+  }
+  const tcGear = $('#tc-gear'), tcChute = $('#tc-chute'), tcSb = $('#tc-sb');
+  const clamp1 = (v) => Math.max(-1, Math.min(1, v));
   setInterval(() => {
     if (simMode !== 'MANUAL' || rig.mode === 'free') return;
     const k = (a, b) => (keys.has(a) || keys.has(b) ? 1 : 0);
-    if (keys.has('KeyX')) ctl.sb = Math.min(1, ctl.sb + 0.05);
-    if (keys.has('KeyZ')) ctl.sb = Math.max(0, ctl.sb - 0.05);
-    ctl.brakes = keys.has('KeyB') ? 1 : 0;
+    if (keys.has('KeyX') || touch.sbUp) ctl.sb = Math.min(1, ctl.sb + 0.05);
+    if (keys.has('KeyZ') || touch.sbDn) ctl.sb = Math.max(0, ctl.sb - 0.05);
+    ctl.brakes = keys.has('KeyB') || touch.brake ? 1 : 0;
+    tcGear.classList.toggle('on', ctl.gear); tcChute.classList.toggle('on', ctl.chute);
+    tcSb.style.width = `${Math.round(ctl.sb * 100)}%`;
     link.send({
       type: 'control',
-      pitch: k('KeyS', 'ArrowDown') - k('KeyW', 'ArrowUp'),
-      roll: k('KeyD', 'ArrowRight') - k('KeyA', 'ArrowLeft'),
-      yaw: k('KeyE', 'KeyE') - k('KeyQ', 'KeyQ'),
+      pitch: clamp1(k('KeyS', 'ArrowDown') - k('KeyW', 'ArrowUp') + touch.pitch),
+      roll: clamp1(k('KeyD', 'ArrowRight') - k('KeyA', 'ArrowLeft') + touch.roll),
+      yaw: clamp1(k('KeyE', 'KeyE') - k('KeyQ', 'KeyQ') + (touch.yawR ? 1 : 0) - (touch.yawL ? 1 : 0)),
       speedbrake: ctl.sb, gear: ctl.gear, brakes: ctl.brakes, chute: ctl.chute,
     });
   }, 33);
@@ -386,6 +459,7 @@ async function main() {
       $('#pill-guid em').textContent = st.gnc ? `${st.gnc.phase}${st.gnc.sub ? ' · ' + st.gnc.sub : ''}` : (st.guidance || '—');
       $('#pill-time em').textContent = `${(st.t || 0).toFixed(1)} s${st.paused ? ' ❚❚' : ''}`;
       $('#btn-pause').textContent = st.paused ? '▶ 继续' : '❚❚ 暂停';
+      dockPause.classList.toggle('paused', !!st.paused);
     }
 
     // ---------------- camera
@@ -491,6 +565,7 @@ async function main() {
     if (st) hud.updateGnc(st);
     if (st) {
       hud.updatePanel(st, { range: Math.hypot(st.pos[0], st.pos[1]) });
+      if (MOBILE_MQ.matches) for (const [dst, src] of mstrip) if (src && dst.textContent !== src.textContent) dst.textContent = src.textContent;
       if (frame % 3 === 0) {
         hud.drawSurfaces(st.surf, st.cmd);
         hud.drawProfile(st, lastPlan);
