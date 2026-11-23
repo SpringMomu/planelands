@@ -1,0 +1,117 @@
+{
+  "_doc": "Orbiter geometry shared by the aero model (Python) and the visual model (JS). Body frame FRD: x forward, y right, z down; metres; origin = centre of gravity / moment reference point. Visual model local frame (three.js) = (x, -z, y). Only the right side (y>0) of symmetric parts is listed; mirror for the left side.",
+  "reference": {
+    "S": 249.91,
+    "b": 23.79,
+    "cbar": 12.06,
+    "mrp": [0.0, 0.0, 0.0]
+  },
+  "mass": {
+    "m": 99800.0,
+    "Ixx": 1.299e6,
+    "Iyy": 9.38e6,
+    "Izz": 9.65e6,
+    "Ixz": 2.25e5
+  },
+  "fuselage": {
+    "_doc": "stations: [x, half_width, z_top, z_bot]; z_top negative (up). Cross-section ~ superellipse, flat bottom, rounded top. Nose tip at x=21.39, aft base at x=-11.38.",
+    "nose_x": 21.39,
+    "base_x": -11.38,
+    "stations": [
+      [21.39, 0.000, 0.70, 0.70],
+      [20.89, 0.880, 0.05, 1.18],
+      [20.39, 1.235, -0.30, 1.40],
+      [19.39, 1.685, -0.78, 1.56],
+      [18.39, 1.995, -1.10, 1.86],
+      [17.39, 2.235, -1.38, 2.07],
+      [16.39, 2.415, -1.85, 2.21],
+      [15.39, 2.530, -2.70, 2.27],
+      [14.39, 2.590, -3.15, 2.30],
+      [13.39, 2.600, -3.25, 2.30],
+      [12.39, 2.600, -3.15, 2.30],
+      [10.89, 2.600, -2.95, 2.30],
+      [6.00, 2.600, -2.92, 2.30],
+      [0.00, 2.600, -2.92, 2.30],
+      [-7.60, 2.600, -2.92, 2.30],
+      [-9.50, 2.680, -2.98, 2.30],
+      [-11.38, 2.750, -3.05, 2.30]
+    ],
+    "windows_x": [15.0, 16.5]
+  },
+  "wing": {
+    "_doc": "Exposed wing outboard of the fuselage side (y=2.6). Planform polyline in (x, y). Chord plane z at root = z_root, dihedral raises the plane outboard (z decreases). Reference trapezoid (for S/cbar) has root LE x=3.19 at y=0, 45 deg LE sweep, tip LE x=-8.70, TE root x=-14.32 (y=0) to tip x=-12.20.",
+    "y_root": 2.6,
+    "z_root": 1.60,
+    "dihedral_deg": 3.5,
+    "le": [[11.20, 2.60], [-1.53, 4.72], [-8.70, 11.90]],
+    "te": [[-13.86, 2.60], [-12.20, 11.90]],
+    "_le_doc": "glove/strake LE sweep 81 deg from (11.20,2.60) to (-1.53,4.72); main LE sweep 45 deg to the tip",
+    "tip_y": 11.90,
+    "t_over_c": [[2.60, 0.080], [4.72, 0.090], [11.90, 0.110]],
+    "elevons": [
+      {"name": "elevon_ri", "y0": 3.05, "y1": 7.20, "chord": 2.55},
+      {"name": "elevon_ro", "y0": 7.30, "y1": 11.45, "chord": 2.05}
+    ],
+    "_elevon_doc": "hinge line parallel to the TE, chord measured streamwise from the TE. Left side names elevon_li / elevon_lo. Deflection positive = trailing edge DOWN.",
+    "elevon_limits_deg": [-33.0, 18.0],
+    "elevon_rate_dps": 20.0
+  },
+  "bodyflap": {
+    "hinge_x": -13.54,
+    "chord": 2.14,
+    "half_span": 3.17,
+    "z": 2.30,
+    "thickness": 0.45,
+    "limits_deg": [-11.7, 22.5],
+    "rate_dps": 1.3,
+    "_doc": "positive = trailing edge DOWN"
+  },
+  "vtail": {
+    "root": {"le_x": -5.80, "te_x": -12.62, "z": -4.10},
+    "tip": {"le_x": -13.80, "te_x": -16.56, "z": -12.10},
+    "t_over_c": 0.10,
+    "rudder": {
+      "chord_frac": 0.30,
+      "z0": -4.60,
+      "z1": -11.60,
+      "limits_deg": [-27.1, 27.1],
+      "rate_dps": 14.0,
+      "_doc": "split rudder/speedbrake: two panels (left/right halves). rudder positive = trailing edge LEFT. Panel angles: left = rudder + sb/2, right = rudder - sb/2 (outward opening)."
+    },
+    "speedbrake_max_deg": 98.6,
+    "speedbrake_rate_dps": 6.1
+  },
+  "oms_pods": {
+    "_doc": "visual + drag only. Each pod centred at y=+-2.25, from x=-1.0 to x=-11.6, z from -2.6 (bottom) to -4.6 (top)",
+    "y": 2.25,
+    "x_front": -1.0,
+    "x_aft": -11.6,
+    "z_bottom": -2.6,
+    "z_top": -4.6
+  },
+  "engines": {
+    "_doc": "SSME nozzle exits (visual): [x_mount, y, z], exit radius, length",
+    "mounts": [[-11.30, 0.0, -1.55], [-11.30, -1.37, 0.25], [-11.30, 1.37, 0.25]],
+    "exit_radius": 1.15,
+    "length": 3.1
+  },
+  "gear": {
+    "_doc": "wheel contact points (extended, unloaded) in FRD. Strut axis = body z.",
+    "nose": {"x": 14.70, "y": 0.0, "z": 4.90, "wheel_radius": 0.41, "stroke": 0.45},
+    "main_r": {"x": -3.53, "y": 3.43, "z": 4.90, "wheel_radius": 0.56, "stroke": 0.40},
+    "main_l": {"x": -3.53, "y": -3.43, "z": 4.90, "wheel_radius": 0.56, "stroke": 0.40},
+    "deploy_time_s": 4.0
+  },
+  "tail_scrape_point": [-15.68, 0.0, 2.55],
+  "drag_chute": {
+    "_doc": "40 ft conical ribbon chute. Riser attaches in the compartment at the base of the fin trailing edge, above SSME #1 (FRD). line_length = suspension lines skirt->confluence; pilot chute 9 ft on a bridle behind the vent.",
+    "attach": [-13.0, 0.0, -3.8],
+    "diameter": 12.2,
+    "riser_length": 27.4,
+    "line_length": 12.2,
+    "pilot_diameter": 2.74,
+    "bridle_length": 8.0,
+    "CD": 0.62
+  },
+  "cockpit_eye": [14.4, -0.55, -2.30]
+}

@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.tmp/
+# generated caches (rebuilt automatically by server.py)
+web/data/*.f32
+web/data/*.u8
+web/data/assets.json
+web/data/terrain_meta.json
+web/data/world.json
+web/data/orbiter_geometry.json
+sim/data/
+# local tool settings
+.claude/settings.local.json
+.vscode/
+*.log

@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Planelands · 航天飞机自主返场</title>
+<link rel="stylesheet" href="./css/style.css" />
+<script type="importmap">
+{ "imports": { "three": "./vendor/three/build/three.module.js" } }
+</script>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<canvas id="hud"></canvas>
+
+<div id="loading">
+  <div class="ld-box">
+    <div class="ld-title">PLANELANDS</div>
+    <div class="ld-sub">航天飞机自主返场 · 物理仿真</div>
+    <div class="ld-bar"><div id="ld-fill"></div></div>
+    <div id="ld-text">初始化…</div>
+  </div>
+</div>
+
+<header id="topbar">
+  <div class="brand"><span class="logo">◢◣</span> PLANELANDS <span class="dim">/ Orbiter Autoland</span></div>
+  <div class="pills">
+    <span class="pill" id="pill-link"><i></i><b>后端</b><em>连接中</em></span>
+    <span class="pill" id="pill-status"><b>状态</b><em>—</em></span>
+    <span class="pill" id="pill-mode"><b>模式</b><em>—</em></span>
+    <span class="pill" id="pill-guid"><b>制导</b><em>—</em></span>
+    <span class="pill" id="pill-time"><b>T+</b><em>0.0 s</em></span>
+    <span class="pill" id="pill-fps"><b>FPS</b><em>—</em></span>
+  </div>
+</header>
+
+<aside id="flight" class="glass">
+  <h3>飞行数据 <span class="dim">FLIGHT DATA</span></h3>
+  <div class="grid2">
+    <div><label>高度</label><span><b data-f="alt">—</b> m</span></div>
+    <div><label>离地</label><span><b data-f="agl">—</b> m</span></div>
+    <div><label>真空速</label><span><b data-f="tas">—</b> m/s</span></div>
+    <div><label>当量空速</label><span><b data-f="keas">—</b> kt</span></div>
+    <div><label>马赫</label><span><b data-f="mach">—</b></span></div>
+    <div><label>动压</label><span><b data-f="qbar">—</b> kPa</span></div>
+    <div><label>迎角 α</label><span><b data-f="alpha">—</b>°</span></div>
+    <div><label>侧滑 β</label><span><b data-f="beta">—</b>°</span></div>
+    <div><label>倾侧 σ</label><span><b data-f="bank">—</b>°</span></div>
+    <div><label>航迹角 γ</label><span><b data-f="gamma">—</b>°</span></div>
+    <div><label>航向</label><span><b data-f="hdg">—</b>°</span></div>
+    <div><label>航迹</label><span><b data-f="trk">—</b>°</span></div>
+    <div><label>过载 nz</label><span><b data-f="nz">—</b> g</span></div>
+    <div><label>升降率</label><span><b data-f="vs">—</b> m/s</span></div>
+    <div><label>升阻比</label><span><b data-f="ld">—</b></span></div>
+    <div><label>距跑道</label><span><b data-f="rng">—</b> km</span></div>
+    <div><label>能量高度</label><span><b data-f="energy">—</b> km</span></div>
+    <div><label>起落架</label><span><b data-f="gear">—</b></span></div>
+  </div>
+  <h3>制导 <span class="dim">GNC · SCP + MPC</span></h3>
+  <div class="phases" id="phases">
+    <span data-k="PLAN" title="规划">规划</span><span data-k="TAEM" title="末端能量管理 TAEM">能量</span><span data-k="HAC" title="航向对准锥 HAC">对准</span>
+    <span data-k="OGS" title="外/内下滑道">下滑</span><span data-k="FLARE" title="拉平与接地">拉平</span><span data-k="ROLLOUT" title="着陆滑跑">滑跑</span>
+  </div>
+  <div class="grid">
+    <label>阶段</label><span><b data-g="phase">—</b></span>
+    <label>目标跑道</label><span><b data-g="rwy">—</b></span>
+    <label>待飞</label><span><b data-g="rtg">—</b> km · <b data-g="ttg">—</b> s</span>
+    <label>能量偏差</label><span><b data-g="eerr">—</b> m</span>
+  </div>
+  <div class="ebar" title="能量高度偏差（相对参考轨迹）：左低右高"><i id="ebar"></i><em></em></div>
+  <table class="refact">
+    <tr><th></th><th>参考</th><th>实际</th></tr>
+    <tr><td>迎角 α</td><td data-g="ra">—</td><td data-g="aa">—</td></tr>
+    <tr><td>倾侧 σ</td><td data-g="rb">—</td><td data-g="ab">—</td></tr>
+    <tr><td>减速板</td><td data-g="rs">—</td><td data-g="as">—</td></tr>
+  </table>
+  <div class="gstat"><b>SCP</b> <span data-g="scp">—</span></div>
+  <div class="gstat"><b>MPC</b> <span data-g="mpc">—</span></div>
+  <h3>操纵面 <span class="dim">CONTROL SURFACES</span></h3>
+  <canvas id="surf" width="260" height="250"></canvas>
+</aside>
+
+<aside id="settings" class="glass">
+  <div class="tabs">
+    <button data-tab="sim" class="on">仿真</button>
+    <button data-tab="wx">体积云</button>
+    <button data-tab="env">光照 · 大气</button>
+    <button data-tab="gfx">画质</button>
+  </div>
+  <section data-pane="sim" class="on">
+    <div class="row btns">
+      <button id="btn-reset" class="accent" title="随机空中位置、速度与航向">⟳ 随机放置</button>
+      <button id="btn-pause">❚❚ 暂停</button>
+      <button id="btn-final" title="RWY33 短五边 30 m / 115 m/s：拉平、接地、减速伞与滑跑">短五边演示</button>
+    </div>
+    <div class="row"><label>时间倍率</label><input type="range" id="ts" min="0" max="5" step="1" value="1"><output id="ts-o">1×</output></div>
+    <div class="row seg" id="mode-seg"><label>控制模式</label>
+      <button data-mode="AUTO" class="on">自动 AUTO</button><button data-mode="MANUAL">手动 CSS</button></div>
+    <div class="row"><label>风速</label><input type="range" id="wind" min="0" max="30" step="0.5" value="6"><output id="wind-o">6 m/s</output></div>
+    <div class="row"><label>风向（来向）</label><input type="range" id="winddir" min="0" max="359" step="1" value="120"><output id="winddir-o">120°</output></div>
+    <div class="row"><label>湍流强度</label><input type="range" id="turb" min="0" max="1" step="0.05" value="0.15"><output id="turb-o">0.15</output></div>
+    <div class="row chk"><label><input type="checkbox" id="wind-auto" checked> 风速 / 湍流自动变化（风暴中加剧，滑块为均值）</label></div>
+    <div class="note" id="wx-live">当前风 —</div>
+    <div class="row chk"><label><input type="checkbox" id="show-forces"> 显示各翼面气动力矢量</label></div>
+    <div class="row chk"><label><input type="checkbox" id="show-trail" checked> 显示飞行轨迹</label></div>
+    <div class="row chk"><label><input type="checkbox" id="show-hud"> 平视显示器 HUD（驾驶舱外也显示）</label></div>
+    <div class="row chk"><label><input type="checkbox" id="show-plan" checked> 显示 SCP 规划轨迹 / HAC</label></div>
+    <div class="row chk"><label><input type="checkbox" id="show-mpc" checked> 显示 MPC 预测时域</label></div>
+    <div class="row chk"><label><input type="checkbox" id="show-appr" checked> 显示进近下滑通道</label></div>
+    <div class="row"><label>制导律</label><select id="guid-sel"><option value="scp_mpc">SCP + MPC</option><option value="hold_glide">占位滑翔</option></select><output></output></div>
+    <p class="note">AUTO = <b>SCP</b> 全程航迹规划 + <b>MPC</b> 滚动跟踪 → 电传飞控。手动：W/S 俯仰 · A/D 滚转 · Q/E 偏航 · Z/X 减速板 · G 起落架 · B 刹车 · C 减速伞。</p>
+  </section>
+  <section data-pane="wx">
+    <div class="row"><label>云底高度</label><input type="range" id="cbase" min="300" max="9000" step="50" value="1600"><output id="cbase-o">1600 m</output></div>
+    <div class="row"><label>云层厚度</label><input type="range" id="cthick" min="200" max="8000" step="50" value="2200"><output id="cthick-o">2200 m</output></div>
+    <div class="row"><label>覆盖率</label><input type="range" id="ccov" min="0" max="1" step="0.01" value="0.48"><output id="ccov-o">0.48</output></div>
+    <div class="row"><label>密度</label><input type="range" id="cdens" min="0.1" max="3" step="0.05" value="1.0"><output id="cdens-o">1.00</output></div>
+    <div class="row"><label>云型（层云→积云→积雨云）</label><input type="range" id="ctype" min="0" max="1" step="0.01" value="0.55"><output id="ctype-o">0.55</output></div>
+    <div class="row"><label>卷云</label><input type="range" id="cirrus" min="0" max="1" step="0.01" value="0.55"><output id="cirrus-o">0.55</output></div>
+    <div class="row"><label>云影强度</label><input type="range" id="cshadow" min="0" max="1" step="0.05" value="0.85"><output id="cshadow-o">0.85</output></div>
+    <div class="row btns presets">
+      <button data-preset="fair">晴间少云</button><button data-preset="scattered">疏云</button>
+      <button data-preset="broken">多云</button><button data-preset="overcast">阴天层云</button><button data-preset="storm">雷暴积雨云</button>
+    </div>
+    <h3 class="subh">降水 · 雷暴（只在积雨云下）</h3>
+    <div class="row"><label>降水强度</label><input type="range" id="rain" min="0" max="1" step="0.01" value="0"><output id="rain-o">0.00</output></div>
+    <div class="row"><label>雷电频率</label><input type="range" id="lightning" min="0" max="1" step="0.01" value="0"><output id="lightning-o">0.00</output></div>
+    <div class="row"><label>地面湿度</label><input type="range" id="wet" min="0" max="1" step="0.01" value="0"><output id="wet-o">自动</output></div>
+    <div class="row chk"><label><input type="checkbox" id="wet-auto" checked> 地面湿度随降水自动变化</label></div>
+    <div class="row chk"><label><input type="checkbox" id="storm-cell"> 在机场上空生成雷暴单体</label></div>
+    <div class="row chk"><label><input type="checkbox" id="sound" checked> 雨声 / 雷声（点击页面后启用）</label></div>
+    <div class="row btns"><button id="btn-strike">⚡ 前方落雷</button></div>
+  </section>
+  <section data-pane="env">
+    <div class="row"><label>当地时间</label><input type="range" id="tod" min="4.5" max="20.5" step="0.05" value="15.6"><output id="tod-o">15:36</output></div>
+    <div class="row"><label>日期（年积日）</label><input type="range" id="doy" min="1" max="365" step="1" value="172"><output id="doy-o">172</output></div>
+    <div class="row chk"><label><input type="checkbox" id="tod-anim"> 时间流逝（×120）</label></div>
+    <div class="row"><label>气溶胶 / 霾</label><input type="range" id="haze" min="0.1" max="5" step="0.05" value="1.2"><output id="haze-o">1.20</output></div>
+    <div class="row"><label>曝光 EV</label><input type="range" id="ev" min="-3" max="3" step="0.05" value="0"><output id="ev-o">0.0</output></div>
+    <div class="row"><label>泛光</label><input type="range" id="bloom" min="0" max="0.3" step="0.005" value="0.06"><output id="bloom-o">0.06</output></div>
+  </section>
+  <section data-pane="gfx">
+    <div class="row seg" id="q-seg"><label>画质预设</label>
+      <button data-q="low">低</button><button data-q="med">中</button><button data-q="high" class="on">高</button><button data-q="ultra">极高</button></div>
+    <div class="row"><label>渲染分辨率</label><input type="range" id="rscale" min="0.5" max="1" step="0.05" value="1"><output id="rscale-o">100%</output></div>
+    <div class="row"><label>云步进数</label><input type="range" id="csteps" min="32" max="192" step="8" value="96"><output id="csteps-o">96</output></div>
+    <div class="row"><label>云可视距离</label><input type="range" id="cdist" min="30" max="250" step="5" value="150"><output id="cdist-o">150 km</output></div>
+    <p class="note">体积云：半分辨率光线步进 + 时域重投影，Beer–Powder 多次散射近似；大气：Hillaire 2020 预计算 LUT（透射率 / 多次散射 / 天空视图 / 辐照度）；地形：几何裁剪图 LOD + 地球曲率。</p>
+  </section>
+</aside>
+
+<canvas id="vsit" width="300" height="160" class="glass" title="垂直剖面 VERT SIT：高度 – 待飞距离"></canvas>
+<canvas id="map" width="300" height="240" class="glass"></canvas>
+
+<footer id="camerabar">
+  <div class="cams" id="cams"></div>
+  <div class="hints">鼠标拖动：环视 · 滚轮：缩放 · 1–7：切换视角 · P：暂停 · R：重新放置 · H：隐藏界面</div>
+</footer>
+
+<div id="toasts"></div>
+
+<script type="module" src="./js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+numpy>=1.24
+websockets>=13.0
+scipy>=1.10
+cvxpy>=1.5
+clarabel>=0.6
+ecos>=2.0
+osqp>=1.0

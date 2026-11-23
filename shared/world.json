@@ -1,0 +1,33 @@
+{
+  "_doc": "World definition shared by Python (sim/worldgen) and JS (web). World frame = ENU, metres, origin at runway centre (sea level). Three.js world = (E, U, -N).",
+  "planet_radius": 6371000.0,
+  "sea_level": 0.0,
+  "runway": {
+    "name": "PLX",
+    "center_en": [0.0, 0.0],
+    "elevation": 3.0,
+    "heading_deg": 330.0,
+    "_heading_doc": "true heading of the RWY 33 landing direction (pointing NNW). RWY 15 is the reciprocal (150 deg).",
+    "length": 4572.0,
+    "width": 91.44,
+    "overrun": 305.0,
+    "shoulder": 15.0,
+    "ends": ["15", "33"]
+  },
+  "airport_flat_zone": {
+    "_doc": "rectangle in runway frame (along, across) metres around the runway centre that worldgen flattens to runway elevation",
+    "half_along": 4300.0,
+    "half_across": 1500.0,
+    "blend": 1500.0
+  },
+  "map": {
+    "size": 2048,
+    "extent": 204800.0,
+    "_doc": "square heightmap centred on origin; texel (row, col): col -> East from -extent/2, row -> North from -extent/2 (row 0 = south). Texel centres at -extent/2 + (i+0.5)*extent/size.",
+    "files": {
+      "height": "web/data/terrain_height.f32",
+      "landcover": "web/data/terrain_landcover.u8",
+      "meta": "web/data/terrain_meta.json"
+    }
+  }
+}
