@@ -7,6 +7,7 @@
     python tools/gnc_selftest.py --at 40,200,15 --at 25,90,10,270   # user-placed starts
     python tools/gnc_selftest.py --at 20,150,4 --at-wind 10,330      # ... with wind (10 m speed, from)
     GNC_AUTO_WEATHER=1 python tools/gnc_selftest.py ...              # drifting wind like the web client
+    python tools/gnc_selftest.py --n 12 --wind 0 --fault-scp 60      # SCP disabled for 60 s: degraded modes
         (dist_km,bearing_deg,alt_km[,heading_deg[,mach]]; bearing from the runway centre,
          heading omitted = toward the runway, Mach omitted = ~10 kPa dynamic pressure)
 
@@ -137,6 +138,9 @@ def main():
     ap.add_argument("--seeds", type=int, nargs="*")
     ap.add_argument("--at", action="append", default=[],
                     help="custom start dist_km,bearing_deg,alt_km[,heading_deg[,mach]] (repeatable)")
+    ap.add_argument("--fault-scp", type=float, default=0.0,
+                    help="fault injection: every plan requested in the first N s of a flight fails (no SCP), "
+                         "exercising the degraded MAXRANGE / HOLD modes and their recovery")
     ap.add_argument("--at-wind", default="0,0,0",
                     help="wind for the --at cases: speed_10m,dir_from[,turbulence] (default calm)")
     ap.add_argument("--buran", type=int, default=0, help="number of forecast-vs-actual wind cases")
@@ -174,6 +178,8 @@ def main():
             wd_fc = (wd_act + 90.0) % 360.0       # forecast direction unrelated to the actual one
             cases.append((args.bseed0 + i, args.buran_forecast, wd_fc, args.buran_turb, btag, False,
                           (args.buran_t, args.buran_speed, wd_act, args.buran_ramp, args.buran_ambig)))
+    if args.fault_scp > 0:
+        os.environ["GNC_FAULT_SCP"] = str(args.fault_scp)      # inherited by the spawned workers
     t0 = time.perf_counter()
     ctx = mp.get_context("spawn")
     with ctx.Pool(processes=min(args.workers, len(cases))) as pool:

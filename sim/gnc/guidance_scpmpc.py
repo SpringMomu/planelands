@@ -1,7 +1,16 @@
 """Autonomous SCP + MPC guidance ("scp_mpc"), the default guidance law.
 
 Phases:  PLAN -> TAEM (ACQ / HAC / PRF) -> A/L (OGS / PREFLARE / IGS / FLARE)
-         -> TOUCHDOWN -> ROLLOUT -> STOPPED          (MAXRANGE if the field is unreachable)
+         -> TOUCHDOWN -> ROLLOUT -> STOPPED
+
+* degraded modes, while no SCP plan is usable (SCP failed; a failed re-plan first keeps a good
+  plan that is still tracked, up to ``keep_fail_max`` times), chosen by the planner's energy
+  classification: GEOREF (energy fine) - the MPC tracks the geometric reference of the selected
+  route (Dubins + HAC energy profile); MAXRANGE (energy low or turn limited) flies at best L/D
+  toward the farthest point of the approach geometry it can still reach, then along the extended
+  centreline; HOLD (energy high) circles the HAC centre with the speedbrake out.  MAXRANGE / HOLD
+  look ahead for terrain (the SCP's clearance constraint is not active there) and limit bank close
+  to the ground; all three re-plan from scratch every ``degraded_replan`` s until a plan is usable.
 
 * planning: runway/HAC selection, Dubins + HAC initial guess, free-final-time SCP to the
   A/L interface (worker process in the real-time server, synchronous in headless tests);
@@ -21,18 +30,20 @@ Phases:  PLAN -> TAEM (ACQ / HAC / PRF) -> A/L (OGS / PREFLARE / IGS / FLARE)
 from __future__ import annotations
 
 import math
+import os
 
 import numpy as np
 
 from ..guidance import GuidanceBase, GuidanceCommand, register
 from .approach import PH_FLARE, PH_IGS, PH_NAMES, PH_OGS, flare_alpha, lateral_bank, rollout_steer
-from .geometry import TWO_PI, runway_ends, wrap_pi
+from .geometry import TWO_PI, ApproachConfig, runway_ends, wrap_pi
 from .model import G0, PlanningModel
 from .mpc import AL_W, TAEM_W, Mpc
 from types import SimpleNamespace
 
 from .planner import AsyncPlanner, SyncPlanner, _Ctx, _final_approach, al_from_dict
 from .reference import RefPath
+from .scp import TerrainField
 
 R2D = 180.0 / math.pi
 D2R = math.pi / 180.0
@@ -51,6 +62,12 @@ class ScpMpcGuidance(GuidanceBase):
     wind_replan_dt = 10.0    # ... at most this often (s)
     reselect_mode = "wind"   # "wind" | "always" | "off"
     flare_h = 22.0           # main-gear height that starts the final flare
+    degraded_replan = 5.0    # degraded modes: cold re-plan this often (s)
+    terrain_clear = 250.0    # degraded modes: required clearance over terrain above the field (m) ...
+    terrain_look = (8.0, 16.0, 24.0, 32.0, 45.0, 60.0)    # ... along the predicted glide (s ahead)
+    hold_sb = 80.0           # HOLD: speedbrake (deg)
+    keep_fail_max = 3        # failed re-plans in a row that keep the (good) plan being flown ...
+    keep_track_max = 4000.0  # ... while its tracking error stays below this (m)
 
     def __init__(self, ctx):
         super().__init__(ctx)
@@ -65,6 +82,12 @@ class ScpMpcGuidance(GuidanceBase):
         else:
             self.planner = SyncPlanner(_Ctx(ctx.tables, ctx.mass, ctx.S, ctx.world,
                                             getattr(ctx, "terrain", None)))
+        terr = getattr(ctx, "terrain", None)
+        self.tfield = TerrainField(terr) if terr is not None else None
+        self.terrain_top = float(self.tfield.g.max()) if self.tfield is not None and self.tfield.ok else 0.0
+        self.rwy_elev = float(elev)
+        # tests: GNC_FAULT_SCP=<s> - every plan requested in the first <s> s of a flight fails
+        self.fault_scp_until = float(os.environ.get("GNC_FAULT_SCP", "0") or 0.0)
         self.msgs = []
         self.plan_log = []           # per-plan statistics (tests / diagnostics)
         self.mpc_stats = [0, 0.0, 0.0]   # count, sum ms, max ms
@@ -94,7 +117,17 @@ class ScpMpcGuidance(GuidanceBase):
         self.mpc_fail = 0
         self.reachable = True
         self.energy_high = False
-        self.maxrange = False
+        self.maxrange = False        # a degraded mode is active (no usable plan)
+        self.degraded = None         # "MAXRANGE" | "HOLD" | None
+        self.energy_dir = "ok"       # ok / high / low / turn (planner's energy classification)
+        self.hold = None             # HOLD circle: centre, direction
+        self.aim = None              # MAXRANGE aim point (runway end, x along it)
+        self.t_aim = -1e9
+        self.captured = False        # MAXRANGE: on the extended centreline
+        self.terrain_conflict = False
+        self.t_deg = None
+        self.keep_fail = 0
+        self.replan_block_until = -1e9
         self.low_warned = False
         self.tel = {}
         self.scp_info = {"iter": 0, "ms": 0.0, "converged": False, "cost": 0.0, "defect": 0.0, "age": 0.0,
@@ -152,6 +185,9 @@ class ScpMpcGuidance(GuidanceBase):
         u0 = self.u_prev if self.u_prev is not None else np.array([s.alpha, 0.0, 0.0])
         req = dict(x0=x, u0=u0, t0=t, wind=self._wind(), prefer=prefer, episode=self.episode,
                    reselect=bool(reselect))
+        if t < self.fault_scp_until:
+            req["fault_scp"] = True
+            warm = False
         if warm and self.ref is not None and self.plan is not None:
             fi, tau = self.ref.project(x)
             ia = self.ref.i_ali
@@ -181,6 +217,19 @@ class ScpMpcGuidance(GuidanceBase):
         if "error" in r:
             self.event("error", f"planner error: {r['error']}")
             return
+        if (r.get("fallback") and not self.maxrange and self.plan is not None and self.plan.get("ok")
+                and self.ref is not None and self.keep_fail < self.keep_fail_max
+                and float(self.tel.get("track_err", 0.0)) < self.keep_track_max):
+            # a re-plan failed but the plan being flown was good and is still tracked: keep flying
+            # it and try again shortly, instead of dropping it for the geometric fallback
+            self.keep_fail += 1
+            self.replan_block_until = t + self.degraded_replan
+            self.t_plan = t - self.replan_period + self.degraded_replan
+            self.event("warn", f"re-plan failed ({r.get('note') or 'SCP'}) - keeping plan #{self.plan_id} "
+                               f"({self.keep_fail}/{self.keep_fail_max})")
+            return
+        if not r.get("fallback"):
+            self.keep_fail = 0
         al = al_from_dict(r["al"], self.ends)
         prev_rwy = self.rwy
         prev_plan = self.plan
@@ -209,7 +258,9 @@ class ScpMpcGuidance(GuidanceBase):
         self.fi = 0.0
         self.plan_id += 1
         self.reachable = r["reachable"]
-        self.energy_high = "HIGH ENERGY" in (r.get("note") or "")
+        note_ = r.get("note") or ""
+        self.energy_dir = r.get("energy") or ("high" if "HIGH ENERGY" in note_ else "ok" if r["reachable"] else "low")
+        self.energy_high = (not r["reachable"]) and self.energy_dir == "high"
         self.plan_log.append(dict(t=t, kind=r["kind"], iterations=int(r["iterations"]), ms=float(r["ms"]),
                                   wall_ms=float(r.get("wall_ms", r["ms"])), converged=bool(r["converged"]),
                                   fallback=bool(r["fallback"]), rwy=r["rwy"], reachable=bool(r["reachable"]),
@@ -255,9 +306,32 @@ class ScpMpcGuidance(GuidanceBase):
             self.low_warned = True
             if self.energy_high:
                 self.event("warn", "HIGH ENERGY: too close for this altitude / speed - best-effort energy dissipation")
-            else:
+            elif self.energy_dir == "turn":
+                self.event("warn", "TURN LIMITED: too fast to turn back yet - gliding toward the field")
+            elif self.energy_dir == "low":
                 self.event("warn", "LOW ENERGY: runway not reachable - flying maximum range toward the field")
-        self.maxrange = not r["reachable"] and r["fallback"]
+        deg = (not r["reachable"]) and bool(r["fallback"])
+        mode = (({"high": "HOLD", "ok": "GEOREF"}).get(self.energy_dir, "MAXRANGE")) if deg else None
+        if mode != self.degraded:
+            if mode is None:
+                self.event("info", f"degraded mode {self.degraded} ended after {t - (self.t_deg or t):.0f} s: "
+                                   f"plan #{self.plan_id} usable")
+                self.u_plan = None           # MPC solves on the new plan right away (no stale sequence)
+                self.t_deg = None
+            else:
+                self.t_deg = t if self.degraded is None else self.t_deg
+                self.aim, self.captured = None, False
+                why = {"HOLD": "energy high: circling the HAC centre, speedbrake out",
+                       "GEOREF": "energy fine: tracking the geometric reference",
+                       "MAXRANGE": "best L/D toward the approach"}[mode]
+                self.event("warn", f"no usable plan (SCP failed): degraded mode {mode} ({why}), "
+                                   f"re-planning every {self.degraded_replan:.0f} s")
+        if mode == "HOLD" and r.get("hac"):
+            self.hold = {"center": np.array(r["hac"]["center"], float), "dir": int(r["hac"]["dir"]) or 1}
+        self.degraded = mode
+        self.maxrange = mode in ("MAXRANGE", "HOLD")      # own control laws; GEOREF flies the MPC
+        if mode is not None:
+            self.replan_block_until = t + self.degraded_replan
 
     # ------------------------------------------------------------------ main update
     def reset(self, s):
@@ -307,8 +381,8 @@ class ScpMpcGuidance(GuidanceBase):
         else:
             self.phase = "TAEM"
             self.sub = self.ref.sub_name(i)
-        if self.maxrange:
-            self.sub = "MAXRANGE"
+        if self.degraded is not None:
+            self.sub = self.degraded
         if (self.phase, self.sub) != prev and prev[0] != "PLAN":
             self.event("info", f"phase {self.phase} / {self.sub}  (h {s.alt:.0f} m, {s.eas / 0.514444:.0f} KEAS)")
         if s.agl_gear < 90.0 or (seg == 1 and self.ref.sub[i] >= PH_IGS):
@@ -319,12 +393,23 @@ class ScpMpcGuidance(GuidanceBase):
         eh = float(self.pm.energy_height(x[2], x[3]) - self.pm.energy_height(xr[2], xr[3]))
         dpos = math.hypot(x[0] - xr[0], x[1] - xr[1])
         t_to_ali = self.ref.t_ali - tau
-        if seg == 0 and not self.pending and t_to_ali > 35.0:
-            due = t - self.t_plan > (30.0 if self.maxrange else self.replan_period)
-            big = (not self.maxrange) and (dpos > 1500.0 or abs(x[2] - xr[2]) > 600.0 or abs(eh) > 900.0
-                                           or self.mpc_fail >= 3)
+        if self.degraded is not None:
+            # degraded: no usable plan - cold re-plan from the current state, often (route kept on
+            # the same runway end unless the selection finds it clearly better)
+            if not self.pending and t - self.t_req > self.degraded_replan and t >= self.replan_block_until:
+                self._request(t, s, x, warm=False, prefer=self.rwy.name if self.rwy is not None else None)
+                if self.planner_mode == "sync" and self.ref is not None and not self.maxrange:
+                    fi, tau = self.ref.project(x, hint=0)
+                    self.fi = fi
+                    i = min(int(round(fi)), len(self.ref.t) - 1)
+                    seg = int(self.ref.seg[i])
+                    xr, ur, gr = self.ref.interp_index(fi)
+                    t_to_ali = self.ref.t_ali - tau
+        elif seg == 0 and not self.pending and t_to_ali > 35.0 and t >= self.replan_block_until:
+            due = t - self.t_plan > self.replan_period
+            big = (dpos > 1500.0 or abs(x[2] - xr[2]) > 600.0 or abs(eh) > 900.0 or self.mpc_fail >= 3)
             dw = self._wind_change()
-            windy = (not self.maxrange) and dw > self.wind_replan_dv and t - self.t_plan > self.wind_replan_dt
+            windy = dw > self.wind_replan_dv and t - self.t_plan > self.wind_replan_dt
             if due or big or windy:
                 if big:
                     self.event("info", f"replan: tracking error {dpos:.0f} m / dh {x[2] - xr[2]:.0f} m / "
@@ -336,7 +421,7 @@ class ScpMpcGuidance(GuidanceBase):
                 # approach re-selection only before HAC acquisition, not too close to the ALI
                 news = (self.reselect_mode == "always" or big
                         or self._wind_change(self.wind_class) > self.wind_replan_dv)
-                resel = (self.reselect_mode != "off" and news and not self.maxrange and self.sub == "ACQ"
+                resel = (self.reselect_mode != "off" and news and self.sub == "ACQ"
                          and t_to_ali > self.freeze_t_ali and self.n_switch < self.max_switches
                          and t - self.t_switch > self.switch_dwell)
                 self.mpc_fail = 0
@@ -348,7 +433,7 @@ class ScpMpcGuidance(GuidanceBase):
         if self.flare:
             cmd = self._flare(t, s)
         elif self.maxrange:
-            cmd = self._max_range(t, s, x)
+            cmd = self._degraded_cmd(t, s, x)
         else:
             if t - self.t_mpc >= self.mpc_period - 1e-6 or self.u_plan is None:
                 w = AL_W if seg == 1 else TAEM_W
@@ -388,8 +473,12 @@ class ScpMpcGuidance(GuidanceBase):
             "energy_high": bool(self.energy_high),
             "scp": dict(self.scp_info, age=t - self.t_plan, pending=self.pending),
             "mpc": {"ms": self.mpc.ms, "status": self.mpc.status},
-            "ref": {"alpha": float(ur[0]), "bank": float(ur[1] * R2D), "sb": float(ur[2]), "h": float(xr[2]),
-                    "V": float(xr[3])},
+            # degraded: the reference is not flown - show the active command, no h / V reference
+            "ref": ({"alpha": cmd.alpha_deg, "bank": cmd.bank_deg, "sb": cmd.speedbrake_deg, "h": None, "V": None}
+                    if self.maxrange else
+                    {"alpha": float(ur[0]), "bank": float(ur[1] * R2D), "sb": float(ur[2]), "h": float(xr[2]),
+                     "V": float(xr[3])}),
+            "energy": self.energy_dir, "degraded": self.degraded, "terrain_conflict": bool(self.terrain_conflict),
             "plan_id": self.plan_id, "track_err": dpos, "h_err": float(x[2] - xr[2]),
             "switches": self.n_switch,
             "hac_side": (int(self.plan["hac"]["dir"]) if self.plan and self.plan.get("hac") else 0),
@@ -411,17 +500,157 @@ class ScpMpcGuidance(GuidanceBase):
         gear = bool(s.gear_pos > 0.5 and s.agl_gear < 600.0)
         return GuidanceCommand(alpha_deg=a, bank_deg=0.0, speedbrake_deg=0.0, gear_down=gear, info="PLAN/WAIT")
 
-    def _max_range(self, t, s, x):
-        """Unreachable field: best L/D, turn toward the threshold."""
-        thr = self.rwy.thr if self.rwy is not None else np.zeros(2)
-        brg = math.atan2(thr[0] - s.pos[0], thr[1] - s.pos[1])
-        err = wrap_pi(brg - x[5])
-        bank = float(np.clip(err * 1.5, -math.radians(40), math.radians(40)))
-        a = float(self.ctx.tables.best_ld_alpha(s.mach, 0.0, 1.0 if self.gear else 0.0))
-        a = min(a, float(self.pm.alpha_max(s.mach)))
-        bank = float(np.clip(bank, -math.radians(30), math.radians(30)))
-        return GuidanceCommand(alpha_deg=a, bank_deg=bank * R2D, speedbrake_deg=0.0, gear_down=self.gear,
-                               info="TAEM/MAXRANGE")
+    # ------------------------------------------------------------------ degraded modes
+    def _bank_to(self, psi_cmd, s, ff=0.0, lim_deg=45.0):
+        """Bank for a ground-track heading command: first-order heading response (time constant
+        ~12 s) plus a feed-forward bank, limited."""
+        trk = math.atan2(s.vel[0], s.vel[1])
+        err = wrap_pi(psi_cmd - trk)
+        V = max(s.tas, 60.0)
+        bank = math.atan(V * float(np.clip(err / 12.0, -0.15, 0.15)) / G0) + ff
+        return float(np.clip(bank, -math.radians(lim_deg), math.radians(lim_deg)))
+
+    def _alpha_glide(self, s, sb):
+        a = float(self.ctx.tables.best_ld_alpha(s.mach, sb, 1.0 if self.gear else 0.0))
+        # dynamic-pressure guard: more alpha when fast (slows down), less when slow
+        a += float(np.clip((s.qbar - 9500.0) / 2000.0, -2.0, 2.0))
+        return float(np.clip(a, 1.0, float(self.pm.alpha_max(s.mach))))
+
+    def _maxrange_aim(self, s, x):
+        """Farthest point of the approach geometry (WP2, ALI or the extended centreline, either runway
+        end) still in reach at best L/D, with a turn-to-align allowance; if none is, the one closest
+        to being reachable.  Returns (runway end, x along it)."""
+        cfg = ApproachConfig()
+        Eh = float(self.pm.energy_height(s.alt, s.tas)) - self.rwy_elev
+        ldb = float(self.pm.ld_best(s.mach))
+        ld_eff = 0.9 * (ldb if s.mach < 0.9 else 0.5 * (ldb + float(self.pm.ld_best(0.6))))
+        opts = []
+        for end in self.ends.values():
+            for xa in (cfg.x_wp2, cfg.x_ali, -6000.0, -3000.0, 0.0):
+                Ea, Na = end.from_rwy(xa, 0.0)
+                dE, dN = float(Ea) - s.pos[0], float(Na) - s.pos[1]
+                D = math.hypot(dE, dN)
+                ang = abs(wrap_pi(end.heading - math.atan2(dE, dN)))
+                need = 600.0 + abs(xa) / 4.0 + (D + 3500.0 * ang) / ld_eff
+                opts.append((end, xa, Eh - need, need))
+        ok = [o for o in opts if o[2] > 0.08 * o[3]]
+        if ok:
+            o = max(ok, key=lambda o: (-o[1], o[2]))       # farthest out (most negative x), then margin
+        else:
+            o = max(opts, key=lambda o: o[2])
+        return o[0], o[1]
+
+    def _maxrange_law(self, t, s, x):
+        """Best L/D toward the farthest reachable point of the approach, then along the centreline
+        (the planner takes over again with a final-approach plan once established)."""
+        if self.aim is None or (t - self.t_aim > 2.0 and not self.captured):
+            self.aim = self._maxrange_aim(s, x)
+            self.t_aim = t
+        end, xa = self.aim
+        self.rwy = end
+        xr, yr = end.to_rwy(s.pos[0], s.pos[1])
+        xr, yr = float(xr), float(yr)
+        trk = math.atan2(s.vel[0], s.vel[1])
+        herr = abs(wrap_pi(trk - end.heading))
+        Ea, Na = end.from_rwy(xa, 0.0)
+        D = math.hypot(float(Ea) - s.pos[0], float(Na) - s.pos[1])
+        if not self.captured and (D < 2500.0 or (xa - 1500.0 < xr < end.length and abs(yr) < 1500.0
+                                                 and herr < math.radians(45.0))):
+            self.captured = True
+            self.event("info", f"MAXRANGE: on the RWY{end.name} centreline {abs(xr) / 1000:.1f} km out, "
+                               f"{s.agl:.0f} m AGL")
+        if self.captured and (xr > 0.0 and s.agl > 300.0 or herr > math.radians(100.0)):
+            # overflew the threshold still high, or turned away: not an approach any more - re-aim
+            self.captured = False
+            self.aim = self._maxrange_aim(s, x)
+            self.t_aim = t
+            self.event("info", f"MAXRANGE: left the RWY{end.name} centreline ({s.agl:.0f} m AGL) - re-aiming")
+            end, xa = self.aim
+            Ea, Na = end.from_rwy(xa, 0.0)
+        if self.captured:
+            psi_d = end.heading - math.atan(float(np.clip(yr / 2000.0, -0.8, 0.8)))
+        else:
+            psi_d = math.atan2(float(Ea) - s.pos[0], float(Na) - s.pos[1])
+        return psi_d, 0.0, 0.0
+
+    def _hold_law(self, t, s, x):
+        """Energy high: circle the HAC centre (radius for ~35 deg bank, shrinking as the vehicle
+        slows), speedbrake out; re-plans pick a route as soon as the energy fits."""
+        if self.hold is None:
+            end = self.rwy or self.ends["33"]
+            c = ApproachConfig()
+            self.hold = {"center": np.array(end.from_rwy(c.x_wp2, c.r_hac), float), "dir": 1}
+        C, d = self.hold["center"], self.hold["dir"]
+        V = max(s.ground_speed, 60.0)
+        R = max(V * V / (G0 * math.tan(math.radians(35.0))), 4000.0)
+        dE, dN = s.pos[0] - C[0], s.pos[1] - C[1]
+        dist = math.hypot(dE, dN)
+        th = math.atan2(dE, dN)
+        psi_d = th + d * (math.pi / 2.0 + math.atan((dist - R) / 3000.0))
+        ff = d * math.atan(V * V / (G0 * R)) if abs(dist - R) < 0.5 * R else 0.0
+        return psi_d, ff, self.hold_sb
+
+    def _terrain_heading(self, s, psi_d):
+        """Terrain look-ahead along the predicted glide (current flight-path angle, at least the best
+        L/D glide) for the desired heading; if it conflicts with terrain that rises above the field,
+        the nearest clear heading (up to +-180 deg).  Ground at field elevation is not a conflict -
+        the vehicle is meant to get down there.  Returns (heading, min clearance, conflict)."""
+        tf = self.tfield
+        if tf is None or not tf.ok or s.pos[2] > self.terrain_top + 3000.0:
+            return psi_d, float("inf"), False
+        Vg = max(s.ground_speed, 50.0)
+        d = Vg * np.asarray(self.terrain_look)
+        # glide slope (average L/D) - a dive steeper than that only for the first ~10 s
+        glide = -1.0 / max(0.85 * float(self.pm.ld_best(s.mach)), 1.0)
+        tg = math.tan(math.radians(s.gamma_i))
+        h_pred = s.pos[2] + d * glide + np.minimum(d, Vg * 10.0) * min(tg - glide, 0.0)
+        best = (psi_d, -float("inf"))
+        for off in (0, 15, -15, 30, -30, 45, -45, 60, -60, 90, -90, 120, -120, 150, -150, 180):
+            psi = psi_d + math.radians(off)
+            E = s.pos[0] + d * math.sin(psi)
+            N = s.pos[1] + d * math.cos(psi)
+            hT = tf.lin(E, N)[0]
+            near = np.zeros(len(d), bool)
+            for end in self.ends.values():
+                a, c = end.to_rwy(E, N)
+                near |= (a > -4000.0) & (a < end.length + 1000.0) & (np.abs(c) < 1500.0)
+            relevant = (hT > self.rwy_elev + 100.0) & ~near
+            clr = float(np.min(np.where(relevant, h_pred - hT, np.inf)))
+            if clr > self.terrain_clear:
+                return psi, clr, off != 0
+            if clr > best[1]:
+                best = (psi, clr)
+        return best[0], best[1], True
+
+    def _degraded_cmd(self, t, s, x):
+        if self.degraded == "HOLD":
+            psi_d, ff, sb = self._hold_law(t, s, x)
+        else:
+            psi_d, ff, sb = self._maxrange_law(t, s, x)
+        psi_c, clr, conflict = self._terrain_heading(s, psi_d)
+        if conflict != self.terrain_conflict:
+            self.event("warn" if conflict else "info",
+                       f"{self.degraded}: terrain ahead - turning {math.degrees(wrap_pi(psi_c - psi_d)):+.0f} deg, "
+                       f"clearance {clr:.0f} m" if conflict else f"{self.degraded}: terrain clear")
+        self.terrain_conflict = conflict
+        if conflict:
+            ff, sb = 0.0, 0.0                       # stretch the glide over the terrain
+        near_rwy = any(abs(float(e.to_rwy(s.pos[0], s.pos[1])[1])) < 400.0 and
+                       -6000.0 < float(e.to_rwy(s.pos[0], s.pos[1])[0]) < e.length for e in self.ends.values())
+        lim = 35.0 if s.mach > 1.0 else 45.0
+        if s.agl < 600.0 and not near_rwy:
+            lim = 25.0
+        if s.agl < 150.0:
+            lim = 10.0
+        bank = self._bank_to(psi_c, s, ff, lim)
+        alpha = self._alpha_glide(s, sb)
+        if s.agl < 50.0 and not near_rwy:
+            # off-field forced landing: wings level, flare to reduce the sink rate at impact
+            bank = 0.0
+            alpha = min(alpha + 4.0 * (1.0 - max(s.agl, 0.0) / 50.0), float(self.pm.alpha_max(s.mach)))
+            sb = 0.0
+        return GuidanceCommand(alpha_deg=alpha, bank_deg=bank * R2D, speedbrake_deg=sb, gear_down=self.gear,
+                               info=f"TAEM/{self.degraded}")
 
     def _flare(self, t, s):
         sb = float(self.ref.al.sb_pf) if self.ref is not None else 0.0

@@ -194,6 +194,72 @@ def dubins_csc(p0, psi0, r1, s1, p2, psi2, r2, s2):
                       p2=np.asarray(p2, float), psi2=psi2)
 
 
+@dataclass
+class LeadPath:
+    """S-turn ("lead-out") in front of a Dubins route, for straight-in-like starts with too much
+    energy where a larger HAC or another loop changes nothing or far too much: turn ``beta`` rad
+    toward ``s0`` (+1 right) on a circle of radius ``r0``, fly ``a`` metres straight, then the CSC
+    route ``tail`` to WP2.  ``a`` lengthens the track continuously (about 2 a (1 - cos beta) for the
+    out-and-back).  Has the ``DubinsPath`` interface used by the candidates / initial guess."""
+    p0: np.ndarray
+    psi0: float
+    r0: float
+    s0: int
+    beta: float
+    a: float
+    tail: DubinsPath
+
+    @property
+    def length(self):
+        return self.r0 * self.beta + self.a + self.tail.length
+
+    loops = property(lambda self: self.tail.loops)
+    c2 = property(lambda self: self.tail.c2)
+    r2 = property(lambda self: self.tail.r2)
+    s2 = property(lambda self: self.tail.s2)
+    p2 = property(lambda self: self.tail.p2)
+    psi2 = property(lambda self: self.tail.psi2)
+    turn1 = property(lambda self: self.beta)
+
+    def sample(self, ds=200.0):
+        t0 = heading_vec(self.psi0)
+        c0 = self.p0 + self.s0 * self.r0 * right_of(t0)
+        pts, psis, kap, lab = [], [], [], []
+        n = max(int(math.ceil(self.r0 * self.beta / ds)), 1)
+        for i in range(n):
+            ps = self.psi0 + self.s0 * self.beta * i / n
+            pts.append(c0 - self.s0 * self.r0 * right_of(heading_vec(ps)))
+            psis.append(ps)
+            kap.append(self.s0 / self.r0)
+            lab.append(0)
+        psl = self.psi0 + self.s0 * self.beta
+        pl = c0 - self.s0 * self.r0 * right_of(heading_vec(psl))
+        if self.a >= 1.0:                  # (orbit: no straight - no duplicate sample at the tail start)
+            n = max(int(math.ceil(self.a / ds)), 1)
+            for i in range(n):
+                pts.append(pl + heading_vec(psl) * self.a * i / n)
+                psis.append(psl)
+                kap.append(0.0)
+                lab.append(1)
+        P = np.array(pts)
+        E, N, psi, k, lb = self.tail.sample(ds)
+        psi = psi - self.tail.psi0 + psl          # continue the unwrapped heading
+        return (np.concatenate([P[:, 0], E]), np.concatenate([P[:, 1], N]), np.concatenate([psis, psi]),
+                np.concatenate([kap, k]), np.concatenate([lab, lb]))
+
+
+def lead_path(p0, psi0, r0, s0, beta, a, r1, s1, p2, psi2, r2, s2):
+    """LeadPath from (p0, psi0) to (p2, psi2): lead-out turn / straight, then a CSC route."""
+    t0 = heading_vec(psi0)
+    c0 = p0 + s0 * r0 * right_of(t0)
+    psl = psi0 + s0 * beta
+    pl = c0 - s0 * r0 * right_of(heading_vec(psl)) + heading_vec(psl) * a
+    tail = dubins_csc(pl, psl, r1, s1, p2, psi2, r2, s2)
+    if tail is None:
+        return None
+    return LeadPath(p0=np.asarray(p0, float), psi0=psi0, r0=r0, s0=s0, beta=beta, a=a, tail=tail)
+
+
 def turn_radius(V, bank_deg=45.0):
     return max(V, 60.0) ** 2 / (G0 * math.tan(math.radians(bank_deg)))
 
@@ -230,6 +296,7 @@ class Candidate:
     relaxed: bool = False     # stretched path (enlarged HAC / extra loops) for a high-energy start
     head: float = 0.0         # mean headwind along the path (m/s)
     dE_min_rob: float = 0.0   # energy needed with the headwind 30 % stronger (relaxed paths)
+    energy: str = "ok"        # energy direction found by select_plan: ok / high / low
 
     @property
     def feasible(self):
@@ -296,10 +363,60 @@ def path_energy_budget(model, path: DubinsPath, x0, x_ali, ds=400.0, head_k=1.0)
     return dE_min, dE_max, Eh0 - Ehf, (E, N, psi, kap, lab, s, h, V, M, q)
 
 
-def candidates(model, x0, ends, cfg: ApproachConfig, level=0):
+# ----------------------------------------------------------------------------- first turn
+R1_MIN, R1_MAX = 3000.0, 40000.0
+TURN_BANK_MAX = math.radians(55.0)   # planning bank for the initial turn (the SCP allows 60 / 70 deg)
+TURN_NZ_MAX = 2.0                    # ... and load factor (SCP soft limit 2.5 g)
+TIGHT_R1_FROM = 6000.0               # offer the decelerating-turn radius once the 45 deg circle exceeds this
+
+
+def effective_turn_radius(model, x0, turn=math.pi, n_steps=12):
+    """Mean radius of an initial turn of ``turn`` rad flown at the lift-limited bank.
+
+    A fast, high start does not keep its speed through a long turn: it glides down while turning,
+    so at roughly constant dynamic pressure its true airspeed - and the radius, ~V^2 - shrinks.
+    A constant-speed 45 deg circle at the initial speed (Mach 1.6 at 20 km: 22.9 km radius, a
+    285 deg turn-back ~115 km long) wildly overestimates the ground track and made such starts look
+    hopelessly short of energy.  The turn is integrated in ``n_steps`` arcs: bank limited by
+    min(TURN_BANK_MAX, the load factor CL_max q S / (m g) allows, TURN_NZ_MAX); energy lost at the
+    best L/D reduced by the turn (sqrt(cos bank)); altitude / speed from the energy height at the
+    (clipped) current dynamic pressure.  Returns the arc length / ``turn``."""
+    h, V = float(x0[2]), float(x0[3])
+    q = float(np.clip(model.qbar(h, V), 6.0e3, 12.0e3))
+    Eh = h + V * V / (2.0 * G0)
+    W = model.m * G0
+    L = 0.0
+    dth = turn / n_steps
+    for _ in range(n_steps):
+        rho, a = atm(h)
+        M = V / float(a)
+        cl_max = float(model.coeffs(model.alpha_max(M), M, 0.0)[0])
+        n_max = min(cl_max * q * model.S / W, TURN_NZ_MAX)
+        bank = math.acos(1.0 / n_max) if n_max > 1.02 else math.radians(11.0)
+        bank = min(bank, TURN_BANK_MAX)
+        r = V * V / (G0 * math.tan(bank))
+        ds = r * dth
+        L += ds
+        Eh -= ds / (float(model.ld_best(M)) * math.sqrt(math.cos(bank)))
+        h = float(h_from_energy(np.array([Eh]), q)[0])
+        rho, a = atm(h)
+        V = math.sqrt(2.0 * q / float(rho))
+    return L / turn
+
+
+def first_turn_radii(model, x0):
+    """Initial-turn radii for the Dubins candidates: the 45 deg circle at the current speed and, for
+    fast starts (where that circle is large), the decelerating lift-limited turn."""
+    r_nom = min(max(turn_radius(float(x0[3]), 45.0), R1_MIN), R1_MAX)
+    if r_nom <= TIGHT_R1_FROM:
+        return (r_nom,)
+    r_eff = min(max(effective_turn_radius(model, x0), R1_MIN), R1_MAX)
+    return (r_nom, r_eff) if r_eff < 0.85 * r_nom else (r_nom,)
+
+
+def candidates(model, x0, ends, cfg: ApproachConfig, level=0, radii=None):
     out = []
-    V0 = float(x0[3])
-    r1 = min(max(turn_radius(V0, 45.0), 3000.0), 40000.0)
+    radii = radii or first_turn_radii(model, x0)
     psi0 = float(x0[5])
     p0 = np.array([x0[0], x0[1]])
     for rwy in ends.values():
@@ -308,25 +425,40 @@ def candidates(model, x0, ends, cfg: ApproachConfig, level=0):
         wp2 = np.array(rwy.from_rwy(c.x_wp2, 0.0))
         wE, wN = model.wind(rwy.elev + 300.0)
         tail = float(wE * rwy.d[0] + wN * rwy.d[1])
-        for side in (+1, -1):
-            for s1 in (+1, -1):
-                p = dubins_csc(p0, psi0, r1, s1, wp2, rwy.heading, c.r_hac, side)
-                if p is None:
-                    continue
-                for loops in (0, 1, 2):
-                    p.loops = loops
-                    dmin, dmax, dav, _ = path_energy_budget(model, p, x0, x_ali, ds=700.0)
-                    L = p.length + c.d_prefinal
-                    out.append(Candidate(rwy=rwy, cfg=c, path=replace(p), side=side, L_taem=L,
-                                         dE_avail=dav, dE_min=dmin, dE_max=dmax, tail=tail, level=level))
-                    if dav <= dmax * 0.97:
-                        break            # extra HAC loops only when there is too much energy
+        for r1 in radii:
+            for side in (+1, -1):
+                for s1 in (+1, -1):
+                    p = dubins_csc(p0, psi0, r1, s1, wp2, rwy.heading, c.r_hac, side)
+                    if p is None:
+                        continue
+                    for loops in (0, 1, 2):
+                        p.loops = loops
+                        dmin, dmax, dav, _ = path_energy_budget(model, p, x0, x_ali, ds=700.0)
+                        L = p.length + c.d_prefinal
+                        out.append(Candidate(rwy=rwy, cfg=c, path=replace(p), side=side, L_taem=L,
+                                             dE_avail=dav, dE_min=dmin, dE_max=dmax, tail=tail, level=level))
+                        if dav <= dmax * 0.97:
+                            break            # extra HAC loops only when there is too much energy
     return out
 
 
-HAC_SCALES = (1.0, 1.25, 1.5, 1.8, 2.2)    # relaxed: enlarged HAC radii ...
-MAX_LOOPS_RELAXED = 4                        # ... and more HAC loops
-HEAD_K_ROBUST = 1.3                          # relaxed paths must still reach with 30 % more headwind
+def energy_direction(cands):
+    """Which way the energy is off for a set of (nominal) candidates: "ok" if one is inside its
+    band; "high" if at least one route still leaves energy to spare (the field is in reach, the
+    routes are just too short or fall in the gap between two loop counts); "low" if every route
+    needs more energy than is available."""
+    if any(c.feasible for c in cands):
+        return "ok"
+    if any(c.dE_avail > c.dE_max * 0.97 for c in cands):
+        return "high"
+    return "low"
+
+
+BAND_TARGET = 0.35                         # aimed-for position in the energy band (plan_score)
+K_GRID = (0.76, 1.0, 1.3, 1.7, 2.2)        # stretched: HAC radius scale, searched continuously ...
+K_BISECT = 6                               # ... by bisection between these grid points
+MAX_LOOPS_RELAXED = 4                      # ... with up to this many extra HAC loops
+HEAD_K_ROBUST = 1.3                        # stretched paths must still reach with 30 % more headwind
 
 
 def headwind_mean(model, prof):
@@ -349,101 +481,300 @@ def _with_prefinal(path: DubinsPath, rwy: RunwayEnd, c: ApproachConfig, ds=350.0
                      np.concatenate([psi, np.full(n, psi[-1])]))
 
 
-def relaxed_candidates(model, x0, ends, cfg: ApproachConfig):
-    """High-energy starts (too close / too high or fast for the nominal geometry): stretch the
-    ground track with an enlarged HAC and extra HAC loops so the energy band has no gaps between
-    loop counts; the budget includes the prefinal straight.  Every candidate is rated for
-    headwind exposure and checked against a 30 % stronger headwind, so stretched legs into a
-    strong headwind are not chosen."""
+def _stretch_eval(model, x0, p0, psi0, r1, s1, rwy, cfg, k, side, loops, tail):
+    """Stretched candidate with the HAC radius scaled by ``k`` (budget includes the prefinal)."""
+    c = replace(cfg, r_hac=cfg.r_hac * k)
+    x_ali = ali_state(model, rwy, c)
+    wp2 = np.array(rwy.from_rwy(c.x_wp2, 0.0))
+    p = dubins_csc(p0, psi0, r1, s1, wp2, rwy.heading, c.r_hac, side)
+    if p is None:
+        return None
+    p.loops = loops
+    tp = _with_prefinal(p, rwy, c)
+    dmin, dmax, dav, prof = path_energy_budget(model, tp, x0, x_ali, ds=700.0)
+    cand = Candidate(rwy=rwy, cfg=c, path=replace(p), side=side, L_taem=p.length + c.d_prefinal,
+                     dE_avail=dav, dE_min=dmin, dE_max=dmax, tail=tail, level=0, relaxed=True,
+                     head=headwind_mean(model, prof))
+    cand._tp, cand._x_ali = tp, x_ali
+    return cand
+
+
+def _family_search(ev, grid, target, x0, model):
+    """Continuous 1-D search over a path family: evaluate ``ev(v)`` on ``grid`` (values ordered so
+    the track gets longer), bracket the energy-band position ``target`` and bisect it; otherwise the
+    in-band grid point closest to it.  Returns the candidate (with ``dE_min_rob`` set) or None."""
+    pts = [(v, ev(v)) for v in grid]
+    pts = [(v, c) for v, c in pts if c is not None]
+    if not pts:
+        return None
+    best = None
+    for (va, ca), (vb, cb) in zip(pts[:-1], pts[1:]):
+        if (ca.band_pos - target) * (cb.band_pos - target) <= 0.0:
+            lo, hi, clo = va, vb, ca
+            for _ in range(K_BISECT):
+                vm = 0.5 * (lo + hi)
+                cm = ev(vm)
+                if cm is None:
+                    break
+                if (clo.band_pos - target) * (cm.band_pos - target) <= 0.0:
+                    hi = vm
+                else:
+                    lo, clo = vm, cm
+                best = cm
+            if best is None:
+                best = ca if abs(ca.band_pos - target) < abs(cb.band_pos - target) else cb
+            break
+    if best is None:
+        ok = [c for _, c in pts if c.dE_min * 1.04 <= c.dE_avail <= c.dE_max * 0.97]
+        if not ok:
+            return None
+        best = min(ok, key=lambda c: abs(c.band_pos - target))
+    if best.dE_min * 1.04 <= best.dE_avail <= best.dE_max * 0.97:
+        best.dE_min_rob = path_energy_budget(model, best._tp, x0, best._x_ali, ds=700.0, head_k=HEAD_K_ROBUST)[0]
+    else:
+        best.dE_min_rob = best.dE_min
+    best._tp = best._x_ali = None
+    return best
+
+
+def stretched_candidates(model, x0, ends, cfg: ApproachConfig, target=BAND_TARGET, names=None, radii=None):
+    """Too much energy for every nominal route (too close / too high or fast, or between two loop
+    counts): lengthen the ground track *continuously*.  For every route topology (runway end, first
+    turn radius and direction, HAC side, number of extra HAC loops) the HAC radius scale k in
+    [K_GRID[0], K_GRID[-1]] is searched (grid, then bisection) for the energy-band position
+    ``target``; the loop count only moves the search to the next stretch interval, so there are no
+    gaps between "one loop too much energy" and "two loops too little".  Every candidate is rated
+    for headwind exposure and checked against a 30 % stronger headwind (``dE_min_rob``)."""
     out = []
-    V0 = float(x0[3])
-    r1 = min(max(turn_radius(V0, 45.0), 3000.0), 40000.0)
+    radii = radii or first_turn_radii(model, x0)
     psi0 = float(x0[5])
     p0 = np.array([x0[0], x0[1]])
     for rwy in ends.values():
+        if names is not None and rwy.name not in names:
+            continue
         wE, wN = model.wind(rwy.elev + 300.0)
         tail = float(wE * rwy.d[0] + wN * rwy.d[1])
-        for k in HAC_SCALES:
-            c = replace(cfg, r_hac=cfg.r_hac * k)
-            x_ali = ali_state(model, rwy, c)
-            wp2 = np.array(rwy.from_rwy(c.x_wp2, 0.0))
+        for r1 in radii:
             for side in (+1, -1):
                 for s1 in (+1, -1):
-                    p = dubins_csc(p0, psi0, r1, s1, wp2, rwy.heading, c.r_hac, side)
-                    if p is None:
-                        continue
                     for loops in range(MAX_LOOPS_RELAXED + 1):
-                        p.loops = loops
-                        tp = _with_prefinal(p, rwy, c)
-                        dmin, dmax, dav, prof = path_energy_budget(model, tp, x0, x_ali, ds=700.0)
-                        cand = Candidate(rwy=rwy, cfg=c, path=replace(p), side=side,
-                                         L_taem=p.length + c.d_prefinal, dE_avail=dav, dE_min=dmin,
-                                         dE_max=dmax, tail=tail, level=0, relaxed=True,
-                                         head=headwind_mean(model, prof))
-                        if dmin * 1.04 <= dav <= dmax * 0.97:
-                            cand.dE_min_rob = path_energy_budget(model, tp, x0, x_ali, ds=700.0,
-                                                                 head_k=HEAD_K_ROBUST)[0]
-                        else:
-                            cand.dE_min_rob = dmin
-                        out.append(cand)
-                        if dav <= dmax * 0.97:
-                            break        # extra loops only while there is too much energy
+                        ev = (lambda k, loops=loops, r1=r1, side=side, s1=s1:
+                              _stretch_eval(model, x0, p0, psi0, r1, s1, rwy, cfg, k, side, loops, tail))
+                        c0 = ev(K_GRID[0])
+                        if c0 is None:
+                            break
+                        if c0.dE_avail < c0.dE_min * 1.04:
+                            break        # even the tightest HAC is too long: more loops only longer
+                        best = _family_search(ev, K_GRID, target, x0, model)
+                        if best is not None:
+                            out.append(best)
     return out
 
 
-def plan_score(c: Candidate, prefer=None):
+STURN_BETA = (math.radians(60.0), math.radians(90.0))   # S-turn: lead-out angles ...
+STURN_GRID = (0.0, 4000.0, 9000.0, 16000.0, 26000.0)      # ... and lead-out lengths (m), bisected
+STURN_R0 = 4000.0                                          # lead-out turn radius (subsonic, ~32 deg)
+ORBIT_R = (2800.0,)                                          # S-turn alternative: initial orbit, min radius (m) ...
+ORBIT_R_SCALE = (1.0, 1.25, 1.6, 2.1, 2.8)                   # ... and radius grid (x the minimum), bisected
+
+
+def _sturn_eval(model, x0, p0, psi0, r0, s0, beta, a, r1, s1, rwy, cfg, side, tail_w):
+    x_ali = ali_state(model, rwy, cfg)
+    wp2 = np.array(rwy.from_rwy(cfg.x_wp2, 0.0))
+    p = lead_path(p0, psi0, r0, s0, beta, a, r1, s1, wp2, rwy.heading, cfg.r_hac, side)
+    if p is None:
+        return None
+    tp = _with_prefinal(p, rwy, cfg)
+    dmin, dmax, dav, prof = path_energy_budget(model, tp, x0, x_ali, ds=700.0)
+    cand = Candidate(rwy=rwy, cfg=cfg, path=p, side=side, L_taem=p.length + cfg.d_prefinal,
+                     dE_avail=dav, dE_min=dmin, dE_max=dmax, tail=tail_w, level=0, relaxed=True,
+                     head=headwind_mean(model, prof))
+    cand._tp, cand._x_ali = tp, x_ali
+    return cand
+
+
+def sturn_candidates(model, x0, ends, cfg: ApproachConfig, target=BAND_TARGET, names=None, radii=None):
+    """Too much energy where neither a larger HAC nor another loop fits (typically straight-in or
+    nearly so: the HAC turn is ~0, so its radius hardly matters, and one more loop is far too long):
+    an S-turn - turn away by beta, fly the lead-out length ``a`` (searched continuously for the
+    band position ``target``), then the nominal CSC route to the HAC."""
+    out = []
+    radii = radii or first_turn_radii(model, x0)
+    psi0 = float(x0[5])
+    p0 = np.array([x0[0], x0[1]])
+    r0 = max(min(radii), STURN_R0)
+    r1 = r0
+    for rwy in ends.values():
+        if names is not None and rwy.name not in names:
+            continue
+        wE, wN = model.wind(rwy.elev + 300.0)
+        tail_w = float(wE * rwy.d[0] + wN * rwy.d[1])
+        for beta in STURN_BETA:
+            for s0 in (+1, -1):
+                for side in (+1, -1):
+                    for s1 in (+1, -1):
+                        ev = (lambda a, beta=beta, s0=s0, side=side, s1=s1:
+                              _sturn_eval(model, x0, p0, psi0, r0, s0, beta, a, r1, s1, rwy, cfg, side, tail_w))
+                        best = _family_search(ev, STURN_GRID, target, x0, model)
+                        if best is not None:
+                            out.append(best)
+        # close to the field (e.g. straight in, ~10 km to WP2): no room for an S-turn - a full
+        # orbit first, its radius searched continuously, then the nominal route
+        # orbit radius: from what the vehicle can fly now (the decelerating turn when fast) up
+        r_lo = min(radii) if max(radii) > TIGHT_R1_FROM else ORBIT_R[0]
+        orbit_grid = tuple(r_lo * f for f in ORBIT_R_SCALE)
+        for r1n in radii:
+            for side in (+1, -1):
+                for s1 in (+1, -1):
+                    ev = (lambda r, side=side, s1=s1, r1n=r1n:
+                          _sturn_eval(model, x0, p0, psi0, r, s1, TWO_PI, 0.0, r1n, s1, rwy, cfg, side, tail_w))
+                    best = _family_search(ev, orbit_grid, target, x0, model)
+                    if best is not None:
+                        out.append(best)
+    return out
+
+
+def plan_score(c: Candidate, prefer=None, target=BAND_TARGET):
     """Lower is better: aim for the middle-low part of the energy band, prefer into-wind,
     fewer HAC loops, shorter TAEM; stretched (relaxed) paths: least headwind exposure, then the
-    smallest HAC."""
-    s = abs(c.band_pos - 0.35)
+    HAC radius closest to nominal."""
+    s = abs(c.band_pos - target)
     s += 0.04 * max(c.tail - 2.0, 0.0)
     s += 0.05 * c.path.loops
     s += 1.5e-6 * c.L_taem
     if c.relaxed:
-        s += 0.06 * c.head + 0.08 * (c.cfg.r_hac / ApproachConfig.r_hac - 1.0)
+        s += 0.06 * c.head + 0.08 * abs(c.cfg.r_hac / ApproachConfig.r_hac - 1.0)
+    if isinstance(c.path, LeadPath):
+        s += 0.05 + 4e-6 * c.path.a
     if prefer is not None and c.rwy.name == prefer:
         s -= 0.08
     return s
 
 
+def _stretch_note(best):
+    if isinstance(best.path, LeadPath) and best.path.beta > 6.0:
+        return f"high energy: initial orbit ({best.path.r0/1000:.1f} km radius) before the approach"
+    if isinstance(best.path, LeadPath):
+        return (f"high energy: S-turn ({math.degrees(best.path.beta):.0f} deg "
+                f"{'right' if best.path.s0 > 0 else 'left'}, {best.path.a/1000:.1f} km lead-out)")
+    return (f"high energy: stretched approach (HAC radius {best.path.r2/1000:.1f} km, "
+            f"{best.path.loops} extra loop{'s' if best.path.loops != 1 else ''})")
+
+
 def select_plan(model, x0, ends, cfg: ApproachConfig, prefer=None):
-    """Pick runway end / HAC side / loops.  Returns (candidate, reachable, note)."""
-    for level in (0, 1, 2):
-        cands = candidates(model, x0, ends, cfg, level)
+    """Pick runway end / HAC side / loops / HAC radius.  Returns (candidate, reachable, note);
+    ``candidate.energy`` is "ok", "high" or "low" (which way the energy was off for the nominal
+    approach), or "turn" (enough energy for a direct glide, but too fast to turn back yet).
+
+    The energy direction is decided first, on the nominal approach: only when *every* nominal route
+    needs more energy than is available is a shortened (low-energy) approach used; when some route
+    leaves energy to spare the track is stretched continuously (larger HAC, extra loops) instead.
+    (Before, the shortened levels were tried first, so high-energy starts often ended up on the
+    low-energy approach and were annunciated as LOW ENERGY.)"""
+    radii = first_turn_radii(model, x0)
+    nom = candidates(model, x0, ends, cfg, 0, radii)
+    feas = [c for c in nom if c.feasible]
+    if feas:
+        best = min(feas, key=lambda c: plan_score(c, prefer))
+        best.energy = "ok"
+        return best, True, ""
+    direction = energy_direction(nom)
+    rel = None
+    if direction == "high":
+        rel = stretched_candidates(model, x0, ends, cfg, radii=radii)
+        feas = [c for c in rel if c.feasible]
+        if not feas:
+            rel = rel + sturn_candidates(model, x0, ends, cfg, radii=radii)
+            feas = [c for c in rel if c.feasible]
+        if feas:
+            best = min(feas, key=lambda c: plan_score(c, prefer))
+            best.energy = "high"
+            return best, True, _stretch_note(best)
+    # low energy (or nothing stretched works): shortened approaches - lower ALI, shorter prefinal,
+    # tighter HAC
+    for level in (1, 2):
+        cands = candidates(model, x0, ends, cfg, level, radii)
         feas = [c for c in cands if c.feasible]
         if feas:
             best = min(feas, key=lambda c: plan_score(c, prefer))
-            note = "" if level == 0 else f"low energy: shortened approach (level {level})"
-            return best, True, note
+            best.energy = direction
+            if direction == "high":
+                return best, True, f"high energy: tighter HAC (shortened approach level {level})"
+            return best, True, f"low energy: shortened approach (level {level})"
     # nothing feasible.  Low energy only if even the most economical path (shortest approach,
     # best L/D) is out of reach; otherwise there is energy to spare and the vehicle is too high /
     # fast for how close it is.  Long detours (e.g. a ~360 deg first turn) always "need" more than
     # is available, so they must not decide it.
-    cands = candidates(model, x0, ends, cfg, 2)
+    cands = candidates(model, x0, ends, cfg, 2, radii)
     cheapest = max(cands, key=lambda c: c.dE_avail / max(c.dE_min, 1.0))
-    if cheapest.dE_avail < cheapest.dE_min * 1.04:
+    if direction == "low" and cheapest.dE_avail < cheapest.dE_min * 1.04:
+        # every Dubins route is out of reach: really low energy, or only too fast to turn back yet?
+        # (supersonic the vehicle has little more than 1 g of lift, so its turns are very wide.)
+        # Turn limited if the same routes flown with a subsonic-size first turn would be in reach.
+        if max(radii) > TIGHT_R1_FROM:
+            tight = candidates(model, x0, ends, cfg, 2, (R1_MIN,))
+            ct = max(tight, key=lambda c: c.dE_avail / max(c.dE_min, 1.0))
+            if ct.dE_avail >= ct.dE_min * 1.04:
+                name = ct.rwy.name
+                cheapest = max((c for c in cands if c.rwy.name == name),
+                               key=lambda c: c.dE_avail / max(c.dE_min, 1.0), default=cheapest)
+                cheapest.energy = "turn"
+                return cheapest, False, (f"TURN LIMITED: too fast to turn back toward runway {name} yet (the turn "
+                                         f"needs {cheapest.dE_min/1000:.1f} km energy height, {cheapest.dE_avail/1000:.1f}"
+                                         f" km available) - gliding toward the field")
+        cheapest.energy = "low"
         return cheapest, False, (f"LOW ENERGY: runway {cheapest.rwy.name} needs {cheapest.dE_min/1000:.1f} km "
                                  f"energy height, {cheapest.dE_avail/1000:.1f} km available")
     # energy to spare: stretch the path (enlarged HAC, more loops), avoiding strong headwind legs
-    rel = relaxed_candidates(model, x0, ends, cfg)
-    feas = [c for c in rel if c.feasible]
-    if feas:
-        best = min(feas, key=lambda c: plan_score(c, prefer))
-        return best, True, (f"high energy: stretched approach (HAC radius {best.path.r2/1000:.1f} km, "
-                            f"{best.path.loops} extra loop{'s' if best.path.loops != 1 else ''})")
+    if rel is None:
+        rel = stretched_candidates(model, x0, ends, cfg, radii=radii)
+        feas = [c for c in rel if c.feasible]
+        if not feas:
+            rel = rel + sturn_candidates(model, x0, ends, cfg, radii=radii)
+            feas = [c for c in rel if c.feasible]
+        if feas:
+            best = min(feas, key=lambda c: plan_score(c, prefer))
+            best.energy = "high"
+            return best, True, _stretch_note(best)
     windy = [c for c in rel if c.dE_min * 1.04 <= c.dE_avail <= c.dE_max * 0.97]
     if windy:
         # only stretched paths with long legs into a strong headwind would work: not planned as
         # reachable (no margin if the headwind is stronger); flown as the best effort
         best = min(windy, key=lambda c: plan_score(c, prefer))
+        best.energy = "high"
         return best, False, (f"HIGH ENERGY: runway {best.rwy.name} only reachable on a stretched approach into a "
                              f"strong headwind ({best.head:.0f} m/s average) - no margin")
     cands = cands + rel
     # closest to being able to dissipate: smallest excess over the dissipation limit
     high = [c for c in cands if c.dE_avail > c.dE_max * 0.97] or cands
     best = min(high, key=lambda c: c.dE_avail / max(c.dE_max, 1.0))
+    best.energy = "high"
     return best, False, (f"HIGH ENERGY: runway {best.rwy.name} can dissipate at most {best.dE_max/1000:.1f} km "
                          f"energy height, {best.dE_avail/1000:.1f} km available - too close for this altitude / speed")
+
+
+def stretched_pick(model, x0, ends, cfg: ApproachConfig, target, prefer=None):
+    """Planner recovery when the SCP reached the ALI too high / fast: the stretched route whose
+    estimated band position is ``target`` (below the one just flown, i.e. a longer track) and that
+    is still reachable at best L/D.  None if there is none."""
+    names = [prefer] if prefer in ends else None
+    def pool(nm):
+        rel = stretched_candidates(model, x0, ends, cfg, target=target, names=nm)
+        ok = [c for c in rel if c.dE_min * 1.04 <= c.dE_avail]
+        near = [c for c in ok if abs(c.band_pos - target) < 0.15]
+        if not near:
+            ok += [c for c in sturn_candidates(model, x0, ends, cfg, target=target, names=nm)
+                   if c.dE_min * 1.04 <= c.dE_avail]
+        return ok
+
+    ok = pool(names)
+    if not ok and names is not None:
+        ok = pool(None)
+    if not ok:
+        return None
+    best = min(ok, key=lambda c: plan_score(c, prefer, target=target))
+    best.energy = "high"
+    return best
 
 
 class TrackPath:
@@ -512,6 +843,9 @@ def initial_guess(model, x0, cand: Candidate, n_nodes=40):
     psi = np.concatenate([psi, np.full(nP, psi[-1])])
     kap = np.concatenate([kap, np.zeros(nP)])
     lab = np.concatenate([lab, np.full(nP, 3)])
+    # drop repeated samples (zero-length segments make the altitude gradient / time NaN)
+    keep = np.concatenate([[True], np.hypot(np.diff(E), np.diff(N)) > 1e-3])
+    E, N, psi, kap, lab = E[keep], N[keep], psi[keep], kap[keep], lab[keep]
     seg = np.hypot(np.diff(E), np.diff(N))
     s = np.concatenate([[0.0], np.cumsum(seg)])
     f = s / max(s[-1], 1.0)

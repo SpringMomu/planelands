@@ -14,8 +14,9 @@ from dataclasses import asdict
 import numpy as np
 
 from .approach import ALRef, build_reference
-from .geometry import TWO_PI, ApproachConfig, initial_guess, plan_score, rate_track, runway_ends, select_plan
-from .model import PlanningModel
+from .geometry import (BAND_TARGET, TWO_PI, ApproachConfig, candidates, initial_guess, plan_score, rate_track,
+                       runway_ends, select_plan, stretched_pick)
+from .model import G0, PlanningModel
 from .scp import DX, ScpSolver, TerrainField
 
 _CTX = None
@@ -146,8 +147,12 @@ def plan(req: dict) -> dict:
     switch = None
     if kind == "warm" and req.get("reselect"):
         switch, decision = _reselect(pm, ctx, x0, Xg, rwy, cfg, hac)
+    energy_cls = None              # which way the energy is off (select_plan), for the degraded modes
+    if req.get("fault_scp"):
+        return _fault_result(req, pm, ctx, x0, t_start)
     if kind != "warm":
         cand, reachable, note = select_plan(pm, x0, ctx.ends, ApproachConfig(), prefer=req.get("prefer"))
+        energy_cls = cand.energy
         rwy, cfg, hac = cand.rwy, cand.cfg, cand.hac()
         Xg0, Ug0, tf0, _ = initial_guess(pm, x0, cand, 40)
         N = _nodes_for(tf0)
@@ -195,15 +200,60 @@ def plan(req: dict) -> dict:
         ms_total += res.ms
         it_total += res.iterations
     if not good:
-        # retry from the geometric guess (and with a shortened approach if energy is short)
+        # Recovery: the SCP did not reach the ALI.  Its end state says which way the energy is off:
+        #   too high / fast at the ALI -> a longer track (larger HAC, extra loop, S-turn / orbit)
+        #                                 aimed at a band position below the one just flown
+        #   too low / slow             -> a shortened approach (lower ALI, shorter prefinal, tighter HAC)
+        #   no usable end state        -> a fresh geometric guess from the runway / HAC selection
+        # (before, only the low-energy direction was handled: a high miss gave up at once.)
         lvl0 = 0
+        band_t = BAND_TARGET
+        tried = set()
+        last, last_rwy, last_cfg, last_hac = res, rwy, cfg, hac
+        gnote = ""
+        if kind == "cold":
+            tried.add("guess")           # the first attempt already was the selection's geometric guess
         for _ in range(3):
-            cand, reach2, note2 = select_plan(pm, x0, ctx.ends, ApproachConfig(), prefer=rwy.name)
-            if lvl0 > cand.level:
-                from .geometry import candidates as _cands
-                cs = [c for c in _cands(pm, x0, ctx.ends, ApproachConfig(), lvl0) if c.rwy.name == cand.rwy.name]
+            te = last.term_err
+            usable = bool(np.all(np.isfinite(te)) and np.all(np.isfinite(last.X)) and np.isfinite(last.defect)
+                          and last.defect < 0.05)
+            v_ali = float(last.X[-1, 3]) if usable else 0.0
+            e_exc = float(te[2] + v_ali * te[3] / G0) if usable else 0.0    # energy-height excess at the ALI
+            mode = "guess"
+            cand = None
+            if usable and (te[2] > 150 or te[3] > 8) and e_exc > 0.0:
+                mode = "stretch"
+                try:
+                    cur = rate_track(pm, x0, last.X, last_rwy, last_cfg, last_hac)
+                    span = max(cur.dE_max - cur.dE_min, 1.0)
+                    band_t = float(np.clip(min(band_t, cur.band_pos) - e_exc / span - 0.05, 0.02, BAND_TARGET))
+                except Exception:
+                    band_t = max(band_t - 0.15, 0.02)
+                cand = stretched_pick(pm, x0, ctx.ends, ApproachConfig(), band_t, prefer=last_rwy.name)
+            elif usable and (te[2] < -150 or te[3] < -8):
+                mode = "shorten"
+                lvl0 += 1
+                if lvl0 > 2:
+                    break
+                cs = [c for c in candidates(pm, x0, ctx.ends, ApproachConfig(), lvl0) if c.rwy.name == last_rwy.name]
+                cs = [c for c in cs if c.dE_avail >= c.dE_min * 1.04] or cs
                 if cs:
-                    cand = min(cs, key=lambda c: abs(c.band_pos - 0.35))
+                    cand = min(cs, key=lambda c: abs(c.band_pos - BAND_TARGET))
+                    cand.energy = "low"
+            if cand is None:
+                if "guess" in tried:
+                    break
+                tried.add("guess")
+                mode = "guess"
+                cand, _, gnote = select_plan(pm, x0, ctx.ends, ApproachConfig(), prefer=rwy.name)
+            key = _cand_key(cand)
+            if key in tried:
+                if mode == "stretch":
+                    band_t = max(band_t - 0.1, 0.02)     # same route again: aim lower next time
+                    continue
+                break
+            tried.add(key)
+            energy_cls = cand.energy if energy_cls in (None, "ok") else energy_cls
             Xg0, Ug0, tf0, _ = initial_guess(pm, x0, cand, 40)
             N2 = _nodes_for(tf0)
             Xg2, Ug2, tfg2 = _resample(np.linspace(0, tf0, 40), Xg0, Ug0, N2) if N2 != 40 else (Xg0, Ug0, tf0)
@@ -212,34 +262,70 @@ def plan(req: dict) -> dict:
             it_total += r2.iterations
             if g2 or (c2 and not consistent):
                 res, good, consistent, al, Xg, Ug, tfg = r2, g2, c2, al2, Xg2, Ug2, tfg2
-                rwy, cfg, hac, reachable, kind = cand.rwy, cand.cfg, cand.hac(), reach2, "cold"
-                note = note2
+                rwy, cfg, hac, kind = cand.rwy, cand.cfg, cand.hac(), "cold"
+                reachable = True
+                note = {"stretch": "SCP high at the ALI: re-planned on a longer track",
+                        "shorten": f"SCP low at the ALI: shortened approach (level {lvl0})",
+                        "guess": gnote}[mode]
+                if mode == "stretch" and getattr(cand, "relaxed", False):
+                    from .geometry import _stretch_note
+                    note += f" ({_stretch_note(cand)})"
             if good:
                 break
-            te = r2.term_err
-            # energy short at the ALI (low / slow): next attempt with a shortened approach
-            if te[2] < -150 or te[3] < -8:
-                lvl0 = max(lvl0, cand.level) + 1
-                if lvl0 > 2:
-                    break
-            else:
-                break
+            last, last_rwy, last_cfg, last_hac = r2, cand.rwy, cand.cfg, cand.hac()
     te = res.term_err
     if good or consistent:
         X, U, tf = res.X, res.U, res.tf      # best-effort SCP trajectory even if the ALI is missed
     else:
         X, U, tf = Xg, Ug, tfg
+    if good and not reachable and "headwind" not in note:
+        # the geometric energy estimate said no, but the SCP (the planning dynamics) reached the ALI:
+        # the estimate is a heuristic - the plan is flyable
+        reachable = True
+        note = (note + " - " if note else "") + "but the SCP reached the ALI: planned as reachable"
     if not good:
         reachable = False
         note = (note + "; " if note else "") + (
             f"ALI not reachable (miss: dh {te[2]:+.0f} m, dV {te[3]:+.1f} m/s) - best-effort trajectory"
             if consistent else "SCP failed - geometric reference")
     res.ms, res.iterations = ms_total, it_total
+    if good:
+        energy = "ok"
+    elif consistent and np.all(np.isfinite(te)):
+        e_exc = float(te[2] + float(X[-1, 3]) * te[3] / G0)
+        energy = "high" if e_exc > 0.0 else "low"
+    else:
+        if energy_cls is None:
+            energy_cls = select_plan(pm, x0, ctx.ends, ApproachConfig())[0].energy
+        energy = energy_cls
     return dict(t0=req.get("t0", 0.0), rwy=rwy.name, cfg=asdict(cfg), hac=hac, X=X, U=U, tf=tf, kind=kind,
+                energy=energy,
                 converged=bool(res.converged), ok=bool(good), fallback=not (good or consistent), iterations=res.iterations,
                 ms=res.ms, wall_ms=(time.perf_counter() - t_start) * 1e3, cost=res.cost, defect=res.defect,
                 term_err=te, reachable=bool(reachable) and bool(good), note=note, al=_al_dict(al),
                 wind=req.get("wind", (0.0, 0.0)), episode=req.get("episode"), decision=decision)
+
+
+def _cand_key(c):
+    """Identity of a geometric route, so the recovery does not retry the same one."""
+    p = c.path
+    return (c.rwy.name, int(c.side), int(getattr(p, "loops", 0)), round(float(getattr(p, "r2", 0.0)) / 250.0),
+            int(c.level), type(p).__name__, round(float(getattr(p, "a", 0.0)) / 500.0),
+            round(float(getattr(p, "r1", getattr(p, "r0", 0.0))) / 500.0), int(getattr(p, "s1", getattr(p, "s0", 0))))
+
+
+def _fault_result(req, pm, ctx, x0, t_start):
+    """Fault injection for tests (req['fault_scp']): no SCP at all - the geometric reference of the
+    selected route is returned as a failed plan, so the guidance's degraded modes are exercised."""
+    cand, _, note = select_plan(pm, x0, ctx.ends, ApproachConfig(), prefer=req.get("prefer"))
+    X, U, tf, _ = initial_guess(pm, x0, cand, 40)
+    al = build_reference(pm, cand.rwy, cand.cfg)
+    return dict(t0=req.get("t0", 0.0), rwy=cand.rwy.name, cfg=asdict(cand.cfg), hac=cand.hac(), X=X, U=U, tf=tf,
+                kind="cold", energy=cand.energy, converged=False, ok=False, fallback=True, iterations=0, ms=0.0,
+                wall_ms=(time.perf_counter() - t_start) * 1e3, cost=float("nan"), defect=float("nan"),
+                term_err=np.full(6, np.nan), reachable=False,
+                note="fault injection: SCP disabled" + (f" ({note})" if note else ""), al=_al_dict(al),
+                wind=req.get("wind", (0.0, 0.0)), episode=req.get("episode"), decision=None)
 
 
 def _final_approach(ctx, pm, x0):
@@ -276,7 +362,10 @@ class SyncPlanner:
         self.busy = False
 
     def submit(self, req):
-        self._res = plan(req)
+        try:
+            self._res = plan(req)
+        except Exception as e:          # like the async planner: report, guidance keeps the old reference
+            self._res = {"error": repr(e), "episode": req.get("episode")}
         return True
 
     def poll(self):
