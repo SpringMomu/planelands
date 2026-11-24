@@ -48,7 +48,9 @@ void main(){
   vec2 uv = vUv;
   vec3 ro = uCamPos;
   vec3 rd = rayDir(uv);
-  ivec2 fp = ivec2(gl_FragCoord.xy) * 2;
+  // full-res depth texel at the centre of this cloud texel's footprint (the cloud buffer is
+  // w*scale wide, scale = 0.35 .. 0.7 per quality preset, so map through uv, not a fixed *2)
+  ivec2 fp = clamp(ivec2(uv * uFullRes), ivec2(0), ivec2(uFullRes) - 1);
   float d = texelFetch(uDepth, fp, 0).r;
   float sceneDist = depthToDist(d, rd);
 
@@ -276,6 +278,7 @@ export class Clouds {
 
   setSize(w, h) {
     const hw = Math.max(2, Math.floor(w * this.scale)), hh = Math.max(2, Math.floor(h * this.scale));
+    this.cu.uFullRes.value.set(w, h);
     if (this.rtMarch && this.rtMarch.width === hw && this.rtMarch.height === hh) return;
     this.rtMarch?.dispose(); this.hist[0]?.dispose(); this.hist[1]?.dispose();
     this.rtMarch = new THREE.WebGLRenderTarget(hw, hh, { count: 2, type: THREE.FloatType, depthBuffer: false, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter });
