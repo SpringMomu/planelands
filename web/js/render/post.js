@@ -362,7 +362,8 @@ export class Post {
     this.fu.uRes.value.set(w, h);
   }
 
-  render(camera, sceneRT, clouds, exposure, smoke = null, rain = null) {
+  /** overlay(renderer, hdrTarget): extra HDR pass after the composite, before bloom (cockpit glass) */
+  render(camera, sceneRT, clouds, exposure, smoke = null, rain = null, overlay = null) {
     const r = this.renderer;
     const cu = this.cu;
     cu.uSmoke.value = smoke;
@@ -381,6 +382,7 @@ export class Post {
     cu.uLogFar.value = Math.log2(camera.far + 1.0);
     cu.uViewProj.value.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     this.composite.render(r, this.hdr);
+    if (overlay) overlay(r, this.hdr);
 
     // bloom
     const b = this.bloomU;

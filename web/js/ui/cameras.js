@@ -1,11 +1,12 @@
 // Camera rig: chase/orbit, cockpit, tower, runway-side, fly-by, free-fly and overview.
 import * as THREE from 'three';
 import { curvatureDrop } from '../core/frames.js';
+import { HeadMotion } from './headmotion.js';
 
 export const CAMERA_MODES = ['chase', 'cockpit', 'tower', 'runway', 'flyby', 'free', 'overview'];
 export const CAMERA_LABELS = { chase: '追随', cockpit: '驾驶舱', tower: '塔台', runway: '跑道旁', flyby: '飞掠', free: '自由', overview: '俯瞰' };
 
-const _v = new THREE.Vector3(), _v2 = new THREE.Vector3(), _q = new THREE.Quaternion(), _e = new THREE.Euler();
+const _v = new THREE.Vector3(), _v2 = new THREE.Vector3(), _q = new THREE.Quaternion(), _q2 = new THREE.Quaternion(), _e = new THREE.Euler();
 const ALIGN = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), -Math.PI / 2); // camera -Z -> model +X
 
 export class CameraRig {
@@ -24,6 +25,9 @@ export class CameraRig {
     this.flyPos = null;
     this.smoothTarget = new THREE.Vector3();
     this.smoothHeading = 0;
+    this.head = new THREE.Vector3();      // pilot's head offset in the cockpit (model frame)
+    this.headMotion = new HeadMotion();
+    this.shake = 1;                        // head-motion gain: 0 off, 1 realistic, 2 exaggerated
     this._initInput();
   }
 
@@ -61,7 +65,7 @@ export class CameraRig {
       const dx = (e.clientX - lx) / this.dom.clientHeight, dy = (e.clientY - ly) / this.dom.clientHeight;
       lx = e.clientX; ly = e.clientY;
       if (this.mode === 'chase' || this.mode === 'overview') { this.yaw -= dx * 3.2; this.pitch = THREE.MathUtils.clamp(this.pitch + dy * 2.4, -1.45, 1.45); }
-      else if (this.mode === 'cockpit') { this.lookYaw -= dx * 2.0; this.lookPitch = THREE.MathUtils.clamp(this.lookPitch - dy * 2.0, -1.3, 1.3); }
+      else if (this.mode === 'cockpit') { this.lookYaw = THREE.MathUtils.clamp(this.lookYaw - dx * 2.0, -2.3, 2.3); this.lookPitch = THREE.MathUtils.clamp(this.lookPitch - dy * 2.0, -1.25, 1.3); }
       else if (this.mode === 'free') { this.free.yaw -= dx * 2.2; this.free.pitch = THREE.MathUtils.clamp(this.free.pitch - dy * 2.2, -1.5, 1.5); }
       else { this.fov = THREE.MathUtils.clamp(this.fov * (1 + dy * 2), 0.5, 70); }
     });
@@ -92,7 +96,7 @@ export class CameraRig {
     if (m === 'chase' && this.dist > 6000) this.dist = 75;
     this.mode = m; this.flyPos = null;
     this.fov = m === 'cockpit' ? 62 : (m === 'tower' || m === 'runway' ? 20 : this.baseFov);
-    if (m === 'cockpit') { this.lookYaw = 0; this.lookPitch = -0.08; }
+    if (m === 'cockpit') { this.lookYaw = 0; this.lookPitch = -0.12; this.head.set(0, 0, 0); this.headMotion.reset(); }
   }
 
   _ground(p) {
@@ -128,10 +132,13 @@ export class CameraRig {
         break;
       }
       case 'cockpit': {
-        _v.copy(target.eye).applyQuaternion(target.quat).add(tp);
+        // pilot head motion: load factors, manoeuvres, gusts / turbulence, buffet, runway (headmotion.js)
+        const hm = this.headMotion.update(dt, target.st, target.eye, this.shake);
+        this.head.copy(hm.offset);
+        _v.copy(target.eye).add(this.head).applyQuaternion(target.quat).add(tp);
         cam.position.copy(_v);
         _q.setFromEuler(_e.set(this.lookPitch, this.lookYaw, 0, 'YXZ'));
-        cam.quaternion.copy(target.quat).multiply(ALIGN).multiply(_q);
+        cam.quaternion.copy(target.quat).multiply(ALIGN).multiply(_q).multiply(_q2.setFromEuler(hm.rot));
         break;
       }
       case 'tower': {

@@ -1,6 +1,7 @@
 // Head-up display (conformal, orbiter style), flight data panel, control-surface
 // diagram and the navigation map.
 import * as THREE from 'three';
+import { enuToThree } from '../core/frames.js';
 
 const D2R = Math.PI / 180;
 const _v = new THREE.Vector3(), _p = new THREE.Vector3();
@@ -80,56 +81,169 @@ export class Hud {
     if (this.profHist.length > 1500) this.profHist.shift();
   }
 
-  // ------------------------------------------------------------------ cockpit frame (forward windows + glare shield)
-  drawCockpit(state) {
-    const ctx = this.ctx, W = this.cv.width, H = this.cv.height;
-    const frame = '#0b0d10', edge = 'rgba(70,78,88,0.9)';
-    ctx.save();
-    // window frame: everything except six window panes is opaque structure
-    ctx.beginPath();
-    ctx.rect(0, 0, W, H);
-    const top = H * 0.06, bot = H * 0.70, cx = W / 2;
-    const panes = [
-      [[cx - W * 0.012, top + H * 0.05], [cx - W * 0.20, top + H * 0.02], [cx - W * 0.235, bot - H * 0.02], [cx - W * 0.012, bot]],
-      [[cx - W * 0.225, top + H * 0.035], [cx - W * 0.40, top + H * 0.09], [cx - W * 0.47, bot - H * 0.10], [cx - W * 0.26, bot - H * 0.025]],
-      [[cx - W * 0.425, top + H * 0.11], [cx - W * 0.53, top + H * 0.20], [cx - W * 0.56, bot - H * 0.20], [cx - W * 0.495, bot - H * 0.12]],
-    ];
-    const all = [...panes, ...panes.map((p) => p.map(([x, y]) => [2 * cx - x, y]).reverse())];
-    for (const p of all) { ctx.moveTo(p[0][0], p[0][1]); for (let i = 1; i < p.length; i++) ctx.lineTo(p[i][0], p[i][1]); ctx.closePath(); }
-    ctx.fillStyle = frame;
-    ctx.fill('evenodd');
-    // pane edges
-    ctx.strokeStyle = edge; ctx.lineWidth = 2;
-    for (const p of all) { ctx.beginPath(); ctx.moveTo(p[0][0], p[0][1]); for (let i = 1; i < p.length; i++) ctx.lineTo(p[i][0], p[i][1]); ctx.closePath(); ctx.stroke(); }
-    // glare shield + instrument panel
-    const g = ctx.createLinearGradient(0, bot - H * 0.04, 0, H);
-    g.addColorStop(0, '#1a1d22'); g.addColorStop(0.15, '#121418'); g.addColorStop(1, '#07080a');
-    ctx.fillStyle = g;
-    ctx.beginPath();
-    ctx.moveTo(0, H); ctx.lineTo(0, bot + H * 0.02);
-    ctx.quadraticCurveTo(cx, bot - H * 0.07, W, bot + H * 0.02); ctx.lineTo(W, H); ctx.closePath(); ctx.fill();
-    ctx.strokeStyle = 'rgba(120,130,140,0.35)'; ctx.lineWidth = 1.5;
-    ctx.beginPath(); ctx.moveTo(0, bot + H * 0.02); ctx.quadraticCurveTo(cx, bot - H * 0.07, W, bot + H * 0.02); ctx.stroke();
-    // multifunction displays
-    const a = state?.air || {};
-    const mfd = (x, y, w, h, lines) => {
-      ctx.fillStyle = '#020403'; ctx.fillRect(x, y, w, h);
-      ctx.strokeStyle = '#2a2f36'; ctx.lineWidth = 3; ctx.strokeRect(x, y, w, h);
-      ctx.fillStyle = 'rgba(110,255,160,0.85)'; ctx.font = `${Math.round(h * 0.11)}px "JetBrains Mono", Consolas, monospace`;
-      lines.forEach((t, i) => ctx.fillText(t, x + w * 0.07, y + h * (0.2 + i * 0.16)));
+  // ------------------------------------------------------------------ orbiter HUD (cockpit view)
+  // Approach-and-land format after the SCOM: boresight, velocity vector, guidance diamond, airspeed
+  // (KEAS) and altitude tapes (R = radar altitude), horizon with heading marks, pitch scale, runway
+  // outline, flare triangles, normal acceleration, commanded speedbrake, guidance mode.  The display
+  // is collimated: symbols are placed by angle in the vehicle frame (or the world frame for the
+  // conformal ones) and clipped to the combiner glass.
+  drawOrbiterHud(camera, s, clip) {
+    const ctx = this.ctx, W = this.cv.width, H = this.cv.height, k = this.dpr || 1;
+    if (!clip || !s || !s.bodyQuat) return;
+    const q = s.bodyQuat, a = s.air || {}, g = s.gnc || {};
+    const proj = (dir) => {
+      _p.copy(camera.position).addScaledVector(dir, 1000).project(camera);
+      if (_p.z > 1) return null;
+      return [(_p.x * 0.5 + 0.5) * W, (1 - (_p.y * 0.5 + 0.5)) * H];
     };
-    const mh = H * 0.17, mw = mh * 1.25, my = H - mh - H * 0.035;
-    mfd(cx - mw * 2.2, my, mw, mh, ['ADI', `PITCH ${fmt(a.theta, 1)}`, `ROLL  ${fmt(a.phi, 1)}`, `AOA   ${fmt(a.alpha, 1)}`, `BETA  ${fmt(a.beta, 2)}`]);
-    mfd(cx - mw * 0.5, my, mw, mh, ['HSI', `HDG ${fmt(a.psi, 0)}`, `TRK ${fmt(a.track, 0)}`, `RNG ${fmt(this._rng / 1000, 1)} KM`, `ALT ${fmt(a.alt, 0)} M`]);
-    mfd(cx + mw * 1.2, my, mw, mh, ['AVVI', `KEAS ${fmt(a.keas, 0)}`, `MACH ${fmt(a.mach, 2)}`, `H-DOT ${fmt(a.vs, 1)}`, `NZ ${fmt(a.nz, 2)}`]);
+    const _d = new THREE.Vector3();
+    const hp = (azDeg, elDeg) => {            // vehicle-fixed direction (az right, el up), degrees
+      const az = azDeg * D2R, el = elDeg * D2R;
+      return proj(_d.set(Math.cos(el) * Math.cos(az), Math.sin(el), Math.cos(el) * Math.sin(az)).applyQuaternion(q));
+    };
+    const c0 = hp(0, 0), c1 = hp(0, 1);
+    if (!c0 || !c1) return;
+    // air-data smoothing: the tapes follow a critically damped low-pass of KEAS / altitude (the raw
+    // values carry turbulence and sample jitter), the digital windows are sampled and held at 5 Hz
+    const now = performance.now(), F = this._hudF || (this._hudF = { t: now, keas: NaN, kv: 0, alt: NaN, av: 0, hold: 0, keasD: NaN, altD: NaN });
+    const dts = Math.min(0.1, Math.max(0, (now - F.t) / 1000)); F.t = now;
+    const agl0 = a.agl ?? a.alt, radar0 = isFinite(a.agl) && a.agl * 3.28084 < 5000;
+    const altRaw = (radar0 ? agl0 : a.alt) * 3.28084;
+    const damp = (x, v, target, w) => {                 // critically damped spring, natural frequency w
+      if (!isFinite(x) || Math.abs(target - x) > 2000) return [target, 0];
+      const acc = w * w * (target - x) - 2 * w * v;
+      v += acc * dts; x += v * dts;
+      return [x, v];
+    };
+    if (isFinite(a.keas)) [F.keas, F.kv] = damp(F.keas, F.kv, a.keas, 2 * Math.PI / 0.9);
+    if (isFinite(altRaw)) {
+      if (F.radar !== radar0) { F.alt = NaN; F.radar = radar0; }
+      [F.alt, F.av] = damp(F.alt, F.av, altRaw, 2 * Math.PI / (altRaw < 200 ? 0.35 : 0.9));
+    }
+    if (now - F.hold > 200 || !isFinite(F.keasD)) { F.hold = now; F.keasD = F.keas; F.altD = F.alt; F.nzD = a.nz; }
+    const ppd = Math.hypot(c1[0] - c0[0], c1[1] - c0[1]);              // pixels per degree
+    const col = 'rgba(110,255,140,0.95)';
+    ctx.save();
+    ctx.beginPath(); clip.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y))); ctx.closePath(); ctx.clip();
+    ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = Math.max(1.2, 0.075 * ppd);
+    ctx.shadowColor = 'rgba(70,255,110,0.9)'; ctx.shadowBlur = 0.35 * ppd;
+    ctx.lineCap = 'round';
+    const font = (deg) => { ctx.font = `600 ${Math.max(9, deg * ppd).toFixed(1)}px "Arial Narrow", "Roboto Condensed", Arial, sans-serif`; };
+    const seg = (p, q2) => { if (p && q2) { ctx.moveTo(p[0], p[1]); ctx.lineTo(q2[0], q2[1]); } };
+    // ---- world-referenced: horizon with heading marks, pitch scale
+    const fwd = _d.set(1, 0, 0).applyQuaternion(q).clone();
+    const hdgV = Math.atan2(fwd.x, -fwd.z);
+    const wdir = (hdg, el) => new THREE.Vector3(Math.sin(hdg) * Math.cos(el), Math.sin(el), -Math.cos(hdg) * Math.cos(el));
+    ctx.beginPath();
+    const hz = [];
+    for (let d = -14; d <= 14; d += 1) hz.push(proj(wdir(hdgV + d * D2R, 0)));
+    hz.forEach((p, i) => { if (p) { if (i && hz[i - 1]) ctx.lineTo(p[0], p[1]); else ctx.moveTo(p[0], p[1]); } });
+    ctx.stroke();
+    const hdgDeg = ((hdgV / D2R) % 360 + 360) % 360;
+    font(0.55);
+    ctx.textAlign = 'center';
+    for (let hv = Math.ceil((hdgDeg - 12) / 5) * 5; hv <= hdgDeg + 12; hv += 5) {
+      const p = proj(wdir(hv * D2R, 0)), pu = proj(wdir(hv * D2R, (hv % 10 === 0 ? 0.55 : 0.3) * D2R));
+      ctx.beginPath(); seg(p, pu); ctx.stroke();
+      if (hv % 10 === 0 && pu) ctx.fillText(String(((hv / 10) % 36 + 36) % 36).padStart(2, '0'), pu[0], pu[1] - 0.15 * ppd);
+    }
+    for (let p = -25; p <= 20; p += 5) {
+      if (p === 0) continue;
+      const L = proj(wdir(hdgV - 1.6 * D2R, p * D2R)), Lm = proj(wdir(hdgV - 0.5 * D2R, p * D2R));
+      const R = proj(wdir(hdgV + 1.6 * D2R, p * D2R)), Rm = proj(wdir(hdgV + 0.5 * D2R, p * D2R));
+      if (!L || !R) continue;
+      ctx.setLineDash(p < 0 ? [0.35 * ppd, 0.25 * ppd] : []);
+      ctx.beginPath(); seg(L, Lm); seg(Rm, R); ctx.stroke();
+      ctx.setLineDash([]);
+      font(0.5); ctx.textAlign = 'right'; ctx.fillText(String(Math.abs(p)), L[0] - 0.2 * ppd, L[1] + 0.18 * ppd);
+    }
+    // ---- runway outline (conformal)
+    const rw = this.world && this.world.runway;
+    if (rw) {
+      const h = rw.heading_deg * D2R, u = [Math.sin(h), Math.cos(h)], v = [u[1], -u[0]], c = rw.center_en || [0, 0];
+      const L2 = rw.length / 2, W2 = rw.width / 2, el = rw.elevation || 0;
+      const corner = (su, sv) => { const e = c[0] + u[0] * L2 * su + v[0] * W2 * sv, n = c[1] + u[1] * L2 * su + v[1] * W2 * sv; return enuToThree(e, n, el, new THREE.Vector3()).sub(camera.position).normalize(); };
+      const pts = [corner(-1, -1), corner(1, -1), corner(1, 1), corner(-1, 1)].map(proj);
+      if (pts.every(Boolean)) { ctx.beginPath(); pts.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]))); ctx.closePath(); ctx.stroke(); }
+    }
+    // ---- boresight (vehicle x axis)
+    ctx.beginPath();
+    ctx.moveTo(c0[0] - 0.9 * ppd, c0[1]); ctx.lineTo(c0[0] - 0.35 * ppd, c0[1]); ctx.lineTo(c0[0] - 0.18 * ppd, c0[1] + 0.25 * ppd);
+    ctx.lineTo(c0[0], c0[1]); ctx.lineTo(c0[0] + 0.18 * ppd, c0[1] + 0.25 * ppd); ctx.lineTo(c0[0] + 0.35 * ppd, c0[1]); ctx.lineTo(c0[0] + 0.9 * ppd, c0[1]);
+    ctx.stroke();
+    // ---- velocity vector (removed after main gear touchdown) and guidance diamond
+    const onGnd = !!s.gear?.wow?.some((w) => w);
+    const vv = s.vel3 && s.vel3.lengthSq() > 1 ? proj(s.vel3.clone().normalize()) : null;
+    if (vv && !onGnd) {
+      const r = 0.42 * ppd;
+      ctx.beginPath(); ctx.arc(vv[0], vv[1], r, 0, Math.PI * 2);
+      ctx.moveTo(vv[0] - r, vv[1]); ctx.lineTo(vv[0] - 1.25 * ppd, vv[1]);
+      ctx.moveTo(vv[0] + r, vv[1]); ctx.lineTo(vv[0] + 1.25 * ppd, vv[1]);
+      ctx.moveTo(vv[0], vv[1] - r); ctx.lineTo(vv[0], vv[1] - 0.85 * ppd);
+      ctx.stroke();
+    }
+    const gd = s.guideDir ? proj(s.guideDir) : null;
+    if (gd) {
+      const r = 0.5 * ppd;
+      ctx.beginPath(); ctx.moveTo(gd[0], gd[1] - r); ctx.lineTo(gd[0] + r, gd[1]); ctx.lineTo(gd[0], gd[1] + r); ctx.lineTo(gd[0] - r, gd[1]); ctx.closePath(); ctx.stroke();
+      // flare triangles during the pull-up to the inner glideslope and the final flare
+      if (/PREFLARE|IGS|FLARE/.test(g.sub || '')) {
+        for (const sg of [-1, 1]) {
+          const x = gd[0] + sg * 1.9 * ppd, y = gd[1];
+          ctx.beginPath(); ctx.moveTo(x, y - 0.35 * ppd); ctx.lineTo(x + 0.3 * ppd, y + 0.25 * ppd); ctx.lineTo(x - 0.3 * ppd, y + 0.25 * ppd); ctx.closePath(); ctx.stroke();
+        }
+      }
+    }
+    // ---- airspeed tape (left) and altitude tape (right), vehicle-fixed
+    const tape = (az, val, span, minor, major, label, align, rLetter, digital) => {
+      if (!isFinite(val)) return;
+      const top = hp(az, 4.2), bot = hp(az, -4.2);
+      if (!top || !bot) return;
+      ctx.beginPath(); seg(top, bot); ctx.stroke();
+      font(0.55);
+      ctx.textAlign = align;
+      const dir = align === 'right' ? -1 : 1;
+      for (let t = Math.ceil((val - span) / minor) * minor; t <= val + span; t += minor) {
+        const el = (t - val) / span * 4.2;
+        const p = hp(az, el); if (!p) continue;
+        const big = Math.abs(t % major) < 1e-6;
+        ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(p[0] + dir * (big ? 0.5 : 0.28) * ppd, p[1]); ctx.stroke();
+        if (big && Math.abs(el) > 0.8) ctx.fillText(label(t), p[0] + dir * 0.65 * ppd, p[1] + 0.2 * ppd);
+      }
+      // current value window
+      const m = hp(az, 0);
+      const bw = 2.5 * ppd, bh = 0.85 * ppd, bx = align === 'right' ? m[0] - 0.55 * ppd - bw : m[0] + 0.55 * ppd;
+      ctx.save(); ctx.shadowBlur = 0; ctx.fillStyle = 'rgba(0,0,0,0.0)'; ctx.restore();
+      ctx.beginPath(); ctx.rect(bx, m[1] - bh / 2, bw, bh); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(m[0] + dir * 0.05 * ppd, m[1]); ctx.lineTo(m[0] + dir * 0.55 * ppd, m[1] - 0.3 * ppd); ctx.lineTo(m[0] + dir * 0.55 * ppd, m[1] + 0.3 * ppd); ctx.closePath(); ctx.stroke();
+      font(0.68); ctx.textAlign = 'center';
+      ctx.fillText(label(digital ?? val, true), bx + bw / 2, m[1] + 0.25 * ppd);
+      if (rLetter) { font(0.6); ctx.fillText('R', bx + bw / 2, m[1] + 1.15 * ppd); }
+    };
+    tape(-6.3, F.keas, 25, 5, 10, (t) => String(Math.round(t)), 'right', false, F.keasD);
+    const radar = radar0, altFt = F.alt;
+    const span = altFt > 3000 ? 1000 : altFt > 600 ? 250 : 60;
+    tape(6.3, altFt, span, span / 5, span, (t, cur) => (cur ? String(Math.round(t / (altFt > 1000 ? 10 : 1)) * (altFt > 1000 ? 10 : 1)) : String(Math.round(t))), 'left', radar, F.altD);
+    // ---- lower status line: Nz, guidance mode, commanded speedbrake
+    font(0.62);
+    const b1 = hp(-5.6, -6.0), b2 = hp(0, -6.0), b3 = hp(5.6, -6.0);
+    if (b1) { ctx.textAlign = 'center'; ctx.fillText(`${isFinite(F.nzD) ? F.nzD.toFixed(1) : '-'} G`, b1[0], b1[1]); }
+    const mode = { ACQ: 'TAEM ACQ', HAC: 'TAEM HDG', PRF: 'TAEM PRFNL', MAXRANGE: 'MXRNG', HOLD: 'HOLD', OGS: 'OGS', PREFLARE: 'FLARE', IGS: 'FLARE', FLARE: 'FNLFL' }[g.sub] || (g.phase === 'TOUCHDOWN' ? 'DEROT' : g.phase === 'ROLLOUT' ? 'ROLLOUT' : '');
+    if (b2 && mode) { ctx.textAlign = 'center'; ctx.fillText(mode, b2[0], b2[1]); }
+    const sbc = s.cmd && isFinite(s.cmd.speedbrake) ? s.cmd.speedbrake : (s.surf ? s.surf.speedbrake : NaN);
+    if (b3 && isFinite(sbc)) { ctx.textAlign = 'center'; ctx.fillText(`SB ${Math.round(sbc / 98.6 * 100)}`, b3[0], b3[1]); }
+    if (onGnd && b1) {                          // rollout: groundspeed with G after nose gear touchdown
+      const gsKt = Math.hypot(s.vel[0], s.vel[1]) * 1.943844, ng = s.gear?.wow?.[0];
+      const p = hp(-5.6, 3.4); if (p) { ctx.textAlign = 'center'; ctx.fillText(`${Math.round(gsKt)}${ng ? ' G' : ''}`, p[0], p[1]); }
+    }
     ctx.restore();
   }
 
   // ------------------------------------------------------------------ conformal HUD
-  drawHud(camera, state, visible, cockpit = false) {
+  drawHud(camera, state, visible, cockpit = false, clip = null) {
     const ctx = this.ctx, W = this.cv.width, H = this.cv.height, k = this.dpr || 1;
     ctx.clearRect(0, 0, W, H);
-    if (cockpit) this.drawCockpit(state);
+    if (cockpit) { this.drawOrbiterHud(camera, state, clip); return; }
     if (!visible || !state) return;
     const proj = (dir) => {
       _p.copy(camera.position).addScaledVector(dir, 1000).project(camera);

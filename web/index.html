@@ -117,6 +117,7 @@
     <div class="row chk"><label><input type="checkbox" id="show-forces"> 显示各翼面气动力矢量</label></div>
     <div class="row chk"><label><input type="checkbox" id="show-trail" checked> 显示飞行轨迹</label></div>
     <div class="row chk"><label><input type="checkbox" id="show-hud"> 平视显示器 HUD（驾驶舱外也显示）</label></div>
+    <div class="row" title="驾驶舱视角中头部随过载、机动、阵风湍流、抖振和跑道颠簸运动；0 关闭，1 真实，2 夸张"><label>舱内视角晃动</label><input type="range" id="headshake" min="0" max="2" step="0.05" value="1"><output id="headshake-o">1.00</output></div>
     <div class="row chk"><label><input type="checkbox" id="show-plan" checked> 显示 SCP 规划轨迹 / HAC</label></div>
     <div class="row chk"><label><input type="checkbox" id="show-mpc" checked> 显示 MPC 预测时域</label></div>
     <div class="row chk"><label><input type="checkbox" id="show-appr" checked> 显示进近下滑通道</label></div>
@@ -156,7 +157,7 @@
   </section>
   <section data-pane="gfx">
     <div class="row seg" id="q-seg"><label>画质预设</label>
-      <button data-q="low">低</button><button data-q="med">中</button><button data-q="high" class="on">高</button><button data-q="ultra">极高</button></div>
+      <button data-q="low" class="on">低</button><button data-q="med">中</button><button data-q="high">高</button><button data-q="ultra">极高</button></div>
     <div class="row"><label>渲染分辨率</label><input type="range" id="rscale" min="0.5" max="1" step="0.05" value="1"><output id="rscale-o">100%</output></div>
     <div class="row"><label>云步进数</label><input type="range" id="csteps" min="32" max="192" step="8" value="96"><output id="csteps-o">96</output></div>
     <div class="row"><label>云可视距离</label><input type="range" id="cdist" min="30" max="250" step="5" value="150"><output id="cdist-o">150 km</output></div>

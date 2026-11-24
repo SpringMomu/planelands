@@ -19,6 +19,7 @@ import { CameraRig, CAMERA_MODES, CAMERA_LABELS } from './ui/cameras.js';
 import { Hud } from './ui/hud.js';
 import { SpawnPanel } from './ui/spawn.js';
 import { Meds } from './ui/meds.js';
+import { Cockpit } from './world/cockpit.js';
 
 const $ = (s) => document.querySelector(s);
 const ld = (txt, f) => { $('#ld-text').textContent = txt; if (f !== undefined) $('#ld-fill').style.width = `${Math.round(f * 100)}%`; };
@@ -127,7 +128,7 @@ async function main() {
   // ------------------------------------------------------------------ render targets / resize
   let sceneRT = null;
   // phones / small touch screens start on the low preset (volumetric clouds are fill-rate heavy)
-  let quality = MOBILE_MQ.matches ? 'low' : 'high', renderScale = 1.0;
+  let quality = 'low', renderScale = 1.0;
   $('#csteps').value = QUALITY[quality].steps; $('#csteps-o').textContent = QUALITY[quality].steps;
   document.querySelectorAll('#q-seg button').forEach((x) => x.classList.toggle('on', x.dataset.q === quality));
   const settings = { exposureEV: 0, bloom: 0.06, showHud: false, showTrail: true, showForces: false };
@@ -158,6 +159,8 @@ async function main() {
   const rig = new CameraRig(camera, canvas, terrain, airport);
   // MEDS glass-cockpit windows (A/E PFD, HSIT nav display, SPI, DPS pages): F / N or the dock buttons
   const meds = new Meds({ dock: $('#camerabar') });
+  // 3D flight deck for the cockpit view (built on first use, parented to the orbiter)
+  const cockpit = new Cockpit({ U, meds });
   resize();
   addEventListener('resize', resize);
 
@@ -190,7 +193,7 @@ async function main() {
       hud.pushTrail(m.pos);
       hud.pushProfile(m);
     },
-    onEpisode: () => { trail.clear(); hud.clearTrail(); smoke.clear(); chute.reset(); shuttle.setChuteDoor(false); prevWow = null; },
+    onEpisode: () => { trail.clear(); hud.clearTrail(); smoke.clear(); chute.reset(); shuttle.setChuteDoor(false); prevWow = null; meds.resetAlarms(); },
     onMpc: (m) => { lastMpc = m.pred; gncViz.setMpc(m.pred); },
     onEvent: (m) => { toast(zhEvent(m.text), m.level || 'info', m.level === 'error' ? 8000 : 5000); meds.event(m); },
     onStatus: (s) => {
@@ -251,6 +254,7 @@ async function main() {
   $('#btn-strike').addEventListener('click', () => weather.strikeNow(camera, groundY));
   $('#show-forces').addEventListener('change', (e) => { settings.showForces = e.target.checked; forces.group.visible = e.target.checked; });
   $('#show-trail').addEventListener('change', (e) => { settings.showTrail = e.target.checked; trail.line.visible = e.target.checked; });
+  bindRange('headshake', (v) => (v === 0 ? '关' : v.toFixed(2)), (v) => { rig.shake = v; });
   $('#show-hud').addEventListener('change', (e) => { settings.showHud = e.target.checked; });
   $('#show-plan').addEventListener('change', (e) => gncViz.setVisible('plan', e.target.checked));
   $('#show-mpc').addEventListener('change', (e) => gncViz.setVisible('mpc', e.target.checked));
@@ -309,8 +313,17 @@ async function main() {
   // a quick tap on the 3D view closes the open sheet (drags still orbit the camera)
   let tap = null;
   canvas.addEventListener('pointerdown', (e) => { tap = e.isPrimary ? { x: e.clientX, y: e.clientY, t: performance.now() } : null; });
+  const raycaster = new THREE.Raycaster(), ndc = new THREE.Vector2();
   canvas.addEventListener('pointerup', (e) => {
-    if (tap && e.isPrimary && performance.now() - tap.t < 350 && Math.hypot(e.clientX - tap.x, e.clientY - tap.y) < 8) openSheet(null);
+    if (tap && e.isPrimary && performance.now() - tap.t < 350 && Math.hypot(e.clientX - tap.x, e.clientY - tap.y) < 8) {
+      openSheet(null);
+      if (rig.mode === 'cockpit') {             // press an MDU edge key in the flight deck
+        const r = canvas.getBoundingClientRect();
+        ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+        raycaster.setFromCamera(ndc, camera);
+        cockpit.click(raycaster.ray);
+      }
+    }
     tap = null;
   });
   MOBILE_MQ.addEventListener('change', (e) => { if (!e.matches) openSheet(null); });
@@ -406,7 +419,7 @@ async function main() {
 
   // ------------------------------------------------------------------ frame loop
   const pos3 = new THREE.Vector3(), vel3 = new THREE.Vector3(), quat3 = new THREE.Quaternion();
-  const tmpQ = new THREE.Quaternion(), tmpV = new THREE.Vector3();
+  const tmpQ = new THREE.Quaternion(), tmpV = new THREE.Vector3(), tmpV2 = new THREE.Vector3();
   const wind3 = new THREE.Vector3(), vAir3 = new THREE.Vector3(), attachW = new THREE.Vector3();
   const sunRad = new THREE.Color(), ambC = new THREE.Color();
   const contacts = [];
@@ -471,8 +484,16 @@ async function main() {
     }
 
     // ---------------- camera
-    rig.update(dt, { pos: pos3, quat: quat3, vel: vel3, eye: shuttle.cockpitEye });
-    shuttle.model.visible = rig.mode !== 'cockpit';
+    const inCockpit = rig.mode === 'cockpit';
+    if (inCockpit && !cockpit.built) { cockpit.build(); }
+    cockpit.group.visible = inCockpit;
+    // the trajectory overlays are not part of the real flight deck: the HUD carries the guidance there
+    gncViz.group.visible = !inCockpit;
+    trail.line.visible = settings.showTrail && !inCockpit;
+    rig.update(dt, { pos: pos3, quat: quat3, vel: vel3, eye: shuttle.cockpitEye, st });
+    shuttle.model.visible = !inCockpit;
+    const near = inCockpit ? 0.1 : 0.3;          // (the composite's depth unprojection needs far/near <= ~2e7)
+    if (camera.near !== near) { camera.near = near; camera.updateProjectionMatrix(); }
 
     // ---------------- lighting
     // bright cloud deck below the camera brightens the IBL lower hemisphere
@@ -487,13 +508,16 @@ async function main() {
     const T = sunTransmittanceCPU(sh, sd.y, U.uHaze.value);
     sun.color.setRGB(T[0], T[1], T[2]);
     sun.intensity = U.uSunIntensity.value;
-    const half = THREE.MathUtils.lerp(28, 230, THREE.MathUtils.smoothstep(-agl, -1500, -60));
+    // shadow frustum: around the orbiter (and its ground shadow), or tight around the flight deck so
+    // the window frames throw crisp sun patches into the cabin
     const sc = sun.shadow.camera;
+    const half = THREE.MathUtils.lerp(28, 230, THREE.MathUtils.smoothstep(-agl, -1500, -60));
     if (sc.right !== half) { sc.left = -half; sc.right = half; sc.top = half; sc.bottom = -half; sc.updateProjectionMatrix(); }
     sun.position.copy(pos3).addScaledVector(sd, 1500);
     sun.target.position.copy(pos3);
     sun.target.updateMatrixWorld();
-    terrain.update(camera, { on: !!sun.shadow.map && agl < 2500 && sd.y > 0, map: sun.shadow.map ? sun.shadow.map.texture : null, matrix: sun.shadow.matrix, size: 2048 });
+    if (inCockpit) cockpit.place(camera, pos3, quat3, shuttle.cockpitEye, sd, sun, atmo.envTexture);
+    terrain.update(camera, { on: !inCockpit && !!sun.shadow.map && agl < 2500 && sd.y > 0, map: sun.shadow.map ? sun.shadow.map.texture : null, matrix: sun.shadow.matrix, size: 2048 });
     airport.update(U.uTime.value, night);
 
     // ---------------- drag chute + tyre smoke (sim-time driven)
@@ -517,6 +541,7 @@ async function main() {
           if (wow[i] && !prevWow[i] && gsp > 20) smoke.touchdown(i, THREE.MathUtils.clamp(gsp / 100, 0.3, 1.1) * (i === 0 ? 0.75 : 1));
         }
       }
+      if (prevEp !== st._ep) cockpit.rain?.clear();        // new episode: fresh, dry windows (re-wetted from the weather)
       prevWow = wow.slice(); prevEp = st._ep;
       smoke.update(sdt, { contacts: shuttle.wheelContacts(contacts), vel: vel3, wind: wind3, groundY, brakes: st.brakes || 0, gs: gsp, wow });
     }
@@ -551,25 +576,32 @@ async function main() {
     }
 
     // ---------------- render
+    // in the flight deck the eye adapts to the darker cabin: about +0.6 EV
+    const exposure = Math.pow(2, settings.exposureEV) * 0.62 * (1 + night * 6) * (1 + 0.5 * weather.rainCam) * (inCockpit ? 1.5 : 1);
+    if (inCockpit) {
+      cockpit.update({ st, dt, night, sunDir: sd, sunRad: light.sunRad, amb: light.amb, exposure, rain: weather.rainCam,
+        wx: st ? { dt: dt * ts, vel: vel3, wind: wind3, fall: weather.fall } : null });
+    }
     renderer.setRenderTarget(sceneRT);
     renderer.setClearColor(0x000000, 1);
     renderer.clear(true, true, false);
     renderer.render(scene, camera);
+    if (inCockpit) cockpit.render(renderer);
     clouds.render(camera, sceneRT.depthTexture);
     const smokeOn = smoke.render(renderer, camera, sceneRT.depthTexture, light);
     const rainOn = weather.renderParticles(renderer, camera, sceneRT.depthTexture);
-    const exposure = Math.pow(2, settings.exposureEV) * 0.62 * (1 + night * 6) * (1 + 0.5 * weather.rainCam);
-    post.render(camera, sceneRT, clouds, exposure, smokeOn ? smoke.texture : null, rainOn ? weather.rain.texture : null);
+    post.render(camera, sceneRT, clouds, exposure, smokeOn ? smoke.texture : null, rainOn && !inCockpit ? weather.rain.texture : null,
+      inCockpit ? (r, hdr) => cockpit.renderGlass(r, camera, sceneRT.depthTexture, hdr) : null);
 
     // ---------------- HUD / panels
-    const inCockpit = rig.mode === 'cockpit';
     gncViz.update(renderer.domElement.width, renderer.domElement.height);
     let guideDir = null;
     if (st && (inCockpit || settings.showHud)) {
       const ra = gncViz.refAhead(st.pos, 8);
       if (ra) guideDir = enuToThree(ra.point[0], ra.point[1], ra.point[2]).sub(camera.position).normalize();
     }
-    hud.drawHud(camera, st ? { ...st, vel3, guideDir } : null, inCockpit || settings.showHud, inCockpit);
+    hud.drawHud(camera, st ? { ...st, vel3, guideDir, bodyQuat: quat3 } : null, inCockpit || settings.showHud, inCockpit,
+      inCockpit ? cockpit.hudClip(camera, hud.cv.width, hud.cv.height) : null);
     if (st) hud.updateGnc(st);
     if (st) {
       hud.updatePanel(st, { range: Math.hypot(st.pos[0], st.pos[1]) });
@@ -584,12 +616,12 @@ async function main() {
     }
     meds.update({
       st, plan: lastPlan, planPts: gncViz.planPts, mpc: lastMpc, trail: hud.trail, prof: hud.profHist, runway: A.world.runway,
-      link: link.connected ? 'online' : link.offline ? 'local' : 'offline', night: U.uNight.value,
+      link: link.connected ? 'online' : link.offline ? 'local' : 'offline', night: U.uNight.value, cockpit: inCockpit,
     });
   }
   loop();
   window.__planelands = {
-    THREE, renderer, scene, camera, U, terrain, airport, shuttle, clouds, post, atmo, rig, link, setCam, gncViz, hud, meds, chute, smoke, trail, weather,
+    THREE, renderer, scene, camera, U, terrain, airport, shuttle, clouds, post, atmo, rig, link, setCam, gncViz, hud, meds, chute, smoke, trail, weather, cockpit,
     injectPlan(m) { lastPlan = m; gncViz.setPlan(m); }, injectMpc(p) { lastMpc = p; gncViz.setMpc(p); },
     // debug helper: free camera at runway-frame (u, v, height) looking at heading/pitch (deg)
     look(u, v, h, hdgDeg, pitchDeg) { setCam('free'); airport.toWorld(u, v, h, rig.free.pos); rig.free.yaw = -hdgDeg * Math.PI / 180; rig.free.pitch = pitchDeg * Math.PI / 180; },

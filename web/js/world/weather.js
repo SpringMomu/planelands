@@ -211,6 +211,9 @@ export class Weather {
     this.audio.setRain(c.camAgl < 150 ? this.rainCam * (1 - c.camAgl / 150) : 0);
   }
 
+  /** velocity of the falling rain (world, m/s: terminal fall + low-passed wind) */
+  get fall() { return this._fall; }
+
   renderParticles(renderer, camera, depthTexture) {
     return this.rain.render(renderer, camera, depthTexture);
   }

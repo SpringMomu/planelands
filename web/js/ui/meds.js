@@ -334,14 +334,14 @@ function drawPFD(g, w, d) {
 
   // ---------------- tapes
   const ty = 66, th = 214;
-  const alpha = valid && a.air_valid !== false ? a.alpha : NaN;     // ADTA data invalid at low speed on the ground
+  const alpha = w.smooth('α', valid && a.air_valid !== false ? a.alpha : NaN, 0.25);     // ADTA data invalid at low speed on the ground
   drawTape(g, { x: 14, y: ty, w: 42, h: th, v: alpha, ppu: th / 30, minor: 1, major: 5, label: 5, fmt: (t) => `${t}`, title: 'α', side: 'r',
     digital: fin(alpha) ? w.hold('a', alpha).toFixed(1) : '', bugs: valid && st.cmd && fin(st.cmd.alpha) ? [st.cmd.alpha] : [] });
-  const mach = valid ? a.mach : NaN;
+  const mach = w.smooth('M', valid ? a.mach : NaN, 0.3);
   if (w.keasMode === undefined) w.keasMode = false;
   if (fin(mach)) { if (w.keasMode && mach > 0.95) w.keasMode = false; else if (!w.keasMode && mach < 0.9) w.keasMode = true; }
   if (w.keasMode) {
-    const ke = valid ? a.keas : NaN;
+    const ke = w.smooth('KEAS', valid ? a.keas : NaN, 0.3);
     const refK = gnc && gnc.ref && fin(gnc.ref.V) && fin(a.rho) ? gnc.ref.V * Math.sqrt(a.rho / 1.225) * KT : NaN;
     drawTape(g, { x: 62, y: ty, w: 46, h: th, v: ke, ppu: th / 110, minor: 5, major: 10, label: 20, fmt: (t) => `${t}`, title: 'KEAS', side: 'r',
       digital: fin(ke) ? `${Math.round(w.hold('k', ke))}` : '', bugs: fin(refK) ? [refK] : [] });
@@ -352,13 +352,13 @@ function drawPFD(g, w, d) {
   // altitude: radar altitude (R) below 5000 ft AGL
   const agl = valid ? (a.agl_gear ?? a.agl) * FT : NaN;
   const radar = fin(agl) && agl < 5000;
-  const hft = valid ? (radar ? agl : a.alt * FT) : NaN;
+  const hft = w.smooth(radar ? 'R' : 'H', valid ? (radar ? agl : a.alt * FT) : NaN, radar && agl < 200 ? 0.12 : 0.3);
   const hs = !fin(hft) ? { span: 20000, minor: 1000, major: 5000, label: 5000 } : hft > 20000 ? { span: 20000, minor: 1000, major: 5000, label: 5000 } : hft > 2500 ? { span: 4000, minor: 200, major: 1000, label: 1000 } : { span: 1000, minor: 50, major: 100, label: 200 };
   const refH = gnc && gnc.ref && fin(gnc.ref.h) ? gnc.ref.h * FT - (radar && fin(a.alt) ? (a.alt * FT - agl) : 0) : NaN;
   drawTape(g, { x: 404, y: ty, w: 48, h: th, v: hft, ppu: th / hs.span, minor: hs.minor, major: hs.major, label: hs.label, lo: -200,
     fmt: (t) => (hs.span > 5000 || t >= 10000 ? `${t / 1000}K` : `${t}`), title: 'H', sub: radar ? 'R' : '', side: 'l',
     digital: fmtFtK(w.hold('h', hft)), bugs: fin(refH) && !isAL(gnc) ? [refH] : [] });
-  const hdot = valid ? a.vs * FT : NaN;
+  const hdot = w.smooth('Hd', valid ? a.vs * FT : NaN, 0.3);
   const hdS = fin(hdot) && Math.abs(hdot) > 170 ? { span: 1000, minor: 20, major: 100, label: 200 } : { span: 400, minor: 10, major: 50, label: 100 };
   drawTape(g, { x: 458, y: ty, w: 44, h: th, v: hdot, ppu: th / hdS.span, minor: hdS.minor, major: hdS.major, label: hdS.label, fmt: (t) => `${t}`, title: 'Ḣ', side: 'l',
     digital: fin(hdot) ? `${Math.round(w.hold('hd', hdot))}` : '' });
@@ -1358,6 +1358,15 @@ class MduWindow {
     this._syncUi(); this.m.save();
   }
 
+  /** first-order low-pass of a displayed air-data value (time constant tau s; resets on invalid data or a jump) */
+  smooth(key, v, tau) {
+    const S = (this._sm ||= {}), e = S[key], t = performance.now();
+    if (!fin(v)) { delete S[key]; return v; }
+    if (!e || t - e.t > 1500 || Math.abs(v - e.v) > Math.max(50, Math.abs(v) * 0.2)) { S[key] = { v, t }; return v; }
+    e.v += (v - e.v) * Math.min(1, (t - e.t) / 1000 / tau); e.t = t;
+    return e.v;
+  }
+
   /** sample-and-hold of a displayed value (digital readouts update at `hz`, not every redraw) */
   hold(key, v, hz = 4) {
     const h = this._held[key];
@@ -1385,6 +1394,35 @@ class MduWindow {
     // fade-in after the self test
     const since = (now - this.bootT0) / 1000 - BOOT_S;
     if (since < 0.35) { g.fillStyle = `rgba(0,0,0,${1 - since / 0.35})`; g.fillRect(0, 0, 512, 512); this.dirty = true; }
+  }
+}
+
+// =========================================================================================== panel MDU (3D flight deck)
+/**
+ * Headless MDU mounted in the 3D flight deck: the same pages, menus and edge keys as a window, drawn
+ * into an offscreen canvas that the cockpit uses as the display texture.  `version` increments on
+ * every redraw so the texture is uploaded only when the picture changed.
+ */
+export class PanelMdu extends MduWindow {
+  _build() {
+    this.cv = document.createElement('canvas');
+    this.cv.width = this.cv.height = this.spec.res || 768;
+    this.g = this.cv.getContext('2d');
+    this.scale = this.cv.width / 512;
+    this.version = 0;
+  }
+  _startBoot() { this.bootT0 = null; this.bitePass = true; this.powerT = performance.now() - 3600e3 * Math.random(); }
+  setPower(on) { this.st.power = on; if (on) { this.bootT0 = performance.now(); this.bitePass = false; } this.dirty = true; this.version++; }
+  place() {}
+  _applyBrt() {}
+  _syncUi() {}
+  _resizeCanvas() { this.scale = this.cv.width / 512; }
+  setOpen() {}
+  setCollapsed() {}
+  frame(d, now) {
+    const before = this.lastDraw;
+    super.frame(d, now);
+    if (this.lastDraw !== before || this.booting()) this.version++;
   }
 }
 
@@ -1438,6 +1476,13 @@ export class Meds {
     addEventListener('resize', () => this.wins.forEach((w) => w.place()));
   }
   toggle(id) { const w = this.wins.find((x) => x.spec.id === id); if (w) w.setOpen(!w.st.open); }
+  /** create an MDU for the 3D flight deck (spec: { port, idp, page, menu, res, sw? }) */
+  panelUnit(spec) {
+    const u = new PanelMdu(this, spec, null, { page: spec.page, menu: spec.menu, rng: spec.rng ?? 3, brt: spec.brt ?? 0.85 });
+    if (spec.sw) Object.assign(u.st.sw, spec.sw);
+    (this.panel ||= []).push(u);
+    return u;
+  }
   front(w) {
     if (w.el.style.zIndex == this.z) return;
     this.z++;
@@ -1461,17 +1506,74 @@ export class Meds {
     const txt = String(m.text || '').toUpperCase().replace(/[^A-Z0-9 .:+\-/%]/g, '').replace(/\s+/g, ' ').trim().slice(0, 36);
     this.fault = `${m.level === 'error' ? 'GNC FAIL ' : 'GNC '}${txt}`.padEnd(42).slice(0, 42) + ' ' + t;
     this.faultAck = false; this.faultT = performance.now();
+    // latched master alarm: one-off malfunctions (errors, crash, tail scrape, hard / off-runway
+    // landing).  Energy and degraded-mode alarms are conditions, evaluated from the telemetry.
+    if (Meds.isLatchedAlarm(m)) { this.latched = true; this.latchedT = performance.now(); this._syncAlarm(); }
     this.wins.forEach((w) => { w.dirty = true; });
   }
+  static isLatchedAlarm(m) {
+    if (m.level === 'error') return true;
+    return /tail scrape|OFF RUNWAY|non-finite|main gear touchdown/i.test(String(m.text || ''));
+  }
+  /**
+   * Condition alarms from the GNC telemetry: the C&W light follows the condition; the master alarm
+   * comes on when a condition appears, goes out when it clears (energy recovered, plan usable again)
+   * or when acknowledged with the MASTER ALARM pushbutton.
+   */
+  _conditions(st) {
+    const g = st && st.gnc, c = {};
+    if (g && !/CRASH|STOPPED|ROLLOUT|TOUCHDOWN/.test(g.phase || '')) {
+      if (g.reachable === false) c.energy = true;
+      if (g.degraded) c.degraded = true;
+    }
+    return c;
+  }
+  _updateAlarms(st) {
+    const cond = this._conditions(st);
+    const act = (this.condAct ||= {}), ack = (this.condAck ||= {});
+    for (const k of new Set([...Object.keys(act), ...Object.keys(cond)])) {
+      if (cond[k] && !act[k]) ack[k] = false;            // new condition: alarm
+      if (!cond[k]) delete ack[k];                       // cleared: forget the acknowledgement
+    }
+    this.condAct = cond;
+    this._syncAlarm();
+  }
+  _syncAlarm() {
+    const cond = this.condAct || {}, ack = this.condAck || {};
+    this.alarm = !!this.latched || Object.keys(cond).some((k) => !ack[k]);
+    // GPC caution light: on while a condition persists, or for a minute after a latched malfunction
+    this.cwGpc = Object.keys(cond).length > 0 || (!!this.latchedT && performance.now() - this.latchedT < 60000);
+  }
+  /** MASTER ALARM pushbutton: extinguishes the light (the fault message stays until MSG RESET) */
+  ackAlarm() {
+    this.latched = false;
+    for (const k of Object.keys(this.condAct || {})) (this.condAck ||= {})[k] = true;
+    this._syncAlarm();
+  }
+  /** new flight: clear everything */
+  resetAlarms() { this.latched = false; this.latchedT = 0; this.condAct = {}; this.condAck = {}; this._syncAlarm(); }
   faultNew() { return performance.now() - this.faultT < 6000 && Math.floor((performance.now() - this.faultT) / 500) % 2 === 0; }
   /** per animation frame */
   update(d) {
     const now = performance.now();
+    this._updateAlarms(d.st);
     const lit = (d.night || 0) > 0.45;
     for (const w of this.wins) {
       if (w._lit !== lit) { w._lit = lit; w.el.classList.toggle('lit', lit); }
       if (w._booting !== w.booting()) { w._booting = w.booting(); w._syncUi(); }
       w.frame(d, now);
+    }
+    // flight-deck units only draw while the cockpit view is shown: at most two redraws per animation
+    // frame, the most overdue first; secondary units refresh at a reduced rate (spec.rate)
+    if (d.cockpit && this.panel) {
+      const due = [];
+      for (const u of this.panel) {
+        if (!u.st.power) continue;
+        const late = now - u.lastDraw - 1000 / (PAGES[u.st.page].hz * (u.spec.rate || 1));
+        if (late >= 0 || u.dirty || u.booting() || u.keyFlash.some((t) => t && now - t < 160)) due.push([late + (u.spec.always ? 50 : 0), u]);
+      }
+      due.sort((a, b) => b[0] - a[0]);
+      for (let i = 0; i < Math.min(2, due.length); i++) { due[i][1].dirty = true; due[i][1].frame(d, now); }
     }
   }
 }
