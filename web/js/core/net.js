@@ -66,6 +66,7 @@ export class SimLink {
         case 'event': this.onEvent?.(m); break;
         case 'plan': this.onPlan?.(m); break;
         case 'mpc': this.onMpc?.(m); break;
+        case 'spawn_check': this.onSpawnCheck?.(m); break;
       }
     };
   }
@@ -141,11 +142,16 @@ export class SimLink {
     this.onStatus?.('local');
     this._offlineReset();
   }
-  _offlineReset() {
+  _offlineReset(sp = null) {
     const r = Math.random;
-    const dist = 18000 + r() * 40000, brg = r() * Math.PI * 2;
-    const alt = 7000 + r() * 15000;
-    const hdg = r() * 360;
+    let dist = 18000 + r() * 40000, brg = r() * Math.PI * 2;
+    let alt = 7000 + r() * 15000;
+    let hdg = r() * 360;
+    if (sp) {
+      // user-placed start (start-position tab): position / altitude / heading only
+      dist = sp.dist_km * 1000; brg = sp.bearing_deg * Math.PI / 180; alt = Math.max(sp.alt_km * 1000, 1600);
+      hdg = sp.heading_deg ?? ((Math.atan2(-Math.sin(brg), -Math.cos(brg)) * 180 / Math.PI + 360) % 360);
+    }
     const rho = 1.225 * Math.exp(-alt / 8500);
     const V = Math.min(Math.sqrt(2 * 10000 / rho), 700);
     this.off = { t: 0, e: Math.sin(brg) * dist, n: Math.cos(brg) * dist, u: alt, V, hdg, gam: -8, bank: 0, paused: false, ts: 1 };
@@ -154,7 +160,7 @@ export class SimLink {
   }
   _offlineCmd(obj) {
     if (obj.type === 'sim') {
-      if (obj.action === 'reset') this._offlineReset();
+      if (obj.action === 'reset') this._offlineReset(obj.spawn);
       if (obj.action === 'toggle_pause') this.off.paused = !this.off.paused;
       if (obj.action === 'pause') this.off.paused = true;
       if (obj.action === 'resume') this.off.paused = false;

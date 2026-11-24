@@ -17,6 +17,8 @@ import { Weather } from './world/weather.js';
 import { GncViz } from './world/gnc_viz.js';
 import { CameraRig, CAMERA_MODES, CAMERA_LABELS } from './ui/cameras.js';
 import { Hud } from './ui/hud.js';
+import { SpawnPanel } from './ui/spawn.js';
+import { Meds } from './ui/meds.js';
 
 const $ = (s) => document.querySelector(s);
 const ld = (txt, f) => { $('#ld-text').textContent = txt; if (f !== undefined) $('#ld-fill').style.width = `${Math.round(f * 100)}%`; };
@@ -154,6 +156,8 @@ async function main() {
 
   const hud = new Hud({ canvas: $('#hud'), panel: $('#flight'), surfCanvas: $('#surf'), mapCanvas: $('#map'), vsitCanvas: $('#vsit'), geometry, world: A.world, terrain });
   const rig = new CameraRig(camera, canvas, terrain, airport);
+  // MEDS glass-cockpit windows (A/E PFD, HSIT nav display, SPI, DPS pages): F / N or the dock buttons
+  const meds = new Meds({ dock: $('#camerabar') });
   resize();
   addEventListener('resize', resize);
 
@@ -176,6 +180,7 @@ async function main() {
       }
       toast('已连接 Python 仿真后端（6-DOF 气动 + 飞控）', 'info');
       sendEnv(true);
+      setTimeout(() => spawnPanel?.requestCheck(), 50);
     },
     onAero: (m) => { if (settings.showForces) forces.update(m.f); lastAero = m; },
     onPlan: (m) => { lastPlan = m; gncViz.setPlan(m); },
@@ -187,7 +192,7 @@ async function main() {
     },
     onEpisode: () => { trail.clear(); hud.clearTrail(); smoke.clear(); chute.reset(); shuttle.setChuteDoor(false); prevWow = null; },
     onMpc: (m) => { lastMpc = m.pred; gncViz.setMpc(m.pred); },
-    onEvent: (m) => toast(zhEvent(m.text), m.level || 'info', m.level === 'error' ? 8000 : 5000),
+    onEvent: (m) => { toast(zhEvent(m.text), m.level || 'info', m.level === 'error' ? 8000 : 5000); meds.event(m); },
     onStatus: (s) => {
       const p = $('#pill-link');
       p.classList.toggle('ok', s === 'online'); p.classList.toggle('bad', s !== 'online');
@@ -195,6 +200,9 @@ async function main() {
     },
   });
   let lastAero = null;
+  // start-position editor (own tab): place the vehicle anywhere and start from there
+  const spawnPanel = new SpawnPanel({ root: $('#spawn-panel'), hud, link, world: A.world, onStart: () => clearEpisode() });
+  link.onSpawnCheck = (m) => spawnPanel.onCheck(m);
 
   // ------------------------------------------------------------------ UI bindings
   const bindRange = (id, fmt, fn) => {
@@ -569,13 +577,19 @@ async function main() {
       if (frame % 3 === 0) {
         hud.drawSurfaces(st.surf, st.cmd);
         hud.drawProfile(st, lastPlan);
-        hud.drawMap(st.pos, st.air?.track ?? 0, A.world.runway, lastPlan ? { pts: gncViz.planPts, hac: lastPlan.hac, approach: lastPlan.approach, ali: lastPlan.ali, fallback: lastPlan.fallback, mpc: lastMpc } : (lastMpc ? { pts: [], mpc: lastMpc } : null));
+        spawnPanel.setVehicle(st);
+        if (frame % 15 === 0) spawnPanel.draw();
+        hud.drawMap(st.pos, st.air?.track ?? 0, A.world.runway, lastPlan ? { pts: gncViz.planPts, hac: lastPlan.hac, approach: lastPlan.approach, ali: lastPlan.ali, fallback: lastPlan.fallback, prev: lastPlan.prev, mpc: lastMpc } : (lastMpc ? { pts: [], mpc: lastMpc } : null));
       }
     }
+    meds.update({
+      st, plan: lastPlan, planPts: gncViz.planPts, mpc: lastMpc, trail: hud.trail, prof: hud.profHist, runway: A.world.runway,
+      link: link.connected ? 'online' : link.offline ? 'local' : 'offline', night: U.uNight.value,
+    });
   }
   loop();
   window.__planelands = {
-    THREE, renderer, scene, camera, U, terrain, airport, shuttle, clouds, post, atmo, rig, link, setCam, gncViz, hud, chute, smoke, trail, weather,
+    THREE, renderer, scene, camera, U, terrain, airport, shuttle, clouds, post, atmo, rig, link, setCam, gncViz, hud, meds, chute, smoke, trail, weather,
     injectPlan(m) { lastPlan = m; gncViz.setPlan(m); }, injectMpc(p) { lastMpc = p; gncViz.setMpc(p); },
     // debug helper: free camera at runway-frame (u, v, height) looking at heading/pitch (deg)
     look(u, v, h, hdgDeg, pitchDeg) { setCam('free'); airport.toWorld(u, v, h, rig.free.pos); rig.free.yaw = -hdgDeg * Math.PI / 180; rig.free.pitch = pitchDeg * Math.PI / 180; },

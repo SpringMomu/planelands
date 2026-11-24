@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Planelands · 轨道器模型预览</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0d1520; color: #dce6f0; font: 12px/1.5 system-ui, sans-serif; }
+  canvas { display: block; }
+  #ui { position: fixed; left: 12px; top: 12px; padding: 10px 12px; background: rgba(10, 16, 24, 0.72); border: 1px solid rgba(160, 190, 220, 0.18); border-radius: 8px; }
+  #ui label { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+  #ui input[type=range] { width: 140px; }
+  #ui .h { color: #7f93a8; margin-bottom: 4px; }
+</style>
+<script type="importmap">
+{ "imports": { "three": "./vendor/three/build/three.module.js" } }
+</script>
+</head>
+<body>
+<div id="ui">
+  <div class="h">拖动旋转 · 滚轮缩放 · 右键平移</div>
+  <label><input type="checkbox" id="gear" /> 起落架</label>
+  <label>减速板 <input type="range" id="sb" min="0" max="98.6" step="0.5" value="0" /></label>
+  <label>升降副翼 <input type="range" id="el" min="-33" max="18" step="0.5" value="0" /></label>
+  <label>体襟翼 <input type="range" id="bf" min="-11.7" max="22.5" step="0.5" value="0" /></label>
+  <label>太阳高度 <input type="range" id="sun" min="2" max="90" step="1" value="38" /></label>
+</div>
+<script type="module" src="./js/tools/orbiter_preview.js"></script>
+</body>
+</html>

@@ -14,7 +14,7 @@ from dataclasses import asdict
 import numpy as np
 
 from .approach import ALRef, build_reference
-from .geometry import TWO_PI, ApproachConfig, initial_guess, runway_ends, select_plan
+from .geometry import TWO_PI, ApproachConfig, initial_guess, plan_score, rate_track, runway_ends, select_plan
 from .model import PlanningModel
 from .scp import DX, ScpSolver, TerrainField
 
@@ -73,11 +73,48 @@ def al_from_dict(d, ends):
                  keys=d["keys"], sb_pf=d["sb_pf"])
 
 
+# re-selection of the discrete approach (runway end / HAC side) on warm replans
+SWITCH_GAIN = 0.12       # score improvement needed to leave a still-feasible plan (hysteresis)
+SWITCH_GAIN_BAD = 0.02   # ... when the current plan has left the energy band
+
+
+def _side_name(rwy, side):
+    return f"RWY{rwy} {'right' if side > 0 else 'left'} HAC"
+
+
+def _reselect(pm, ctx, x0, Xw, rwy, cfg, hac):
+    """Re-run the runway / HAC-side selection from the current state with the current wind and
+    compare it with the plan being flown (``Xw``: its remaining TAEM nodes, starting at x0).
+    Returns (candidate or None, decision dict)."""
+    try:
+        cur = rate_track(pm, x0, Xw, rwy, cfg, hac)
+    except Exception as e:                       # degenerate remaining track: keep the plan
+        return None, dict(error=repr(e))
+    best, ok, _ = select_plan(pm, x0, ctx.ends, ApproachConfig())
+    s_cur, s_new = plan_score(cur), plan_score(best)
+    dec = dict(cur_rwy=rwy.name, cur_side=int(hac["dir"]) if hac else 0, cur_band=float(cur.band_pos),
+               cur_feasible=bool(cur.feasible), cur_score=float(s_cur), new_rwy=best.rwy.name,
+               new_side=int(best.side), new_band=float(best.band_pos), new_loops=int(best.path.loops),
+               new_score=float(s_new), new_ok=bool(ok), switch=False)
+    same = hac is not None and best.rwy.name == rwy.name and best.side == int(hac["dir"])
+    if not ok or same:
+        return None, dec
+    if cur.feasible and best.level > 0:
+        return None, dec          # never trade a flyable plan for a shortened (low-energy) approach
+    gain = s_cur - s_new
+    if gain > (SWITCH_GAIN_BAD if not cur.feasible else SWITCH_GAIN):
+        dec["reason"] = ("current plan out of the energy band" if not cur.feasible
+                         else f"better energy margin (score {s_cur:.2f} -> {s_new:.2f})")
+        return best, dec
+    return None, dec
+
+
 def plan(req: dict) -> dict:
     """Plan from req['x0'] (3-DOF state) to the A/L interface.
 
     req keys: x0, u0, t0, wind=(speed, dir_from), warm (optional previous TAEM reference
-    from now: dict(rwy, cfg, hac, t, X, U, reachable)), prefer (runway name or None)."""
+    from now: dict(rwy, cfg, hac, t, X, U, reachable)), prefer (runway name or None),
+    reselect (bool: with ``warm``, re-evaluate runway end / HAC side and switch if clearly better)."""
     t_start = time.perf_counter()
     init_worker()
     ctx = _CTX
@@ -93,6 +130,7 @@ def plan(req: dict) -> dict:
         fin["episode"] = req.get("episode")
         fin["wind"] = req.get("wind", (0.0, 0.0))
         return fin
+    kind = None
     if warm is not None and warm["rwy"] in ctx.ends and warm["t"][-1] - warm["t"][0] > 25.0:
         rwy = ctx.ends[warm["rwy"]]
         cfg = ApproachConfig(**warm["cfg"])
@@ -104,7 +142,11 @@ def plan(req: dict) -> dict:
         Xg[0] = x0
         Xg[0, 5] = x0[5]
         kind = "warm"
-    else:
+    decision = None
+    switch = None
+    if kind == "warm" and req.get("reselect"):
+        switch, decision = _reselect(pm, ctx, x0, Xg, rwy, cfg, hac)
+    if kind != "warm":
         cand, reachable, note = select_plan(pm, x0, ctx.ends, ApproachConfig(), prefer=req.get("prefer"))
         rwy, cfg, hac = cand.rwy, cand.cfg, cand.hac()
         Xg0, Ug0, tf0, _ = initial_guess(pm, x0, cand, 40)
@@ -128,9 +170,30 @@ def plan(req: dict) -> dict:
         consistent = bool(np.all(np.isfinite(res.X)) and np.isfinite(res.defect) and res.defect < 0.02)
         return res, good, consistent, al, Xg
 
-    res, good, consistent, al, Xg = attempt(rwy, cfg, Xg, Ug, tfg, 12 if kind == "cold" else 6)
-    ms_total = res.ms
-    it_total = res.iterations
+    ms_total = 0.0
+    it_total = 0
+    if switch is not None:
+        # different runway end / HAC side: cold SCP from its geometric guess; adopt it only if it
+        # reaches the ALI, otherwise stay on the plan being flown
+        Xs0, Us0, tfs0, _ = initial_guess(pm, x0, switch, 40)
+        Ns = _nodes_for(tfs0)
+        Xs, Us, tfs = _resample(np.linspace(0, tfs0, 40), Xs0, Us0, Ns) if Ns != 40 else (Xs0, Us0, tfs0)
+        rs, gs_, cs_, als, Xs = attempt(switch.rwy, switch.cfg, Xs, Us, tfs, 12)
+        ms_total += rs.ms
+        it_total += rs.iterations
+        if gs_:
+            prev = (rwy.name, int(hac["dir"]) if hac else 0)
+            rwy, cfg, hac, reachable, kind = switch.rwy, switch.cfg, switch.hac(), True, "switch"
+            Xg, Ug, tfg = Xs, Us, tfs
+            decision.update(switch=True, frm=_side_name(*prev), to=_side_name(rwy.name, switch.side))
+            res, good, consistent, al = rs, gs_, cs_, als
+        else:
+            decision.update(rejected="SCP did not reach the ALI on the new approach")
+            switch = None
+    if switch is None:
+        res, good, consistent, al, Xg = attempt(rwy, cfg, Xg, Ug, tfg, 12 if kind == "cold" else 6)
+        ms_total += res.ms
+        it_total += res.iterations
     if not good:
         # retry from the geometric guess (and with a shortened approach if energy is short)
         lvl0 = 0
@@ -176,7 +239,7 @@ def plan(req: dict) -> dict:
                 converged=bool(res.converged), ok=bool(good), fallback=not (good or consistent), iterations=res.iterations,
                 ms=res.ms, wall_ms=(time.perf_counter() - t_start) * 1e3, cost=res.cost, defect=res.defect,
                 term_err=te, reachable=bool(reachable) and bool(good), note=note, al=_al_dict(al),
-                wind=req.get("wind", (0.0, 0.0)), episode=req.get("episode"))
+                wind=req.get("wind", (0.0, 0.0)), episode=req.get("episode"), decision=decision)
 
 
 def _final_approach(ctx, pm, x0):

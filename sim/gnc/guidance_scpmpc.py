@@ -5,7 +5,14 @@ Phases:  PLAN -> TAEM (ACQ / HAC / PRF) -> A/L (OGS / PREFLARE / IGS / FLARE)
 
 * planning: runway/HAC selection, Dubins + HAC initial guess, free-final-time SCP to the
   A/L interface (worker process in the real-time server, synchronous in headless tests);
-  replans every ~20 s (warm-started from the current reference) or on large errors
+  replans every ~20 s (warm-started from the current reference), on large errors or when the
+  wind estimate changes
+* approach re-selection: until HAC acquisition (and > ``freeze_t_ali`` s before the ALI) a replan
+  re-runs the runway-end / HAC-side choice with the current wind and switches to a different
+  approach when it is clearly better (hysteresis, at most ``max_switches``) - the discrete
+  re-decision that a warm-started SCP alone can never make.  ``reselect_mode`` "wind" (default):
+  only once the wind differs from the one the approach was chosen with, or on a large energy /
+  tracking error; "always": on every replan; "off": never
 * tracking: LTV-MPC on the combined reference (TAEM plan + A/L reference) at 2.5 Hz with
   spatial re-indexing; the control sequence is interpolated between MPC updates
 * flare / touchdown / rollout: proven sink-rate flare with tail-scrape protection, centreline
@@ -22,7 +29,9 @@ from .approach import PH_FLARE, PH_IGS, PH_NAMES, PH_OGS, flare_alpha, lateral_b
 from .geometry import TWO_PI, runway_ends, wrap_pi
 from .model import G0, PlanningModel
 from .mpc import AL_W, TAEM_W, Mpc
-from .planner import AsyncPlanner, SyncPlanner, _Ctx, al_from_dict
+from types import SimpleNamespace
+
+from .planner import AsyncPlanner, SyncPlanner, _Ctx, _final_approach, al_from_dict
 from .reference import RefPath
 
 R2D = 180.0 / math.pi
@@ -35,6 +44,12 @@ class ScpMpcGuidance(GuidanceBase):
     rate_hz = 10.0
     mpc_period = 0.4
     replan_period = 20.0
+    freeze_t_ali = 60.0      # no approach re-selection closer than this to the ALI ...
+    max_switches = 2         # ... or after this many switches per flight
+    switch_dwell = 40.0      # min time between switches (s)
+    wind_replan_dv = 3.0     # wind change (vector, m/s at 10 m) that triggers an immediate replan ...
+    wind_replan_dt = 10.0    # ... at most this often (s)
+    reselect_mode = "wind"   # "wind" | "always" | "off"
     flare_h = 22.0           # main-gear height that starts the final flare
 
     def __init__(self, ctx):
@@ -84,6 +99,14 @@ class ScpMpcGuidance(GuidanceBase):
         self.scp_info = {"iter": 0, "ms": 0.0, "converged": False, "cost": 0.0, "defect": 0.0, "age": 0.0,
                          "fallback": True}
         self.pending = False
+        self.n_switch = 0
+        self.t_switch = -1e9
+        self.wind_plan = None        # wind (speed, dir_from) the current plan was made with
+        self.wind_class = None       # ... the current runway end / HAC side was chosen with
+        self.switch_log = []
+        self.decision = None
+        self.prev_approach = None
+        self.last_prev_msg = None
 
     def event(self, level, text):
         self.msgs.append({"type": "event", "level": level, "text": text})
@@ -102,6 +125,15 @@ class ScpMpcGuidance(GuidanceBase):
         f = getattr(self.ctx, "wind_info", None)
         return f() if f else (0.0, 0.0)
 
+    def _wind_change(self, ref=None):
+        """Vector change (m/s) of the 10 m wind since the current plan (or ``ref`` wind) was made."""
+        ref = self.wind_plan if ref is None else ref
+        if ref is None:
+            return 0.0
+        (s1, d1), (s0, d0) = self._wind(), ref
+        a1, a0 = math.radians(d1), math.radians(d0)
+        return math.hypot(s1 * math.sin(a1) - s0 * math.sin(a0), s1 * math.cos(a1) - s0 * math.cos(a0))
+
     def _state3(self, s):
         wE, wN = self.pm.wind(s.pos[2])
         vE, vN = s.vel[0] - float(wE), s.vel[1] - float(wN)
@@ -113,11 +145,12 @@ class ScpMpcGuidance(GuidanceBase):
         return np.array([s.pos[0], s.pos[1], s.pos[2], s.tas, math.radians(s.gamma), psi])
 
     # ------------------------------------------------------------------ planning
-    def _request(self, t, s, x, warm=True, prefer=None):
+    def _request(self, t, s, x, warm=True, prefer=None, reselect=False):
         if self.planner.busy:
             return
         u0 = self.u_prev if self.u_prev is not None else np.array([s.alpha, 0.0, 0.0])
-        req = dict(x0=x, u0=u0, t0=t, wind=self._wind(), prefer=prefer, episode=self.episode)
+        req = dict(x0=x, u0=u0, t0=t, wind=self._wind(), prefer=prefer, episode=self.episode,
+                   reselect=bool(reselect))
         if warm and self.ref is not None and self.plan is not None:
             fi, tau = self.ref.project(x)
             ia = self.ref.i_ali
@@ -138,6 +171,9 @@ class ScpMpcGuidance(GuidanceBase):
         r = self.planner.poll()
         if r is None:
             return
+        self._accept(r, t)
+
+    def _accept(self, r, t):
         if r.get("episode") is not None and r.get("episode") != self.episode:
             return                       # stale result from before a reset
         self.pending = False
@@ -146,6 +182,24 @@ class ScpMpcGuidance(GuidanceBase):
             return
         al = al_from_dict(r["al"], self.ends)
         prev_rwy = self.rwy
+        prev_plan = self.plan
+        if r.get("wind") is not None:
+            self.wind_plan = tuple(r["wind"])
+            if r["kind"] != "warm" or self.wind_class is None:
+                self.wind_class = tuple(r["wind"])
+        dec = r.get("decision")
+        if dec is not None:
+            self.decision = dict(dec, t=t)
+        if r["kind"] == "switch":
+            self.n_switch += 1
+            self.t_switch = t
+            self.switch_log.append(dict(t=t, h=float(r["X"][0, 2]), **dec))
+            self.event("warn", f"HAC switch: {dec['frm']} -> {dec['to']} ({dec['reason']}; energy band "
+                               f"{dec['cur_band']:.2f} -> {dec['new_band']:.2f}, wind "
+                               f"{r['wind'][0]:.0f} m/s from {r['wind'][1]:03.0f})")
+        elif dec is not None and dec.get("rejected"):
+            self.event("info", f"approach re-selection: {dec['new_rwy']} {'right' if dec['new_side'] > 0 else 'left'}"
+                               f" HAC rejected ({dec['rejected']})")
         ref = RefPath(self.pm, r["t0"], r["X"], r["U"], r["tf"], al, hac=r["hac"])
         self.ref = ref
         self.plan = r
@@ -156,7 +210,8 @@ class ScpMpcGuidance(GuidanceBase):
         self.reachable = r["reachable"]
         self.plan_log.append(dict(t=t, kind=r["kind"], iterations=int(r["iterations"]), ms=float(r["ms"]),
                                   wall_ms=float(r.get("wall_ms", r["ms"])), converged=bool(r["converged"]),
-                                  fallback=bool(r["fallback"]), rwy=r["rwy"], reachable=bool(r["reachable"])))
+                                  fallback=bool(r["fallback"]), rwy=r["rwy"], reachable=bool(r["reachable"]),
+                                  hac_dir=int(r["hac"]["dir"]) if r.get("hac") else 0, decision=dec))
         self.scp_info = {"iter": int(r["iterations"]), "ms": float(r["ms"]), "converged": bool(r["converged"]),
                          "cost": float(r["cost"]) if np.isfinite(r["cost"]) else 0.0,
                          "defect": float(r["defect"]) if np.isfinite(r["defect"]) else 0.0,
@@ -174,12 +229,22 @@ class ScpMpcGuidance(GuidanceBase):
             "approach": [[float(a), float(b), float(c)] for a, b, c in al.polyline(step=8)],
             "converged": bool(r["converged"]), "fallback": bool(r["fallback"]), "kind": r["kind"],
             "iterations": int(r["iterations"]), "ms": float(r["ms"]), "tf": float(r["tf"]),
+            "switch": r["kind"] == "switch",
         }
+        if r["kind"] == "switch" and prev_plan is not None:
+            # previous approach, for the displays (abandoned HAC + approach line)
+            pm_ = self.last_prev_msg or {}
+            self.prev_approach = {"rwy": prev_plan["rwy"], "hac": prev_plan.get("hac"), "t": t,
+                                  "approach": pm_.get("approach"),
+                                  "track": [[n[1], n[2]] for n in pm_.get("nodes", [])]}
+        if self.prev_approach is not None:
+            self.last_plan_msg["prev"] = self.prev_approach
         self.msgs.append(self.last_plan_msg)
+        self.last_prev_msg = self.last_plan_msg
         txt = (f"plan #{self.plan_id} ({r['kind']}) RWY{r['rwy']}: SCP {r['iterations']} it, {r['ms']:.0f} ms, "
                f"{'converged' if r['converged'] else 'not converged'}, tf {r['tf']:.0f} s to ALI"
                + (" [geometric fallback]" if r["fallback"] else ""))
-        if r["kind"] == "cold" or r["fallback"] or prev_rwy is None or prev_rwy.name != r["rwy"]:
+        if r["kind"] in ("cold", "switch") or r["fallback"] or prev_rwy is None or prev_rwy.name != r["rwy"]:
             self.event("info", txt)
         if r.get("note") and r["note"] != getattr(self, "_last_note", None):
             self.event("warn" if not r["reachable"] else "info", r["note"])
@@ -198,6 +263,15 @@ class ScpMpcGuidance(GuidanceBase):
         x = self._state3(s)
         self.u_prev = np.array([s.alpha, 0.0, 0.0])
         self.mpc._solver = None          # no warm-start state across episodes (reproducibility)
+        if self.planner_mode != "sync":
+            # already on final (e.g. the short-final demo): the A/L reference needs no SCP, build it
+            # here instead of flying the first seconds without a plan while the worker is busy
+            fin = _final_approach(SimpleNamespace(ends=self.ends), self.pm, x)
+            if fin is not None:
+                fin.update(t0=s.t, episode=self.episode, wind=self._wind())
+                self.pending = False
+                self._accept(fin, s.t)
+                return
         self._request(s.t, s, x, warm=False)
 
     def update(self, t, s):
@@ -244,12 +318,24 @@ class ScpMpcGuidance(GuidanceBase):
             due = t - self.t_plan > (30.0 if self.maxrange else self.replan_period)
             big = (not self.maxrange) and (dpos > 1500.0 or abs(x[2] - xr[2]) > 600.0 or abs(eh) > 900.0
                                            or self.mpc_fail >= 3)
-            if due or big:
+            dw = self._wind_change()
+            windy = (not self.maxrange) and dw > self.wind_replan_dv and t - self.t_plan > self.wind_replan_dt
+            if due or big or windy:
                 if big:
                     self.event("info", f"replan: tracking error {dpos:.0f} m / dh {x[2] - xr[2]:.0f} m / "
                                        f"dE {eh:.0f} m")
+                elif windy:
+                    w = self._wind()
+                    self.event("info", f"replan: wind update {w[0]:.0f} m/s from {w[1]:03.0f} "
+                                       f"(changed {dw:.1f} m/s since the last plan)")
+                # approach re-selection only before HAC acquisition, not too close to the ALI
+                news = (self.reselect_mode == "always" or big
+                        or self._wind_change(self.wind_class) > self.wind_replan_dv)
+                resel = (self.reselect_mode != "off" and news and not self.maxrange and self.sub == "ACQ"
+                         and t_to_ali > self.freeze_t_ali and self.n_switch < self.max_switches
+                         and t - self.t_switch > self.switch_dwell)
                 self.mpc_fail = 0
-                self._request(t, s, x, warm=True)
+                self._request(t, s, x, warm=True, reselect=resel)
                 if self.planner_mode == "sync" and self.ref is not None:
                     fi, tau = self.ref.project(x, hint=0)
                     self.fi = fi
@@ -299,6 +385,11 @@ class ScpMpcGuidance(GuidanceBase):
             "ref": {"alpha": float(ur[0]), "bank": float(ur[1] * R2D), "sb": float(ur[2]), "h": float(xr[2]),
                     "V": float(xr[3])},
             "plan_id": self.plan_id, "track_err": dpos, "h_err": float(x[2] - xr[2]),
+            "switches": self.n_switch,
+            "hac_side": (int(self.plan["hac"]["dir"]) if self.plan and self.plan.get("hac") else 0),
+            "reselect": ({k: self.decision[k] for k in ("cur_band", "new_band", "cur_score", "new_score",
+                                                         "new_rwy", "new_side") if k in self.decision}
+                         if self.decision else None),
         }
         return cmd
 
@@ -310,7 +401,9 @@ class ScpMpcGuidance(GuidanceBase):
                     "time_to_go": 0.0, "reachable": True, "scp": dict(self.scp_info, age=0.0, pending=self.pending),
                     "mpc": {"ms": 0.0, "status": "idle"},
                     "ref": {"alpha": a, "bank": 0.0, "sb": 0.0, "h": s.alt, "V": s.tas}}
-        return GuidanceCommand(alpha_deg=a, bank_deg=0.0, speedbrake_deg=0.0, info="PLAN/WAIT")
+        # never retract a gear that is already down close to the ground while waiting for a plan
+        gear = bool(s.gear_pos > 0.5 and s.agl_gear < 600.0)
+        return GuidanceCommand(alpha_deg=a, bank_deg=0.0, speedbrake_deg=0.0, gear_down=gear, info="PLAN/WAIT")
 
     def _max_range(self, t, s, x):
         """Unreachable field: best L/D, turn toward the threshold."""
@@ -350,11 +443,11 @@ class ScpMpcGuidance(GuidanceBase):
             brakes = 0.55
         if gs < 15.0:
             brakes = 1.0
-        # drag chute once the nose wheel is firmly down and below ~180 KTAS (limits the nose-up
-        # moment of the chute); speedbrake fully open only at lower speed for the same reason
-        chute = (nose and self.t_nose is not None and t - self.t_nose > 1.5 and gs > 32.0
-                 and (s.tas < 93.0 or self._chute_on))
-        self._chute_on = chute or self._chute_on
+        # drag chute: deployed as soon as the main gear is on the ground (before derotation);
+        # jettisoned by the simulator below ~60 KGS
+        main = bool(s.wow[1] or s.wow[2])
+        chute = self._chute_on or (main and gs > 32.0)
+        self._chute_on = chute
         sb_fl = float(self.ref.al.sb_pf) if self.ref is not None else 0.0
         sb = 98.6 if (nose and s.tas < 80.0) else (sb_fl if nose else sb_fl)
         self.tel = dict(self.tel, phase=self.phase, sub=self.sub, range_to_go=0.0, time_to_go=0.0)

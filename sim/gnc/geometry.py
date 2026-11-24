@@ -313,22 +313,25 @@ def candidates(model, x0, ends, cfg: ApproachConfig, level=0):
     return out
 
 
+def plan_score(c: Candidate, prefer=None):
+    """Lower is better: aim for the middle-low part of the energy band, prefer into-wind,
+    fewer HAC loops, shorter TAEM."""
+    s = abs(c.band_pos - 0.35)
+    s += 0.04 * max(c.tail - 2.0, 0.0)
+    s += 0.05 * c.path.loops
+    s += 1.5e-6 * c.L_taem
+    if prefer is not None and c.rwy.name == prefer:
+        s -= 0.08
+    return s
+
+
 def select_plan(model, x0, ends, cfg: ApproachConfig, prefer=None):
     """Pick runway end / HAC side / loops.  Returns (candidate, reachable, note)."""
     for level in (0, 1, 2):
         cands = candidates(model, x0, ends, cfg, level)
         feas = [c for c in cands if c.feasible]
         if feas:
-            def score(c):
-                # aim for the middle-low part of the energy band, prefer into-wind, fewer loops
-                s = abs(c.band_pos - 0.35)
-                s += 0.04 * max(c.tail - 2.0, 0.0)
-                s += 0.05 * c.path.loops
-                s += 1.5e-6 * c.L_taem
-                if prefer is not None and c.rwy.name == prefer:
-                    s -= 0.08
-                return s
-            best = min(feas, key=score)
+            best = min(feas, key=lambda c: plan_score(c, prefer))
             note = "" if level == 0 else f"low energy: shortened approach (level {level})"
             return best, True, note
     # nothing feasible: report the one with the best margin
@@ -340,6 +343,53 @@ def select_plan(model, x0, ends, cfg: ApproachConfig, prefer=None):
                              f"height, {best.dE_avail/1000:.1f} km available")
     best = min(cands, key=lambda c: c.dE_avail / max(c.dE_max, 1.0))
     return best, False, "HIGH ENERGY: cannot dissipate enough energy before the ALI"
+
+
+class TrackPath:
+    """An arbitrary ground track (e.g. the remaining TAEM reference) with the ``sample`` /
+    ``length`` / HAC interface of ``DubinsPath``, so ``path_energy_budget`` can rate it."""
+
+    def __init__(self, E, N, psi, hac=None):
+        E, N, psi = (np.asarray(v, float) for v in (E, N, psi))
+        seg = np.hypot(np.diff(E), np.diff(N))
+        self.s = np.concatenate([[0.0], np.cumsum(seg)])
+        self.E, self.N, self.psi = E, N, psi
+        self.loops = 0
+        hac = hac or {"center": [0.0, 0.0], "radius": 1.0, "dir": 0}
+        self.c2 = np.asarray(hac["center"], float)
+        self.r2 = float(hac["radius"])
+        self.s2 = int(hac["dir"])
+
+    @property
+    def length(self):
+        return float(self.s[-1])
+
+    def sample(self, ds=200.0):
+        n = max(int(math.ceil(self.length / ds)), 1)
+        sn = np.linspace(0.0, self.length, n + 1)
+        E, N, psi = (np.interp(sn, self.s, v) for v in (self.E, self.N, self.psi))
+        dpsi = np.gradient(psi, sn) if n > 1 else np.zeros_like(sn)
+        kap = np.where(np.abs(dpsi) > 1.0 / 60000.0, dpsi, 0.0)
+        return E, N, psi, kap, np.zeros(len(sn), int)
+
+
+def rate_track(model, x0, X, rwy: RunwayEnd, cfg: ApproachConfig, hac=None, level=0):
+    """Energy-band rating of the remaining TAEM reference ``X`` (nodes from now to the ALI),
+    comparable with the Dubins candidates (prefinal straight excluded, like there)."""
+    X = np.asarray(X, float)
+    full = TrackPath(X[:, 0], X[:, 1], X[:, 5], hac)
+    s_wp2 = max(full.length - cfg.d_prefinal, 1.0)
+    k = int(np.searchsorted(full.s, s_wp2))
+    E = np.concatenate([full.E[:k], [np.interp(s_wp2, full.s, full.E)]])
+    N = np.concatenate([full.N[:k], [np.interp(s_wp2, full.s, full.N)]])
+    psi = np.concatenate([full.psi[:k], [np.interp(s_wp2, full.s, full.psi)]])
+    path = TrackPath(E, N, psi, hac)
+    x_ali = ali_state(model, rwy, cfg)
+    dmin, dmax, dav, _ = path_energy_budget(model, path, x0, x_ali, ds=700.0)
+    wE, wN = model.wind(rwy.elev + 300.0)
+    tail = float(wE * rwy.d[0] + wN * rwy.d[1])
+    return Candidate(rwy=rwy, cfg=cfg, path=path, side=int(path.s2), L_taem=full.length, dE_avail=dav,
+                     dE_min=dmin, dE_max=dmax, tail=tail, level=level)
 
 
 # ----------------------------------------------------------------------------- initial guess

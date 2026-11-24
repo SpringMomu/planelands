@@ -413,6 +413,14 @@ export class Hud {
     c.moveTo(...b); c.lineTo(...toPx(Math.sin(h) * (L / 2 + ext), Math.cos(h) * (L / 2 + ext)));
     c.stroke(); c.setLineDash([]);
     // planned trajectory, HAC, approach
+    if (plan && plan.prev) {
+      // approach abandoned by a HAC switch (grey, dashed)
+      const pv = plan.prev; c.strokeStyle = 'rgba(190,190,190,0.55)'; c.lineWidth = 1.5; c.setLineDash([5, 4]);
+      if (pv.track && pv.track.length > 1) { c.beginPath(); pv.track.forEach((p, i) => { const q = toPx(p[0], p[1]); i ? c.lineTo(...q) : c.moveTo(...q); }); c.stroke(); }
+      if (pv.hac) { const [hx, hy] = toPx(pv.hac.center[0], pv.hac.center[1]); c.beginPath(); c.arc(hx, hy, pv.hac.radius * s, 0, Math.PI * 2); c.stroke(); }
+      if (pv.approach && pv.approach.length > 1) { c.beginPath(); pv.approach.forEach((p, i) => { const q = toPx(p[0], p[1]); i ? c.lineTo(...q) : c.moveTo(...q); }); c.stroke(); }
+      c.setLineDash([]);
+    }
     if (plan && plan.pts && plan.pts.length > 1) {
       c.strokeStyle = plan.fallback ? 'rgba(255,190,90,0.9)' : 'rgba(110,220,255,0.95)'; c.lineWidth = 2; c.setLineDash([]);
       c.beginPath(); plan.pts.forEach((p, i) => { const q = toPx(p[0], p[1]); i ? c.lineTo(...q) : c.moveTo(...q); }); c.stroke();

@@ -3,6 +3,15 @@
     python tools/gnc_selftest.py                 # 24 random feasible spawns + 6 wind/turbulence cases
     python tools/gnc_selftest.py --n 40 --wind 10 --workers 12
     python tools/gnc_selftest.py --seeds 1003 1007   # specific seeds, verbose events
+    python tools/gnc_selftest.py --n 0 --wind 0 --buran 16   # forecast-vs-actual wind (HAC switch)
+    python tools/gnc_selftest.py --at 40,200,15 --at 25,90,10,270   # user-placed starts
+        (dist_km,bearing_deg,alt_km[,heading_deg[,mach]]; bearing from the runway centre,
+         heading omitted = toward the runway, Mach omitted = ~10 kPa dynamic pressure)
+
+"buran" cases: the vehicle spawns and plans with a light forecast wind; at ``--buran-t`` s the
+actual wind ramps (over ``--buran-ramp`` s) to ``--buran-speed`` m/s from a swept direction, like
+the much stronger than forecast wind at Buran's landing.  Reports how often the guidance
+re-selects the approach (runway end / HAC side) and whether it still lands.
 
 Success = touchdown on the runway with sink < 3 m/s, |cross| < 20 m, and the vehicle stops
 on the runway (incl. overruns).  Each case runs in its own process (synchronous planner).
@@ -31,18 +40,55 @@ KT = 1.0 / 0.514444
 
 def run_case(case):
     from sim.simulator import Simulator
-    seed, ws, wd, turb, tag, verbose = case
+    seed, ws, wd, turb, tag, verbose = case[:6]
+    sched = case[6] if len(case) > 6 else None      # (t_change, speed, dir_from, ramp_s, ambiguity)
+    at = case[7] if len(case) > 7 else None         # custom spawn spec (Simulator._custom_init)
     t_wall = time.perf_counter()
     sim = Simulator(seed=seed, verbose=False)
     sim.wind.set(speed=ws, dir_from=wd, intensity=turb)
     sim.drain_messages()                     # discard the init episode
-    sim.reset(seed=seed)
+    if sched is not None and len(sched) > 4 and sched[4] > 0:
+        # spawn near a decision boundary: the best two approaches of different runway end / HAC
+        # side score within sched[4] of each other under the forecast wind
+        from sim.gnc.geometry import ApproachConfig, candidates, plan_score
+        base = sim._spawn_feasible
+
+        def ambiguous(x3):
+            if not base(x3):
+                return False
+            feas = sorted((c for c in candidates(sim._spawn_pm, x3, sim._spawn_ends, ApproachConfig(), 0)
+                           if c.feasible), key=plan_score)
+            if not feas:
+                return False
+            k0 = (feas[0].rwy.name, feas[0].side)
+            other = [c for c in feas if (c.rwy.name, c.side) != k0]
+            return bool(other) and plan_score(other[0]) - plan_score(feas[0]) < sched[4]
+        sim._spawn_feasible = ambiguous
     ev = []
+    if at is not None:
+        init, warn = sim._custom_init(at)
+        sim.reset(init=init)
+        ev.extend(f"[   0.0] warn: custom spawn: {w}" for w in warn)
+    else:
+        sim.reset(seed=seed)
+    g0 = sim.guidance
     spawn = None
     qmax = nzmax = 0.0
     nzmin = 9.0
     tmax = 1500.0
+    wchg = None
     while sim.t < tmax:
+        if sched is not None and sim.t >= sched[0] and sim.status == "FLIGHT":
+            # vector ramp forecast -> actual wind
+            f = min((sim.t - sched[0]) / max(sched[3], 1e-6), 1.0)
+            a0, a1 = math.radians(wd), math.radians(sched[2])
+            vx = (1 - f) * ws * math.sin(a0) + f * sched[1] * math.sin(a1)
+            vy = (1 - f) * ws * math.cos(a0) + f * sched[1] * math.cos(a1)
+            if f < 1.0 or wchg is None:
+                sim.wind.set(speed=math.hypot(vx, vy), dir_from=math.degrees(math.atan2(vx, vy)) % 360.0)
+                if wchg is None:
+                    wchg = dict(rwy0=(g0.plan or {}).get("rwy"), side0=g0.plan_log[-1]["hac_dir"] if g0.plan_log else 0)
+                    ev.append(f"[{sim.t:6.1f}] test: actual wind ramps to {sched[1]:.0f} m/s from {sched[2]:03.0f}")
         sim.step()
         if sim.status == "FLIGHT" and int(sim.t * 100) % 10 == 0:
             o = sim.obs
@@ -53,7 +99,7 @@ def run_case(case):
         for m in sim.drain_messages():
             if m.get("type") == "event":
                 ev.append(f"[{sim.t:6.1f}] {m['level']}: {m['text']}")
-                if spawn is None and m["text"].startswith("spawn"):
+                if spawn is None and m["text"].startswith(("spawn:", "custom spawn:")):
                     spawn = m["text"]
         if sim.status in ("STOPPED", "CRASHED"):
             break
@@ -72,7 +118,8 @@ def run_case(case):
                scp_iter=[p["iterations"] for p in plans], scp_ms=[p["ms"] for p in plans],
                scp_conv=[p["converged"] for p in plans], scp_fb=[p["fallback"] for p in plans],
                cold_ms=[p["ms"] for p in cold], mpc_n=mstat[0], mpc_mean=mstat[1] / max(mstat[0], 1),
-               mpc_max=mstat[2], wall=time.perf_counter() - t_wall)
+               mpc_max=mstat[2], wall=time.perf_counter() - t_wall,
+               switches=list(getattr(g, "switch_log", [])), wchg=wchg)
     return res
 
 
@@ -86,9 +133,29 @@ def main():
     ap.add_argument("--turb", type=float, default=0.6)
     ap.add_argument("--workers", type=int, default=min(12, os.cpu_count() or 4))
     ap.add_argument("--seeds", type=int, nargs="*")
+    ap.add_argument("--at", action="append", default=[],
+                    help="custom start dist_km,bearing_deg,alt_km[,heading_deg[,mach]] (repeatable)")
+    ap.add_argument("--buran", type=int, default=0, help="number of forecast-vs-actual wind cases")
+    ap.add_argument("--bseed0", type=int, default=3000)
+    ap.add_argument("--buran-speed", type=float, default=12.0, help="actual 10 m wind (m/s; ~1.75x aloft)")
+    ap.add_argument("--buran-forecast", type=float, default=3.0, help="forecast 10 m wind (m/s)")
+    ap.add_argument("--buran-t", type=float, default=40.0, help="time the actual wind sets in (s)")
+    ap.add_argument("--buran-ramp", type=float, default=20.0)
+    ap.add_argument("--buran-turb", type=float, default=0.3)
+    ap.add_argument("--buran-ambig", type=float, default=0.12,
+                    help="spawn only where the two best approach classes score within this (0: any spawn)")
     args = ap.parse_args()
     cases = []
-    if args.seeds:
+    if args.at:
+        for i, a in enumerate(args.at):
+            v = [float(x) for x in a.split(",")]
+            sp = dict(dist_km=v[0], bearing_deg=v[1], alt_km=v[2])
+            if len(v) > 3:
+                sp["heading_deg"] = v[3]
+            if len(v) > 4:
+                sp.update(speed=v[4], speed_unit="mach")
+            cases.append((i, 0.0, 0.0, 0.0, f"at {a}", True, None, sp))      # calm
+    elif args.seeds:
         cases = [(s, 0.0, 0.0, 0.0, "calm", True) for s in args.seeds]
     else:
         cases = [(args.seed0 + i, 0.0, 0.0, 0.0, "calm", False) for i in range(args.n)]
@@ -96,6 +163,12 @@ def main():
         tag = f"wind{args.wind_speed:g}+turb{args.turb:g}"
         cases += [(args.wseed0 + i, args.wind_speed, float(dirs[i % len(dirs)]), args.turb, tag, False)
                   for i in range(args.wind)]
+        btag = f"buran{args.buran_forecast:g}->{args.buran_speed:g}"
+        for i in range(args.buran):
+            wd_act = (i * 360.0 / 8 + 22.5 * (i // 8)) % 360.0
+            wd_fc = (wd_act + 90.0) % 360.0       # forecast direction unrelated to the actual one
+            cases.append((args.bseed0 + i, args.buran_forecast, wd_fc, args.buran_turb, btag, False,
+                          (args.buran_t, args.buran_speed, wd_act, args.buran_ramp, args.buran_ambig)))
     t0 = time.perf_counter()
     ctx = mp.get_context("spawn")
     with ctx.Pool(processes=min(args.workers, len(cases))) as pool:
@@ -109,6 +182,9 @@ def main():
                   f"t={r['t']:.0f}s {tds} | qmax {r['qmax']/1000:.1f} kPa nz {r['nzmin']:.2f}..{r['nzmax']:.2f} | "
                   f"plans {r['n_plans']} | wall {r['wall']:.0f}s", flush=True)
             print(f"      {r['spawn']}", flush=True)
+            for sw in r["switches"]:
+                print(f"      HAC switch at t={sw['t']:.0f}s h={sw['h']/1000:.1f} km: {sw['frm']} -> {sw['to']} "
+                      f"(band {sw['cur_band']:.2f} -> {sw['new_band']:.2f}; {sw['reason']})", flush=True)
             if not r["success"] or args.seeds:
                 for e in r["events"][-14:]:
                     print("        " + e)
@@ -128,6 +204,11 @@ def main():
             print(f"   touchdown: sink {sink.mean():.2f} avg / {sink.max():.2f} max m/s, {kgs.mean():.0f} KGS avg "
                   f"({kgs.min():.0f}..{kgs.max():.0f}), past threshold {past.mean():.0f} m ({past.min():.0f}..{past.max():.0f}),"
                   f" |cross| {cr.mean():.1f} avg / {cr.max():.1f} max m")
+        nsw = [r for r in rs if r["switches"]]
+        if nsw or tag.startswith("buran"):
+            print(f"   approach re-selection: {len(nsw)}/{len(rs)} flights switched "
+                  f"({sum(len(r['switches']) for r in rs)} switches), {sum(r['success'] for r in nsw)}/{len(nsw)} "
+                  f"of those landed")
         print(f"   max qbar {max(r['qmax'] for r in rs)/1000:.1f} kPa, nz range {min(r['nzmin'] for r in rs):.2f}.."
               f"{max(r['nzmax'] for r in rs):.2f} g")
         it = np.concatenate([r["scp_iter"] for r in rs]) if rs else np.array([])

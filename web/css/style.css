@@ -356,3 +356,13 @@ select option { background: #10161e; }
   #touchctl { bottom: var(--sb); right: calc(var(--sr) + var(--rail-w) + 12px); }
   #stick { width: 124px; height: 124px; }
 }
+
+/* start-position editor */
+.spawn-map { display: block; width: 100%; aspect-ratio: 592 / 440; border: 1px solid var(--line); border-radius: 6px; cursor: crosshair; touch-action: none; }
+.spawn-hint { margin-top: 6px; }
+.spawn-status { padding: 7px 9px; border-radius: 6px; border: 1px solid var(--line); background: rgba(255,255,255,0.03); }
+.spawn-status[data-s="ok"] { border-color: rgba(61,255,110,0.45); }
+.spawn-status[data-s="ok"] b { color: #3dff6e; }
+.spawn-status[data-s="warn"] { border-color: rgba(255,181,71,0.55); }
+.spawn-status[data-s="bad"] { border-color: rgba(255,93,93,0.6); }
+.spawn-status[data-s="bad"] b { color: #ff7b7b; }

@@ -17,7 +17,7 @@ from .gnc import guidance_scpmpc as _gnc_register  # noqa: F401  (registers "scp
 from .gnc.geometry import ApproachConfig, runway_ends, select_plan
 from .gnc.model import PlanningModel
 from .reduced_model import ReducedModel, TrimTables
-from .spawn import InitialState, approach_state, random_spawn
+from .spawn import InitialState, approach_state, custom_spawn, random_spawn
 from .terrain import Terrain
 from .trim import load_or_build_trim_tables
 from .wind import WindModel
@@ -129,6 +129,7 @@ class Simulator:
         self.chute_state = 0.0      # inflated area fraction
         self.chute_t = None
         self.chute_jettisoned = False
+        self._air_hold = None
         self.brakes = 0.0
         self.steer = 0.0
         self.touchdown = None
@@ -151,6 +152,49 @@ class Simulator:
 
     def reset_to(self, init: InitialState):
         self.reset(init=init)
+
+    # ------------------------------------------------------------------ user-placed start
+    def _custom_init(self, sp: dict):
+        """InitialState from a client spawn spec: e, n (m) or dist_km + bearing_deg (from the runway
+        centre), alt (m MSL) or alt_km, heading_deg (None/'runway' = toward the runway), speed +
+        speed_unit (auto | mach | keas | tas), gamma_deg, gear_down."""
+        if "e" in sp and "n" in sp:
+            e, n = float(sp["e"]), float(sp["n"])
+        else:
+            d = float(sp.get("dist_km", 40.0)) * 1000.0
+            b = math.radians(float(sp.get("bearing_deg", 0.0)))
+            e, n = d * math.sin(b), d * math.cos(b)
+        alt = float(sp["alt"]) if "alt" in sp else float(sp.get("alt_km", 15.0)) * 1000.0
+        hd = sp.get("heading_deg")
+        hd = None if hd is None or hd == "runway" else float(hd)
+        rc = self.geo.world["runway"]["center_en"]
+        return custom_spawn(self.tables, self.terrain, self.geo.mass, self.geo.S, e, n, alt, heading_deg=hd,
+                            speed=sp.get("speed"), speed_unit=sp.get("speed_unit", "auto"),
+                            gamma_deg=float(sp.get("gamma_deg", -8.0)), wind_fn=self.wind.steady,
+                            gear_down=sp.get("gear_down"), rwy_center=(float(rc[0]), float(rc[1])))
+
+    def assess_spawn(self, init: InitialState) -> dict:
+        """Energy-band reachability of a start state (same estimate the guidance plans with)."""
+        agl = init.pos[2] - self.terrain.height(init.pos[0], init.pos[1])
+        v_air = init.vel - self.wind.steady(agl)
+        V = float(np.linalg.norm(v_air))
+        x3 = np.array([init.pos[0], init.pos[1], init.pos[2], V,
+                       math.asin(max(-1.0, min(1.0, v_air[2] / max(V, 1e-3)))), math.atan2(v_air[0], v_air[1])])
+        pm = self._spawn_pm
+        pm.set_wind(self.wind.speed, self.wind.dir_from)
+        try:
+            cand, ok, note = select_plan(pm, x3, self._spawn_ends, ApproachConfig())
+        except Exception as ex:
+            return {"reachable": False, "note": f"assessment failed: {ex!r}"}
+        out = {"reachable": bool(ok), "rwy": cand.rwy.name, "side": int(cand.side), "loops": int(cand.path.loops),
+               "band": float(cand.band_pos), "level": int(cand.level), "note": note,
+               "e_avail": float(cand.dE_avail), "e_min": float(cand.dE_min), "e_max": float(cand.dE_max)}
+        if ok:
+            out["summary"] = (f"reachable: RWY{cand.rwy.name} {'right' if cand.side > 0 else 'left'} HAC, "
+                              f"energy band {cand.band_pos:.2f}" + (f" ({note})" if note else ""))
+        else:
+            out["summary"] = note or "not reachable"
+        return out
 
     # ------------------------------------------------------------------ observation
     def observe(self, F_aero=None):
@@ -381,6 +425,10 @@ class Simulator:
                                                self.x[10:13], self.terrain.height, self.brakes, self.steer)
         else:
             self.last_Mg = np.zeros(3)
+        if self.status == "STOPPED" and self.brakes >= 0.5:
+            # parked on the brakes: no horizontal creep / yaw drift (the gear springs still settle)
+            self.x[3:5] = 0.0
+            self.x[12] = 0.0
         self.t += dt
         if not np.all(np.isfinite(self.x)):
             self.event("warn", "state became non-finite - resetting")
@@ -464,6 +512,37 @@ class Simulator:
         return n
 
     # ------------------------------------------------------------------ telemetry
+    def _display_air(self, o):
+        """Air-data / inertial quantities as the displays show them.  Angles derived from a
+        near-zero velocity are meaningless (alpha / bank flip through +-180 deg, the ground track
+        follows millimetre-per-second creep), so like a real air-data system the vane angles are
+        flagged invalid below ~50 KTAS on the ground and held at the last valid value, airspeeds
+        come from the steady wind only, and the track / flight-path angle fall back to the heading /
+        0 when the vehicle is (almost) not moving over the ground."""
+        on_ground = any(self.gear.wow) or self.status in ("ROLLOUT", "STOPPED")
+        la = self.last_aero or {}
+        air_ok = not (on_ground and o["V"] < 25.0)
+        if air_ok or getattr(self, "_air_hold", None) is None:
+            self._air_hold = {"alpha": o["alpha"] * R2D if air_ok else o["theta"] * R2D,
+                              "beta": o["beta"] * R2D if air_ok else 0.0,
+                              "bank": o["mu"] * R2D if air_ok else o["phi"] * R2D,
+                              "gamma_air": o["gamma"] * R2D if air_ok else 0.0,
+                              "ld": la.get("ld", 0.0) if air_ok else 0.0}
+        d = dict(self._air_hold, air_valid=bool(air_ok))
+        x = self.x
+        if air_ok:
+            V, eas, qbar, mach = o["V"], o["eas"], o["qbar"], o["mach"]
+        else:
+            V = float(np.linalg.norm(x[3:6] - self.ctx.wind_w))      # steady wind only (no gusts)
+            eas, qbar, mach = V * math.sqrt(o["rho"] / RHO0), 0.5 * o["rho"] * V * V, V / o["a"]
+        d.update(tas=V, eas=eas, keas=eas * KT, qbar=qbar, mach=mach)
+        moving = not on_ground or o["gs"] > 1.5
+        d["track"] = o["track"] if moving else (o["psi"] * R2D) % 360.0
+        d["gamma"] = o["gamma_i"] * R2D if moving else 0.0
+        d["gs"] = o["gs"] if (not on_ground or o["gs"] > 0.3) else 0.0
+        d["vs"] = x[5] if not (self.status == "STOPPED") else 0.0
+        return d
+
     def state_message(self, seq=0):
         o = self.obs
         x = self.x
@@ -479,18 +558,19 @@ class Simulator:
         cmd_alpha = self.gcmd.alpha_deg if self.mode == "AUTO" else self.man_alpha * R2D
         cmd_bank = self.gcmd.bank_deg if self.mode == "AUTO" else self.man_mu * R2D
         cmd_sb = self.fcs.cmd[CH_SB] * R2D
+        da = self._display_air(o)
         return {
             "type": "state", "t": self.t, "seq": seq, "episode": int(self.episode), "paused": self.paused,
             "time_scale": self.time_scale,
             "mode": self.mode, "status": self.status, "guidance": self.guidance.name + (f":{self.gcmd.info}" if self.gcmd.info else ""),
             "pos": x[0:3].tolist(), "vel": x[3:6].tolist(), "quat": x[6:10].tolist(), "omega": x[10:13].tolist(),
             "air": {
-                "alpha": o["alpha"] * R2D, "beta": o["beta"] * R2D, "mach": o["mach"], "tas": o["V"],
-                "eas": o["eas"], "keas": o["eas"] * KT, "qbar": o["qbar"], "rho": o["rho"],
-                "nz": -n[2], "ny": n[1], "nx": n[0], "gamma": o["gamma_i"] * R2D, "gamma_air": o["gamma"] * R2D,
-                "track": o["track"], "bank": o["mu"] * R2D, "phi": o["phi"] * R2D, "theta": o["theta"] * R2D,
+                "alpha": da["alpha"], "beta": da["beta"], "mach": da["mach"], "tas": da["tas"],
+                "eas": da["eas"], "keas": da["keas"], "qbar": da["qbar"], "rho": o["rho"],
+                "nz": -n[2], "ny": n[1], "nx": n[0], "gamma": da["gamma"], "gamma_air": da["gamma_air"],
+                "track": da["track"], "bank": da["bank"], "phi": o["phi"] * R2D, "theta": o["theta"] * R2D,
                 "psi": (o["psi"] * R2D) % 360.0, "alt": x[2], "agl": o["agl"], "agl_gear": o["agl_gear"],
-                "vs": x[5], "gs": o["gs"], "ld": la.get("ld", 0.0), "wind": o["wind"].tolist(),
+                "vs": da["vs"], "gs": da["gs"], "ld": da["ld"], "air_valid": da["air_valid"], "wind": o["wind"].tolist(),
                 "p": x[10] * R2D, "q": x[11] * R2D, "r": x[12] * R2D,
             },
             "surf": {"elevon_li": s[CH_LI], "elevon_lo": s[CH_LO], "elevon_ri": s[CH_RI], "elevon_ro": s[CH_RO],
@@ -546,8 +626,23 @@ class Simulator:
                 if msg.get("scenario") == "final":
                     # short-final demo (RWY33): exercises flare, touchdown, derotation, chute and rollout
                     self.reset(init=approach_state(self.terrain, self.tables, height_agl=30.0, V=115.0, gamma_deg=-2.0))
+                elif msg.get("scenario") == "custom":
+                    init, warn = self._custom_init(msg.get("spawn") or {})
+                    a = self.assess_spawn(init)
+                    self.reset(init=init)
+                    for w in warn:
+                        self.event("warn", f"custom spawn: {w}")
+                    self.event("info" if a.get("reachable") else "warn", f"custom spawn {a['summary']}")
                 else:
                     self.reset(seed=int(seed) if seed is not None else None)
+            elif a == "spawn_check":
+                # reachability preview of a spawn spec, without moving the vehicle
+                init, warn = self._custom_init(msg.get("spawn") or {})
+                r = self.assess_spawn(init)
+                hg = float(self.terrain.height(init.pos[0], init.pos[1]))
+                self.events.append({"type": "spawn_check", "id": msg.get("id"), "warnings": warn,
+                                    "pos": [float(v) for v in init.pos], "agl": float(init.pos[2] - hg),
+                                    "alpha": float(init.alpha_deg), "desc": init.desc, **r})
             elif a == "pause":
                 self.paused = True
             elif a == "resume":

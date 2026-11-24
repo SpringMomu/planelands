@@ -9,6 +9,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 <title>Planelands · 航天飞机自主返场</title>
 <link rel="stylesheet" href="./css/style.css" />
+<link rel="stylesheet" href="./css/meds.css" />
 <script type="importmap">
 { "imports": { "three": "./vendor/three/build/three.module.js" } }
 </script>
@@ -94,6 +95,7 @@
 <aside id="settings" class="glass">
   <div class="tabs">
     <button data-tab="sim" class="on">仿真</button>
+    <button data-tab="spawn" title="把飞机放到任意位置和高度开始">起点</button>
     <button data-tab="wx">体积云</button>
     <button data-tab="env">光照 · 大气</button>
     <button data-tab="gfx">画质</button>
@@ -122,6 +124,7 @@
     <p class="note m-only">手机手动模式：左下摇杆控制俯仰 / 滚转（下拉 = 抬头），右侧按钮控制偏航、减速板、起落架、减速伞和刹车。</p>
     <p class="note">AUTO = <b>SCP</b> 全程航迹规划 + <b>MPC</b> 滚动跟踪 → 电传飞控。手动：W/S 俯仰 · A/D 滚转 · Q/E 偏航 · Z/X 减速板 · G 起落架 · B 刹车 · C 减速伞。</p>
   </section>
+  <section data-pane="spawn"><div id="spawn-panel"></div></section>
   <section data-pane="wx">
     <div class="row"><label>云底高度</label><input type="range" id="cbase" min="300" max="9000" step="50" value="1600"><output id="cbase-o">1600 m</output></div>
     <div class="row"><label>云层厚度</label><input type="range" id="cthick" min="200" max="8000" step="50" value="2200"><output id="cthick-o">2200 m</output></div>
@@ -171,7 +174,7 @@
 <footer id="camerabar">
   <h3 class="m-only">视角 <span class="dim">CAMERA</span></h3>
   <div class="cams" id="cams"></div>
-  <div class="hints">鼠标拖动：环视 · 滚轮：缩放 · 1–7：切换视角 · P：暂停 · R：重新放置 · H：隐藏界面</div>
+  <div class="hints">鼠标拖动：环视 · 滚轮：缩放 · 1–7：切换视角 · P：暂停 · R：重新放置 · H：隐藏界面 · F / N：PFD / 导航仪表</div>
   <div class="hints-touch">单指拖动：环视 · 双指捏合：缩放</div>
 </footer>
 

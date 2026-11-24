@@ -1,0 +1,199 @@
+/* MEDS cockpit display windows (MDU): free-floating, draggable, collapsible shuttle glass-cockpit units.
+   Every dimension is in em: the window's font-size is width / 30, so the whole unit scales as one piece. */
+
+.mdu-win {
+  --panel: #5e6367;
+  --panel-hi: #6c7175;
+  --panel-lo: #4b4f53;
+  --engrave: #f1f2ee;
+  --bezel: #1d1f21;
+  position: fixed; left: 0; top: 0; z-index: 10;
+  width: 30em; font-size: 14px;
+  user-select: none; -webkit-user-select: none; touch-action: none;
+  border-radius: 0.32em;
+  background: var(--panel);
+  box-shadow:
+    0 0.9em 2.2em rgba(0, 0, 0, 0.55), 0 0.15em 0.4em rgba(0, 0, 0, 0.5),
+    0 0 0 1px rgba(0, 0, 0, 0.75),
+    inset 0 1px 0 rgba(255, 255, 255, 0.22), inset 0 -1px 0 rgba(0, 0, 0, 0.45);
+  font-family: "Arial Narrow", "Roboto Condensed", "Helvetica Neue", Arial, sans-serif;
+  color: var(--engrave);
+  cursor: grab;
+}
+.mdu-win.dragging { cursor: grabbing; box-shadow: 0 1.4em 3em rgba(0,0,0,.6), 0 0.2em 0.6em rgba(0,0,0,.5), 0 0 0 1px rgba(0,0,0,.75), inset 0 1px 0 rgba(255,255,255,.22); }
+.mdu-win.closed { display: none; }
+.mdu-win.opening { animation: mdu-open .28s cubic-bezier(.2,.9,.3,1.15); }
+@keyframes mdu-open { from { opacity: 0; transform: scale(.94) translateY(.6em); } to { opacity: 1; transform: none; } }
+/* painted aluminium: fine paint grain + very soft light falloff */
+.mdu-win::before {
+  content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+  background-image: var(--meds-noise), radial-gradient(140% 90% at 30% 0%, rgba(255,255,255,0.10), rgba(255,255,255,0) 55%), linear-gradient(180deg, rgba(255,255,255,0.04), rgba(0,0,0,0.12));
+  background-size: 7em 7em, 100% 100%, 100% 100%;
+  mix-blend-mode: overlay; opacity: 0.9;
+}
+
+/* ------------------------------------------------------------------ title placard strip */
+.mdu-strip {
+  position: relative; display: flex; align-items: center; gap: 0.5em;
+  height: 1.75em; padding: 0 0.45em 0 0.55em;
+  background: linear-gradient(180deg, #474c50 0%, #3b3f43 55%, #32363a 100%);
+  border-radius: 0.32em 0.32em 0 0;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.16), inset 0 -1px 0 rgba(0,0,0,0.55), 0 1px 0 rgba(255,255,255,0.08);
+}
+.mdu-win.collapsed .mdu-strip { border-radius: 0.32em; }
+.mdu-grip { width: 1.1em; height: 0.85em; flex: none;
+  background: repeating-linear-gradient(90deg, rgba(0,0,0,0.55) 0 0.09em, rgba(255,255,255,0.18) 0.09em 0.14em, transparent 0.14em 0.25em);
+  border-radius: 0.08em; opacity: 0.9; }
+.mdu-port { font-weight: 700; font-size: 0.78em; letter-spacing: 0.14em; white-space: nowrap;
+  text-shadow: 0 -1px 0 rgba(0,0,0,0.7), 0 1px 0 rgba(255,255,255,0.08); }
+.mdu-ttl { font-size: 0.68em; letter-spacing: 0.12em; color: #c8ccce; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  text-shadow: 0 -1px 0 rgba(0,0,0,0.7); }
+.mdu-sp { flex: 1; }
+.mdu-led { width: 0.55em; height: 0.55em; border-radius: 50%; flex: none;
+  background: radial-gradient(circle at 35% 30%, #59605a, #1d211e 70%);
+  box-shadow: 0 0 0 0.09em #151719, 0 0 0 0.15em #5d6266, inset 0 -1px 1px rgba(0,0,0,.6); }
+.mdu-led.on { background: radial-gradient(circle at 35% 30%, #eaffef 0, #4dff7c 35%, #109a3a 80%); box-shadow: 0 0 0 0.09em #151719, 0 0 0 0.15em #5d6266, 0 0 0.5em rgba(70,255,120,0.75); }
+.mdu-led.boot { background: radial-gradient(circle at 35% 30%, #fff6d8 0, #ffc23a 35%, #a86a00 80%); box-shadow: 0 0 0 0.09em #151719, 0 0 0 0.15em #5d6266, 0 0 0.5em rgba(255,190,60,0.75); }
+.mdu-wbtn {
+  width: 1.3em; height: 1.15em; padding: 0; flex: none; display: grid; place-items: center;
+  font: 700 0.72em/1 Arial, sans-serif; color: #e8eaea;
+  background: linear-gradient(180deg, #2b2e31, #1b1d1f); border: 0; border-radius: 0.16em;
+  box-shadow: 0 0 0 1px #0c0d0e, inset 0 1px 0 rgba(255,255,255,0.14), 0 1px 0 rgba(255,255,255,0.1);
+  cursor: pointer; font-size: 0.72em; width: 1.75em; height: 1.55em;
+}
+.mdu-wbtn:hover { background: linear-gradient(180deg, #34383b, #222427); }
+.mdu-wbtn:active { transform: translateY(1px); box-shadow: 0 0 0 1px #0c0d0e, inset 0 1px 2px rgba(0,0,0,0.7); }
+.mdu-wbtn b { display: block; width: 0.8em; height: 0.16em; background: currentColor; margin-top: 0.4em; }
+.mdu-win.collapsed .mdu-wbtn b { width: 0.75em; height: 0.6em; margin-top: 0; background: transparent; border: 0.13em solid currentColor; border-top-width: 0.22em; }
+
+/* ------------------------------------------------------------------ collapsible body */
+.mdu-fold { display: grid; grid-template-rows: 1fr; transition: grid-template-rows .32s cubic-bezier(.3,.8,.3,1); }
+.mdu-fold-in { overflow: hidden; min-height: 0; }
+.mdu-win.collapsed .mdu-fold { grid-template-rows: 0fr; }
+.mdu-panel { padding: 0.8em 0.9em 0.75em; position: relative; }
+
+/* ------------------------------------------------------------------ MDU bezel */
+.mdu-bezel {
+  position: relative; padding: 1.05em 1.1em 0.4em;
+  border-radius: 0.55em;
+  background: linear-gradient(180deg, #2a2c2f 0%, #1f2123 40%, #18191b 100%);
+  box-shadow:
+    0 0 0 1px #0a0b0c, 0 0.18em 0.35em rgba(0,0,0,0.65), 0 -1px 0 rgba(255,255,255,0.16),
+    inset 0 1px 0 rgba(255,255,255,0.13), inset 0 -0.14em 0.3em rgba(0,0,0,0.6);
+}
+.mdu-bezel::before { /* texture on the bezel's crackle-finish paint */
+  content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+  background-image: var(--meds-noise); background-size: 5em 5em; mix-blend-mode: soft-light; opacity: 0.55;
+}
+.dzus { position: absolute; width: 0.78em; height: 0.78em; border-radius: 50%;
+  background: radial-gradient(circle at 38% 32%, #8e9396 0, #5d6164 40%, #33363a 75%, #1e2022 100%);
+  box-shadow: 0 0 0 0.08em #0b0c0d, 0 0.06em 0.08em rgba(255,255,255,0.14), inset 0 -0.06em 0.1em rgba(0,0,0,0.6); }
+.dzus::after { content: ""; position: absolute; left: 12%; right: 12%; top: 50%; height: 0.11em; margin-top: -0.055em;
+  background: linear-gradient(180deg, #0d0e0f, #2c2f32); border-radius: 0.05em; transform: rotate(var(--r, 20deg)); box-shadow: 0 1px 0 rgba(255,255,255,0.15); }
+.dzus.tl { left: 0.17em; top: 0.17em; --r: 28deg; } .dzus.tr { right: 0.17em; top: 0.17em; --r: -41deg; }
+.dzus.bl { left: 0.17em; bottom: 0.17em; --r: 77deg; } .dzus.br { right: 0.17em; bottom: 0.17em; --r: 8deg; }
+
+.mdu-scr {
+  position: relative; width: 100%; aspect-ratio: 1 / 1; overflow: hidden;
+  background: #07090a; border-radius: 0.12em;
+  box-shadow: 0 0 0 0.1em #050606, 0 0 0 0.2em #303336, 0 0.22em 0 0.2em rgba(255,255,255,0.06), inset 0 0 0.4em #000;
+  cursor: default;
+}
+.mdu-scr canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; transition: opacity .35s ease-out; }
+.mdu-scr.off canvas { opacity: 0; transition: opacity .18s ease-in; }
+/* cover glass: anti-glare matte, faint reflection, viewing-angle falloff, pixel matrix */
+.mdu-glass { position: absolute; inset: 0; pointer-events: none; border-radius: inherit;
+  background:
+    linear-gradient(116deg, rgba(255,255,255,0.075) 0%, rgba(255,255,255,0.028) 24%, rgba(255,255,255,0) 40%, rgba(255,255,255,0) 78%, rgba(255,255,255,0.025) 100%),
+    radial-gradient(120% 70% at 22% -12%, rgba(190,210,235,0.09), rgba(190,210,235,0) 60%);
+  box-shadow: inset 0 0 1.6em rgba(0,0,0,0.55), inset 0 0.25em 0.5em rgba(0,0,0,0.6); }
+.mdu-glass::before { content: ""; position: absolute; inset: 0;
+  background: repeating-linear-gradient(0deg, rgba(0,0,0,0.28) 0 1px, transparent 1px 3px), repeating-linear-gradient(90deg, rgba(0,0,0,0.22) 0 1px, transparent 1px 3px);
+  opacity: 0.22; mix-blend-mode: multiply; }
+.mdu-glass::after { content: ""; position: absolute; inset: 0; background-image: var(--meds-noise); background-size: 9em 9em; opacity: 0.05; mix-blend-mode: screen; }
+.mdu-scr.off .mdu-glass { background:
+    linear-gradient(116deg, rgba(255,255,255,0.12) 0%, rgba(255,255,255,0.045) 26%, rgba(255,255,255,0) 44%, rgba(255,255,255,0) 76%, rgba(255,255,255,0.04) 100%),
+    radial-gradient(120% 80% at 20% -10%, rgba(190,210,235,0.12), rgba(190,210,235,0) 62%), #0b0e10; }
+
+.mdu-keys { display: grid; grid-template-columns: repeat(6, 1fr); justify-items: center; margin-top: 0.42em; }
+.ek {
+  width: 2.65em; height: 1.05em; padding: 0; border: 0; border-radius: 0.16em; cursor: pointer;
+  background: linear-gradient(180deg, #6a6f73 0%, #50555a 45%, #3e4246 100%);
+  box-shadow: 0 0 0 1px #0d0e0f, 0 0.13em 0 #111213, 0 0.2em 0.3em rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.28), inset 0 -1px 0 rgba(0,0,0,0.3);
+  transition: transform .04s, box-shadow .04s;
+}
+.ek:hover { background: linear-gradient(180deg, #72777b 0%, #575c61 45%, #43474b 100%); }
+.ek:active, .ek.down { transform: translateY(0.11em); box-shadow: 0 0 0 1px #0d0e0f, 0 0.02em 0 #111213, 0 0.05em 0.1em rgba(0,0,0,0.6), inset 0 1px 2px rgba(0,0,0,0.45); }
+.mdu-bzl { display: flex; justify-content: space-between; align-items: center; margin-top: 0.32em; padding: 0 1.6em;
+  font-size: 0.52em; letter-spacing: 0.2em; color: #a9adb0; text-shadow: 0 -1px 0 #000; }
+.mdu-bzl i { font-style: normal; color: #7d8285; }
+
+/* ------------------------------------------------------------------ panel controls */
+.mdu-ctl { display: flex; justify-content: space-around; align-items: flex-start; gap: 0.4em; margin-top: 0.7em; min-height: 4.9em; }
+.mdu-ctl .plac { font-weight: 700; font-size: 0.56em; letter-spacing: 0.1em; text-align: center; white-space: nowrap;
+  text-shadow: 0 -1px 0 rgba(0,0,0,0.55), 0 1px 0 rgba(255,255,255,0.12); margin-bottom: 0.35em; }
+.mdu-ctl .grp { display: flex; flex-direction: column; align-items: center; }
+
+/* toggle switch */
+.tg-body { display: flex; align-items: center; gap: 0.2em; }
+.tg-sw { position: relative; width: 1.9em; height: 3.2em; cursor: pointer; }
+.tg-sw::before { /* panel bushing washer */ content: ""; position: absolute; left: 50%; top: 50%; width: 1.5em; height: 1.5em; margin: -0.75em 0 0 -0.75em; border-radius: 50%;
+  background: radial-gradient(circle at 40% 35%, #9da2a5 0, #6b7074 45%, #3e4245 80%);
+  box-shadow: 0 0.1em 0.2em rgba(0,0,0,0.6), inset 0 0 0 0.08em rgba(0,0,0,0.35); }
+.tg-nut { position: absolute; left: 50%; top: 50%; width: 1.05em; height: 1.05em; margin: -0.525em 0 0 -0.525em;
+  clip-path: polygon(25% 3%, 75% 3%, 100% 50%, 75% 97%, 25% 97%, 0 50%);
+  background: conic-gradient(from 30deg, #cfd3d5, #7f8488, #e4e7e8, #6c7175, #c3c7c9, #5c6164, #cfd3d5); }
+.tg-nut::after { content: ""; position: absolute; inset: 0.2em; border-radius: 50%; background: radial-gradient(circle at 45% 40%, #2b2e30, #08090a 70%); }
+.tg-lev { position: absolute; left: 50%; bottom: 50%; width: 0.38em; height: 1.45em; margin-left: -0.19em; transform-origin: 50% 100%;
+  border-radius: 0.2em 0.2em 0.1em 0.1em;
+  background: linear-gradient(90deg, #5a5f63 0%, #c9cdcf 28%, #ffffff 42%, #a7acaf 62%, #4b5054 100%);
+  filter: drop-shadow(0.12em 0.18em 0.12em rgba(0,0,0,0.6));
+  transition: height .07s ease-in, transform .07s ease-in; }
+.tg-lev::after { content: ""; position: absolute; left: 50%; top: -0.2em; width: 0.56em; height: 0.56em; margin-left: -0.28em; border-radius: 50%;
+  background: radial-gradient(circle at 38% 32%, #ffffff 0, #d6d9db 25%, #888d91 70%, #4b5054 100%); }
+.tg[data-pos="0"] .tg-lev { height: 1.45em; transform: none; }
+.tg[data-pos="mid"] .tg-lev { height: 0.32em; transform: none; }
+.tg[data-pos="mid"] .tg-lev::after { top: -0.28em; width: 0.62em; height: 0.62em; margin-left: -0.31em; }
+.tg[data-pos="end"] .tg-lev { height: 1.45em; transform: rotate(180deg); }
+.tg-pos { display: flex; flex-direction: column; justify-content: space-between; height: 3.2em; font-weight: 700; font-size: 0.5em; letter-spacing: 0.06em; line-height: 1;
+  text-shadow: 0 -1px 0 rgba(0,0,0,0.5); padding: 0.1em 0; }
+.tg-pos span { opacity: 0.6; transition: opacity .1s; }
+.tg-pos span.sel { opacity: 1; }
+.tg-pos.n3 { height: 6.4em; }  /* label column height is in its own (smaller) em */
+.tg-pos.n2 { height: 6.4em; }
+
+/* rotary knob */
+.kn-dial { position: relative; width: 2.9em; height: 2.9em; margin: 0.8em 0.7em 0; cursor: ns-resize; }
+.kn-dial svg { position: absolute; left: -0.8em; top: -0.8em; width: 4.5em; height: 4.5em; overflow: visible; pointer-events: none; }
+.kn-skirt { position: absolute; inset: 0.22em; border-radius: 50%;
+  background: radial-gradient(circle at 40% 30%, #3a3d40 0, #1b1c1e 60%, #0c0d0e 100%);
+  box-shadow: 0 0.18em 0.32em rgba(0,0,0,0.7), 0 0 0 1px #08090a; transform: rotate(var(--a, 0deg)); }
+.kn-skirt::after { /* skirt index line */ content: ""; position: absolute; left: 50%; top: 0.05em; width: 0.13em; height: 0.55em; margin-left: -0.065em; background: #f4f4f0; border-radius: 0.05em; box-shadow: 0 0 1px rgba(0,0,0,.8); }
+.kn-cap { position: absolute; inset: 0.62em; border-radius: 50%;
+  background:
+    radial-gradient(circle at 38% 30%, rgba(255,255,255,0.22) 0, rgba(255,255,255,0) 45%),
+    repeating-conic-gradient(from 0deg, #2c2e31 0 5deg, #151618 5deg 10deg);
+  box-shadow: 0 0.1em 0.18em rgba(0,0,0,0.8), inset 0 0 0 0.12em #1d1f21, inset 0 1px 1px rgba(255,255,255,0.25);
+  transform: rotate(var(--a, 0deg)); }
+.kn-cap::after { content: ""; position: absolute; inset: 0.2em; border-radius: 50%; background: radial-gradient(circle at 40% 32%, #4a4d51 0, #232527 55%, #151617 100%); box-shadow: inset 0 1px 0 rgba(255,255,255,.15); }
+
+/* ------------------------------------------------------------------ resize grip */
+.mdu-rsz { position: absolute; right: 0.1em; bottom: 0.1em; width: 1.1em; height: 1.1em; cursor: nwse-resize;
+  background: repeating-linear-gradient(135deg, transparent 0 0.16em, rgba(0,0,0,0.55) 0.16em 0.24em, rgba(255,255,255,0.22) 0.24em 0.3em);
+  clip-path: polygon(100% 0, 100% 100%, 0 100%); border-bottom-right-radius: 0.3em; opacity: 0.85; }
+.mdu-win.collapsed .mdu-rsz { display: none; }
+
+/* ------------------------------------------------------------------ integral panel lighting at night */
+.mdu-win.lit { --panel: #3b3f42; --engrave: #ffffff; }
+.mdu-win.lit .plac, .mdu-win.lit .tg-pos, .mdu-win.lit .mdu-port { color: #fffdf4; text-shadow: 0 0 0.35em rgba(255,250,225,0.85), 0 0 0.1em rgba(255,250,225,0.9); }
+.mdu-win.lit .mdu-strip { background: linear-gradient(180deg, #2f3336, #25282b); }
+.mdu-win.lit .kn-dial svg { filter: drop-shadow(0 0 0.12em rgba(255,250,225,0.9)); }
+
+/* ------------------------------------------------------------------ dock (camera bar launchers) */
+.meds-dock { display: flex; gap: 4px; padding: 5px; background: var(--glass-strong); border: 1px solid var(--line); border-radius: 9px; backdrop-filter: blur(12px); }
+.meds-dock button { padding: 7px 11px; white-space: nowrap; font-family: var(--mono); letter-spacing: 0.06em; }
+.meds-dock button kbd { font-family: var(--mono); color: var(--dim); margin-right: 5px; font-size: 10px; }
+.meds-dock button.on { background: rgba(108, 240, 160, 0.14); border-color: rgba(108, 240, 160, 0.55); }
+
+body.ui-hidden .mdu-win, body.ui-hidden .meds-dock { display: none; }
+#toasts { z-index: 60; }

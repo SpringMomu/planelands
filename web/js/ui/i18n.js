@@ -1,10 +1,18 @@
 // Chinese rendering of the simulator's event messages (the backend logs in English).
 // Phrase-level rules so numbers are kept and unknown text simply passes through.
-const KIND = { cold: '冷启动', warm: '热启动', final: '五边' };
+const KIND = { cold: '冷启动', warm: '热启动', final: '五边', switch: '改选进场' };
 
 const RULES = [
   // spawn / scenario
   [/^spawn: /, '随机出生点：'],
+  [/^custom spawn: position clamped to the map \((\d+) km\)/, '自定义起点：位置超出地图，已限制在 ±$1 km'],
+  [/^custom spawn: altitude raised to (\d+) m \(150 m above the terrain\)/, '自定义起点：高度太低，已抬到 $1 m（离地 150 m）'],
+  [/^custom spawn: speed clamped to (\d+) m\/s/, '自定义起点：速度超限，已限制为 $1 m/s'],
+  [/^custom spawn: too slow for 1 g at this altitude: alpha limited to ([\d.]+) deg \(will sink \/ accelerate\)/, '自定义起点：这个高度速度太低，迎角限制在 $1°（会掉高度加速）'],
+  [/^custom spawn: /, '自定义起点：'],
+  [/^custom spawn reachable: RWY(\d+) (right|left) HAC, energy band ([\d.]+)/, (m, r, sd, b) => `自定义起点可达：RWY${r} ${sd === 'right' ? '右' : '左'}侧 HAC，能量带位置 ${b}`],
+  [/^custom spawn LOW ENERGY: runway (\d+) needs ([\d.]+) km energy height, ([-\d.]+) km available/, '自定义起点能量不足：到 RWY$1 需 $2 km 能量高度，只有 $3 km'],
+  [/^custom spawn HIGH ENERGY: cannot dissipate enough energy before the ALI/, '自定义起点能量过高：到 A/L 接口前耗散不掉'],
   [/([\d.]+) km from runway \(bearing (-?\d+) deg\)/, '距跑道 $1 km（方位 $2°）'],
   [/\balt ([\d.]+) km/, '高度 $1 km'],
   [/\bMach ([\d.]+)/, '马赫 $1'],
@@ -51,6 +59,13 @@ const RULES = [
   [/established on final approach/, '已建立五边进近'],
   [/^phase (\S+) \/ (\S*)\s+\(h (\d+) m, (\d+) KEAS\)/, '阶段 $1 / $2（高度 $3 m，$4 KEAS）'],
   [/gear down at (\d+) m/, '放下起落架（离地 $1 m）'],
+  [/^HAC switch: RWY(\d+) (right|left) HAC -> RWY(\d+) (right|left) HAC \(/, (m, r0, s0, r1, s1) => `改选进场：RWY${r0} ${s0 === 'right' ? '右' : '左'}侧 HAC → RWY${r1} ${s1 === 'right' ? '右' : '左'}侧 HAC（`],
+  [/current plan out of the energy band/, '原方案已超出能量带'],
+  [/better energy margin \(score ([\d.]+) -> ([\d.]+)\)/, '能量余量更好（评分 $1 → $2）'],
+  [/energy band ([\d.]+) -> ([\d.]+)/, '能量带位置 $1 → $2'],
+  [/wind (\d+) m\/s from (\d+)\)/, '风 $1 m/s，来向 $2°）'],
+  [/^replan: wind update (\d+) m\/s from (\d+) \(changed ([\d.]+) m\/s since the last plan\)/, '重新规划：风况更新 $1 m/s，来向 $2°（较上次规划变化 $3 m/s）'],
+  [/^approach re-selection: (\d+) (right|left) HAC rejected \(SCP did not reach the ALI on the new approach\)/, (m, r, sd) => `改选进场被否决：RWY${r} ${sd === 'right' ? '右' : '左'}侧 HAC 的 SCP 到不了 A/L 接口`],
   [/^replan: tracking error (\d+) m \/ dh (-?\d+) m \/ dE (-?\d+) m/, '重新规划：跟踪误差 $1 m / 高度差 $2 m / 能量高度差 $3 m'],
 ];
 
