@@ -93,6 +93,7 @@ class ScpMpcGuidance(GuidanceBase):
         self._chute_on = False
         self.mpc_fail = 0
         self.reachable = True
+        self.energy_high = False
         self.maxrange = False
         self.low_warned = False
         self.tel = {}
@@ -208,6 +209,7 @@ class ScpMpcGuidance(GuidanceBase):
         self.fi = 0.0
         self.plan_id += 1
         self.reachable = r["reachable"]
+        self.energy_high = "HIGH ENERGY" in (r.get("note") or "")
         self.plan_log.append(dict(t=t, kind=r["kind"], iterations=int(r["iterations"]), ms=float(r["ms"]),
                                   wall_ms=float(r.get("wall_ms", r["ms"])), converged=bool(r["converged"]),
                                   fallback=bool(r["fallback"]), rwy=r["rwy"], reachable=bool(r["reachable"]),
@@ -251,7 +253,10 @@ class ScpMpcGuidance(GuidanceBase):
         self._last_note = r.get("note")
         if not r["reachable"] and not self.low_warned:
             self.low_warned = True
-            self.event("warn", "LOW ENERGY: runway not reachable - flying maximum range toward the field")
+            if self.energy_high:
+                self.event("warn", "HIGH ENERGY: too close for this altitude / speed - best-effort energy dissipation")
+            else:
+                self.event("warn", "LOW ENERGY: runway not reachable - flying maximum range toward the field")
         self.maxrange = not r["reachable"] and r["fallback"]
 
     # ------------------------------------------------------------------ main update
@@ -380,6 +385,7 @@ class ScpMpcGuidance(GuidanceBase):
             "phase": self.phase, "sub": self.sub, "rwy": self.rwy.name if self.rwy else None,
             "energy_err": eh, "range_to_go": self.ref.range_to_go(fi), "time_to_go": max(self.ref.t_end - tau, 0.0),
             "time_to_ali": max(t_to_ali, 0.0), "reachable": bool(self.reachable),
+            "energy_high": bool(self.energy_high),
             "scp": dict(self.scp_info, age=t - self.t_plan, pending=self.pending),
             "mpc": {"ms": self.mpc.ms, "status": self.mpc.status},
             "ref": {"alpha": float(ur[0]), "bank": float(ur[1] * R2D), "sb": float(ur[2]), "h": float(xr[2]),
@@ -418,9 +424,19 @@ class ScpMpcGuidance(GuidanceBase):
                                info="TAEM/MAXRANGE")
 
     def _flare(self, t, s):
-        a = flare_alpha(self.ctx.tables, self.ctx.mass, self.ctx.S, s, gear=1.0)
-        bank = lateral_bank(self.rwy, s, bank_lim_deg=5.0) if self.rwy is not None else 0.0
         sb = float(self.ref.al.sb_pf) if self.ref is not None else 0.0
+        sink_td = 0.9
+        if self.ref is not None and self.rwy is not None:
+            # touchdown-zone awareness: floating past the aim point (excess speed, tailwind, shear
+            # balloon) -> settle it with a firmer sink and the speedbrake open instead of using
+            # up the runway
+            x, _ = self.rwy.to_rwy(s.pos[0], s.pos[1])
+            over = float(x) - float(self.ref.al.keys["x_td"])
+            if over > 0.0:
+                sink_td += float(np.clip(over / 300.0, 0.0, 1.0)) * 1.0
+                sb += (98.6 - sb) * float(np.clip(over / 250.0, 0.0, 1.0))
+        a = flare_alpha(self.ctx.tables, self.ctx.mass, self.ctx.S, s, gear=1.0, sink_td=sink_td)
+        bank = lateral_bank(self.rwy, s, bank_lim_deg=5.0) if self.rwy is not None else 0.0
         return GuidanceCommand(alpha_deg=a, bank_deg=bank, speedbrake_deg=sb, gear_down=True, info="A/L/FLARE")
 
     def _ground(self, t, s, status):

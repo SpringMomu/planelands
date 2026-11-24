@@ -105,7 +105,7 @@ class Simulator:
             cand, ok, note = select_plan(pm, x3, self._spawn_ends, ApproachConfig())
         except Exception:
             return False
-        return bool(ok) and cand.level == 0 and cand.band_pos < 0.9
+        return bool(ok) and cand.level == 0 and not cand.relaxed and cand.band_pos < 0.9
 
     # ------------------------------------------------------------------ reset
     def reset(self, seed=None, init: InitialState | None = None):
@@ -188,7 +188,8 @@ class Simulator:
             return {"reachable": False, "note": f"assessment failed: {ex!r}"}
         out = {"reachable": bool(ok), "rwy": cand.rwy.name, "side": int(cand.side), "loops": int(cand.path.loops),
                "band": float(cand.band_pos), "level": int(cand.level), "note": note,
-               "e_avail": float(cand.dE_avail), "e_min": float(cand.dE_min), "e_max": float(cand.dE_max)}
+               "e_avail": float(cand.dE_avail), "e_min": float(cand.dE_min), "e_max": float(cand.dE_max),
+               "relaxed": bool(cand.relaxed), "hac_r": float(cand.path.r2), "head": float(cand.head)}
         if ok:
             out["summary"] = (f"reachable: RWY{cand.rwy.name} {'right' if cand.side > 0 else 'left'} HAC, "
                               f"energy band {cand.band_pos:.2f}" + (f" ({note})" if note else ""))

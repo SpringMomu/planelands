@@ -205,30 +205,60 @@ def _sb_preflare(model, rwy, cfg, H, phase, keys):
 
 _CACHE = {}
 
+WIND_AIM_S = 25.0       # IGS aim / touchdown shift per m/s of along-runway wind (s)
+WIND_AIM_TAIL = 650.0   # max shift toward the threshold in a tailwind (m)
+WIND_AIM_HEAD = 400.0   # max shift down the runway in a headwind (m)
+X_TD_MIN = 400.0        # never aim the touchdown closer to the threshold than this
 
-def build_reference(model, rwy: RunwayEnd, cfg: ApproachConfig, dx=25.0, x_rollout=300.0) -> ALRef:
-    """A/L reference; the OGS EAS is adapted (280..320 KEAS) so that the preflare speedbrake
-    setting stays inside its range (headwind -> faster OGS, tailwind -> slower)."""
-    key = (rwy.name, tuple(sorted(cfg.__dict__.items())), round(model.w_speed, 1), round(model.w_dir, 0))
-    if key in _CACHE:
-        return _CACHE[key]
-    H, phase, keys = vertical_profile(cfg)
+
+def wind_aim(model, rwy: RunwayEnd, cfg: ApproachConfig) -> ApproachConfig:
+    """Wind-dependent IGS aim point and touchdown target (the OGS / ALI stay unchanged).
+
+    Tailwind: higher ground speed and a steeper air-relative IGS (bigger flare, balloon and float
+    in the tailwind that weakens near the ground) carry the touchdown far down the runway -> aim
+    closer to the threshold; the preflare speedbrake is then also set to bleed the speed earlier.
+    Headwind: the opposite (touchdown near the threshold) -> aim further down the runway, like
+    the Orbiter's wind-dependent close-in aim point."""
+    wE, wN = model.wind(rwy.elev + 10.0)
+    tail = float(wE * rwy.d[0] + wN * rwy.d[1])
+    dx = float(np.clip(WIND_AIM_S * np.sign(tail) * max(abs(tail) - 0.5, 0.0), -WIND_AIM_HEAD, WIND_AIM_TAIL))
+    if abs(dx) < 1.0:
+        return cfg
     from dataclasses import replace as _replace
+    return _replace(cfg, x_aim_igs=cfg.x_aim_igs - dx, x_td=max(cfg.x_td - dx, X_TD_MIN))
+
+
+def _adapt_eas(model, rwy, cfg):
+    """OGS EAS (280..320 KEAS, up to 340 when short of energy in a strong headwind) for which
+    the preflare speedbrake setting is inside its range."""
+    from dataclasses import replace as _replace
+    H, phase, keys = vertical_profile(cfg)
     kt = 0.514444
     eas = cfg.eas_ogs
     sb_pf, st = _sb_preflare(model, rwy, cfg, H, phase, keys)
-    for _ in range(4):
+    for _ in range(6):
         if st < 0 or sb_pf < 4.0:
             eas2 = eas + 10.0 * kt
         elif st > 0:
             eas2 = eas - 10.0 * kt
         else:
             break
-        if not (279.0 * kt <= eas2 <= 321.0 * kt):
+        if not (279.0 * kt <= eas2 <= (341.0 if st < 0 else 321.0) * kt):
             break
         c2 = _replace(cfg, eas_ogs=eas2)
         sb2, st2 = _sb_preflare(model, rwy, c2, H, phase, keys)
         eas, cfg, sb_pf, st = eas2, c2, sb2, st2
+    return cfg, H, phase, keys, sb_pf, st
+
+
+def build_reference(model, rwy: RunwayEnd, cfg: ApproachConfig, dx=25.0, x_rollout=300.0) -> ALRef:
+    """A/L reference; the IGS aim point / touchdown target are shifted with the along-runway wind
+    and the OGS EAS is adapted so that the preflare speedbrake setting stays inside its range
+    (headwind -> faster OGS, tailwind -> slower)."""
+    key = (rwy.name, tuple(sorted(cfg.__dict__.items())), round(model.w_speed, 1), round(model.w_dir, 0))
+    if key in _CACHE:
+        return _CACHE[key]
+    cfg, H, phase, keys, sb_pf, st = _adapt_eas(model, rwy, wind_aim(model, rwy, cfg))
     xs, Hs, V, gam, alpha, sb, gear, t, ph, wcr = _integrate(model, rwy, cfg, H, phase, keys, sb_pf, dx=dx,
                                                               x_end=keys["x_td"] + x_rollout)
     E, N = rwy.from_rwy(xs, 0.0)

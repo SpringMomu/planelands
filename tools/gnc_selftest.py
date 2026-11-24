@@ -5,6 +5,8 @@
     python tools/gnc_selftest.py --seeds 1003 1007   # specific seeds, verbose events
     python tools/gnc_selftest.py --n 0 --wind 0 --buran 16   # forecast-vs-actual wind (HAC switch)
     python tools/gnc_selftest.py --at 40,200,15 --at 25,90,10,270   # user-placed starts
+    python tools/gnc_selftest.py --at 20,150,4 --at-wind 10,330      # ... with wind (10 m speed, from)
+    GNC_AUTO_WEATHER=1 python tools/gnc_selftest.py ...              # drifting wind like the web client
         (dist_km,bearing_deg,alt_km[,heading_deg[,mach]]; bearing from the runway centre,
          heading omitted = toward the runway, Mach omitted = ~10 kPa dynamic pressure)
 
@@ -45,7 +47,7 @@ def run_case(case):
     at = case[7] if len(case) > 7 else None         # custom spawn spec (Simulator._custom_init)
     t_wall = time.perf_counter()
     sim = Simulator(seed=seed, verbose=False)
-    sim.wind.set(speed=ws, dir_from=wd, intensity=turb)
+    sim.wind.set(speed=ws, dir_from=wd, intensity=turb, auto=bool(os.environ.get("GNC_AUTO_WEATHER")))
     sim.drain_messages()                     # discard the init episode
     if sched is not None and len(sched) > 4 and sched[4] > 0:
         # spawn near a decision boundary: the best two approaches of different runway end / HAC
@@ -135,6 +137,8 @@ def main():
     ap.add_argument("--seeds", type=int, nargs="*")
     ap.add_argument("--at", action="append", default=[],
                     help="custom start dist_km,bearing_deg,alt_km[,heading_deg[,mach]] (repeatable)")
+    ap.add_argument("--at-wind", default="0,0,0",
+                    help="wind for the --at cases: speed_10m,dir_from[,turbulence] (default calm)")
     ap.add_argument("--buran", type=int, default=0, help="number of forecast-vs-actual wind cases")
     ap.add_argument("--bseed0", type=int, default=3000)
     ap.add_argument("--buran-speed", type=float, default=12.0, help="actual 10 m wind (m/s; ~1.75x aloft)")
@@ -154,7 +158,8 @@ def main():
                 sp["heading_deg"] = v[3]
             if len(v) > 4:
                 sp.update(speed=v[4], speed_unit="mach")
-            cases.append((i, 0.0, 0.0, 0.0, f"at {a}", True, None, sp))      # calm
+            aw = [float(x) for x in args.at_wind.split(",")] + [0.0, 0.0, 0.0]
+            cases.append((i, aw[0], aw[1], aw[2], f"at {a}", True, None, sp))
     elif args.seeds:
         cases = [(s, 0.0, 0.0, 0.0, "calm", True) for s in args.seeds]
     else:

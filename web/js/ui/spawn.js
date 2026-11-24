@@ -163,12 +163,15 @@ export class SpawnPanel {
     let txt;
     if (c.reachable) {
       txt = `<b>可达</b>：RWY${c.rwy} ${side}侧 HAC${c.loops ? `（绕 ${c.loops} 圈）` : ''}，能量带位置 ${c.band.toFixed(2)}` +
-        (c.level ? `，需缩短进近（第 ${c.level} 级）` : '');
-      el.dataset.s = c.level ? 'warn' : 'ok';
+        (c.level ? `，需缩短进近（第 ${c.level} 级）` : '') +
+        (c.relaxed ? `<br>能量偏高：拉长航迹（HAC 半径 ${(c.hac_r / 1000).toFixed(1)} km），已避开强逆风航段` : '');
+      el.dataset.s = c.level || c.relaxed ? 'warn' : 'ok';
     } else {
-      const low = c.e_avail < c.e_min;
+      const low = c.note ? c.note.startsWith('LOW ENERGY') : c.e_avail < c.e_min;
       txt = low ? `<b>能量不足</b>：到 RWY${c.rwy} 需 ${(c.e_min / 1000).toFixed(1)} km 能量高度，只有 ${(c.e_avail / 1000).toFixed(1)} km（几何估算）— 制导会尽力飞，可能到不了跑道`
-        : `<b>能量过高</b>：到 ALI 前耗散不掉（可用 ${(c.e_avail / 1000).toFixed(1)} km，最多耗散 ${(c.e_max / 1000).toFixed(1)} km）`;
+        : c.relaxed && c.note && c.note.includes('headwind')
+          ? `<b>能量过高</b>：只有顶着强逆风（平均 ${Math.round(c.head)} m/s）拉长航迹才到得了 RWY${c.rwy}，没有余量 — 制导会尽力飞`
+          : `<b>能量过高</b>：离跑道太近，到 RWY${c.rwy} 最多耗散 ${(c.e_max / 1000).toFixed(1)} km 能量高度，现有 ${(c.e_avail / 1000).toFixed(1)} km（几何估算）— 制导会尽力耗散，可能冲过 A/L 接口`;
       el.dataset.s = 'bad';
     }
     const extra = [];

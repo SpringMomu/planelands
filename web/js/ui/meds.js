@@ -265,7 +265,7 @@ function drawPFD(g, w, d) {
   const ann = [];
   if (st?.paused) ann.push(['SIM HOLD', COL.yellow]);
   if (d.link === 'local') ann.push(['NAV: PREVIEW', COL.amber]);
-  if (gnc && gnc.reachable === false) ann.push(['ENERGY LOW', COL.red]);
+  if (gnc && gnc.reachable === false) ann.push([gnc.energy_high ? 'ENERGY HIGH' : 'ENERGY LOW', COL.red]);
   if (st?.gear?.pos > 0.98) ann.push(['GR DN', COL.green]); else if (st?.gear?.pos > 0.02) ann.push(['GR TRNS', COL.yellow]);
   ann.forEach(([s, c], i) => T(g, s, 256 + (i - (ann.length - 1) / 2) * 76, 38, 11, c, 'center', '700'));
 

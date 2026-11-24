@@ -67,7 +67,7 @@ def runway_ends(world):
 
 @dataclass
 class ApproachConfig:
-    gamma_ogs_deg: float = -18.0     # outer glide slope
+    gamma_ogs_deg: float = -20.0     # outer glide slope (Orbiter lightweight OGS; matches the OGS PAPI)
     x_aim_ogs: float = -2300.0       # OGS aim point (before the threshold)
     h_ali: float = 3000.0            # ALI height above the runway
     eas_ogs: float = 290.0 * KT      # equivalent airspeed on the OGS
@@ -128,6 +128,8 @@ class DubinsPath:
         pts, psis, kap, lab = [], [], [], []
 
         def arc(c, r, s, psi_a, ang, label):
+            if r * ang < 1.0:
+                return              # no turn (e.g. straight-in): no duplicate zero-length sample
             n = max(int(math.ceil(r * ang / ds)), 1)
             for i in range(n):
                 f = i / n
@@ -225,9 +227,15 @@ class Candidate:
     dE_max: float             # energy that can be dissipated at worst L/D
     tail: float               # tailwind component on final (m/s)
     level: int = 0
+    relaxed: bool = False     # stretched path (enlarged HAC / extra loops) for a high-energy start
+    head: float = 0.0         # mean headwind along the path (m/s)
+    dE_min_rob: float = 0.0   # energy needed with the headwind 30 % stronger (relaxed paths)
 
     @property
     def feasible(self):
+        if self.relaxed:
+            # stretched paths must still make it if the headwind is stronger than forecast
+            return max(self.dE_min, self.dE_min_rob) * 1.04 <= self.dE_avail <= self.dE_max * 0.97
         return self.dE_min * 1.04 <= self.dE_avail <= self.dE_max * 0.97
 
     @property
@@ -253,9 +261,10 @@ def ali_state(model, rwy: RunwayEnd, cfg: ApproachConfig):
     return np.array([E, N, h, V, math.radians(cfg.gamma_ogs_deg), rwy.heading])
 
 
-def path_energy_budget(model, path: DubinsPath, x0, x_ali, ds=400.0):
+def path_energy_budget(model, path: DubinsPath, x0, x_ali, ds=400.0, head_k=1.0):
     """Energy needed (best L/D) and dissipable (worst L/D) to fly ``path`` from x0 to x_ali,
-    using the Mach profile of a linear-energy / blended-qbar glide."""
+    using the Mach profile of a linear-energy / blended-qbar glide.  ``head_k`` scales the
+    headwind components (robustness check against a stronger headwind than forecast)."""
     E, N, psi, kap, lab = path.sample(ds)
     seg = np.hypot(np.diff(E), np.diff(N))
     s = np.concatenate([[0.0], np.cumsum(seg)])
@@ -276,6 +285,8 @@ def path_energy_budget(model, path: DubinsPath, x0, x_ali, ds=400.0):
     turn_eff = np.sqrt(np.clip(np.cos(np.minimum(bank, 1.2)), 0.3, 1.0))
     wE, wN = model.wind(h)
     wpar = wE * np.sin(psi) + wN * np.cos(psi)
+    if head_k != 1.0:
+        wpar = np.where(wpar < 0.0, wpar * head_k, wpar)
     gs = np.clip((V + wpar) / V, 0.3, 2.0)
     ldb = model.ld_best(M) * turn_eff * gs
     ldm = model.ld_min(M) * gs * np.where(np.abs(kap) > 0, 0.85, 1.0)
@@ -313,13 +324,83 @@ def candidates(model, x0, ends, cfg: ApproachConfig, level=0):
     return out
 
 
+HAC_SCALES = (1.0, 1.25, 1.5, 1.8, 2.2)    # relaxed: enlarged HAC radii ...
+MAX_LOOPS_RELAXED = 4                        # ... and more HAC loops
+HEAD_K_ROBUST = 1.3                          # relaxed paths must still reach with 30 % more headwind
+
+
+def headwind_mean(model, prof):
+    """Mean headwind (m/s, >= 0 parts only) along a sampled path profile."""
+    E, N, psi, kap, lab, s, h, V, M, q = prof
+    wE, wN = model.wind(h)
+    head = np.maximum(-(wE * np.sin(psi) + wN * np.cos(psi)), 0.0)
+    seg = np.diff(s)
+    return float(np.sum(seg * 0.5 * (head[1:] + head[:-1])) / max(s[-1], 1.0))
+
+
+def _with_prefinal(path: DubinsPath, rwy: RunwayEnd, c: ApproachConfig, ds=350.0):
+    """Ground track of ``path`` plus the prefinal straight WP2 -> ALI, for an energy budget that
+    covers the whole TAEM (the nominal candidates leave the prefinal out)."""
+    E, N, psi, _, _ = path.sample(ds)
+    n = max(int(c.d_prefinal / ds), 2)
+    xs = np.linspace(c.x_wp2, c.x_ali, n + 1)[1:]
+    Ep, Np = rwy.from_rwy(xs, 0.0)
+    return TrackPath(np.concatenate([E, Ep]), np.concatenate([N, Np]),
+                     np.concatenate([psi, np.full(n, psi[-1])]))
+
+
+def relaxed_candidates(model, x0, ends, cfg: ApproachConfig):
+    """High-energy starts (too close / too high or fast for the nominal geometry): stretch the
+    ground track with an enlarged HAC and extra HAC loops so the energy band has no gaps between
+    loop counts; the budget includes the prefinal straight.  Every candidate is rated for
+    headwind exposure and checked against a 30 % stronger headwind, so stretched legs into a
+    strong headwind are not chosen."""
+    out = []
+    V0 = float(x0[3])
+    r1 = min(max(turn_radius(V0, 45.0), 3000.0), 40000.0)
+    psi0 = float(x0[5])
+    p0 = np.array([x0[0], x0[1]])
+    for rwy in ends.values():
+        wE, wN = model.wind(rwy.elev + 300.0)
+        tail = float(wE * rwy.d[0] + wN * rwy.d[1])
+        for k in HAC_SCALES:
+            c = replace(cfg, r_hac=cfg.r_hac * k)
+            x_ali = ali_state(model, rwy, c)
+            wp2 = np.array(rwy.from_rwy(c.x_wp2, 0.0))
+            for side in (+1, -1):
+                for s1 in (+1, -1):
+                    p = dubins_csc(p0, psi0, r1, s1, wp2, rwy.heading, c.r_hac, side)
+                    if p is None:
+                        continue
+                    for loops in range(MAX_LOOPS_RELAXED + 1):
+                        p.loops = loops
+                        tp = _with_prefinal(p, rwy, c)
+                        dmin, dmax, dav, prof = path_energy_budget(model, tp, x0, x_ali, ds=700.0)
+                        cand = Candidate(rwy=rwy, cfg=c, path=replace(p), side=side,
+                                         L_taem=p.length + c.d_prefinal, dE_avail=dav, dE_min=dmin,
+                                         dE_max=dmax, tail=tail, level=0, relaxed=True,
+                                         head=headwind_mean(model, prof))
+                        if dmin * 1.04 <= dav <= dmax * 0.97:
+                            cand.dE_min_rob = path_energy_budget(model, tp, x0, x_ali, ds=700.0,
+                                                                 head_k=HEAD_K_ROBUST)[0]
+                        else:
+                            cand.dE_min_rob = dmin
+                        out.append(cand)
+                        if dav <= dmax * 0.97:
+                            break        # extra loops only while there is too much energy
+    return out
+
+
 def plan_score(c: Candidate, prefer=None):
     """Lower is better: aim for the middle-low part of the energy band, prefer into-wind,
-    fewer HAC loops, shorter TAEM."""
+    fewer HAC loops, shorter TAEM; stretched (relaxed) paths: least headwind exposure, then the
+    smallest HAC."""
     s = abs(c.band_pos - 0.35)
     s += 0.04 * max(c.tail - 2.0, 0.0)
     s += 0.05 * c.path.loops
     s += 1.5e-6 * c.L_taem
+    if c.relaxed:
+        s += 0.06 * c.head + 0.08 * (c.cfg.r_hac / ApproachConfig.r_hac - 1.0)
     if prefer is not None and c.rwy.name == prefer:
         s -= 0.08
     return s
@@ -334,15 +415,35 @@ def select_plan(model, x0, ends, cfg: ApproachConfig, prefer=None):
             best = min(feas, key=lambda c: plan_score(c, prefer))
             note = "" if level == 0 else f"low energy: shortened approach (level {level})"
             return best, True, note
-    # nothing feasible: report the one with the best margin
+    # nothing feasible.  Low energy only if even the most economical path (shortest approach,
+    # best L/D) is out of reach; otherwise there is energy to spare and the vehicle is too high /
+    # fast for how close it is.  Long detours (e.g. a ~360 deg first turn) always "need" more than
+    # is available, so they must not decide it.
     cands = candidates(model, x0, ends, cfg, 2)
-    low = [c for c in cands if c.dE_avail < c.dE_min * 1.04]
-    if low:
-        best = max(low, key=lambda c: c.dE_avail / c.dE_min)
-        return best, False, (f"LOW ENERGY: runway {best.rwy.name} needs {best.dE_min/1000:.1f} km energy "
-                             f"height, {best.dE_avail/1000:.1f} km available")
-    best = min(cands, key=lambda c: c.dE_avail / max(c.dE_max, 1.0))
-    return best, False, "HIGH ENERGY: cannot dissipate enough energy before the ALI"
+    cheapest = max(cands, key=lambda c: c.dE_avail / max(c.dE_min, 1.0))
+    if cheapest.dE_avail < cheapest.dE_min * 1.04:
+        return cheapest, False, (f"LOW ENERGY: runway {cheapest.rwy.name} needs {cheapest.dE_min/1000:.1f} km "
+                                 f"energy height, {cheapest.dE_avail/1000:.1f} km available")
+    # energy to spare: stretch the path (enlarged HAC, more loops), avoiding strong headwind legs
+    rel = relaxed_candidates(model, x0, ends, cfg)
+    feas = [c for c in rel if c.feasible]
+    if feas:
+        best = min(feas, key=lambda c: plan_score(c, prefer))
+        return best, True, (f"high energy: stretched approach (HAC radius {best.path.r2/1000:.1f} km, "
+                            f"{best.path.loops} extra loop{'s' if best.path.loops != 1 else ''})")
+    windy = [c for c in rel if c.dE_min * 1.04 <= c.dE_avail <= c.dE_max * 0.97]
+    if windy:
+        # only stretched paths with long legs into a strong headwind would work: not planned as
+        # reachable (no margin if the headwind is stronger); flown as the best effort
+        best = min(windy, key=lambda c: plan_score(c, prefer))
+        return best, False, (f"HIGH ENERGY: runway {best.rwy.name} only reachable on a stretched approach into a "
+                             f"strong headwind ({best.head:.0f} m/s average) - no margin")
+    cands = cands + rel
+    # closest to being able to dissipate: smallest excess over the dissipation limit
+    high = [c for c in cands if c.dE_avail > c.dE_max * 0.97] or cands
+    best = min(high, key=lambda c: c.dE_avail / max(c.dE_max, 1.0))
+    return best, False, (f"HIGH ENERGY: runway {best.rwy.name} can dissipate at most {best.dE_max/1000:.1f} km "
+                         f"energy height, {best.dE_avail/1000:.1f} km available - too close for this altitude / speed")
 
 
 class TrackPath:

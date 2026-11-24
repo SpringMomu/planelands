@@ -510,7 +510,8 @@ if (uWet > 0.0){
         if (d === 300) for (let k = -7; k <= 7; k++) add(u, k * 1.5, 0.8, white, 0.45);
       }
     }
-    // PAPI for a 3 deg glide path (left side) and the orbiter's 20 deg outer glide-slope PAPI (right side, ~2 km out)
+    // PAPI for a 3 deg glide path (left side) and the orbiter's 20 deg outer glide-slope PAPI (right side, at the
+    // OGS aim point 2.3 km out: sim/gnc/geometry.py ApproachConfig gamma_ogs_deg / x_aim_ogs)
     for (const end of [-1, 1]) {
       const thr = end * L / 2, inward = -end;
       const aim = new THREE.Vector2(-this.dir.x * inward, -this.dir.y * inward); // horizontal direction toward the approach (EN)
@@ -518,7 +519,7 @@ if (uWet > 0.0){
       const papiAng = [3.5, 3.17, 2.83, 2.5].map((a) => THREE.MathUtils.degToRad(a));
       papiAng.forEach((a, i) => add(thr + inward * 320, inward * (-(W / 2 + 15 + i * 9)), 0.8, white, 0.9, 1, [aimXZ[0], aimXZ[1], a, 0]));
       const ogs = [21.0, 20.3, 19.7, 19.0].map((a) => THREE.MathUtils.degToRad(a));
-      ogs.forEach((a, i) => add(thr - inward * 2000, inward * (W / 2 + 60 + i * 9), 0.8, white, 1.4, 1, [aimXZ[0], aimXZ[1], a, 0]));
+      ogs.forEach((a, i) => add(thr - inward * 2300, inward * (W / 2 + 60 + i * 9), 0.8, white, 1.4, 1, [aimXZ[0], aimXZ[1], a, 0]));
     }
     // taxiway edge lights
     for (let u = -L / 2 - 150; u <= L / 2 + 150; u += 60) for (const s of [-1, 1]) add(u, -190 + s * 12.5, 0.3, blue, 0.12);
