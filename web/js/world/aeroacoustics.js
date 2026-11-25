@@ -40,7 +40,9 @@
 //      vehicle where it was then: seconds of delay at the tower, the roar arrives after it has passed),
 //      in air moving with the wind; Doppler shift of moving source and moving listener; convective
 //      amplification (Ffowcs Williams' finite-coherence form, bounded on the Mach cone); supersonic:
-//      two emission points or none (silence outside the Mach cone);
+//      two emission points or none for every part of the vehicle (silence outside the Mach cones,
+//      a fade over them, not a switch); directivity nulls of the idealised sources filled to ~10 dB
+//      below the mean (finite edges, spread sources; DIR_FILL);
 //      spherical spreading; ISO 9613-1 air absorption integrated along the slant path (humidity falls
 //      off with height, thin air absorbs more); ground reflection (Delany-Bazley ground impedance,
 //      plane-wave reflection coefficient, interference averaged over each band); acoustic shadow of
@@ -350,6 +352,14 @@ function flapDelta(c, surf) {
  * (absorption, ground) or null.
  */
 export const FINK_M_MAX = 0.8;            // validity of the correlations (subsonic transports)
+// Directivity fill: the ANOPP patterns have exact nulls (a trailing edge straight downstream or in its own
+// plane, a dipole edge-on) that belong to idealised sources - a semi-infinite thin edge, a compact
+// dipole.  Real edges have chord, thickness, sweep and dihedral, the wake refracts, the sources are
+// spread over metres, and the correlations were fitted to flyover angles of ~30-150 deg only.  Each
+// pattern f (mean m over the sphere) becomes (1 - e) f + e m: nulls ~10 dB below the mean, the same
+// radiated power.
+export const DIR_FILL = 0.1;
+const fill = (f, mean) => (1 - DIR_FILL) * f + DIR_FILL * mean;
 
 export function finkComponent(c, src, dirs, r, dopL, gearPos, surf, out, amp = null) {
   const { M, rho, c: a, mu } = src;
@@ -372,7 +382,7 @@ export function finkComponent(c, src, dirs, r, dopL, gearPos, surf, out, amp = n
     const cbar = c.S / c.b, delta = 0.37 * cbar * Math.pow(Math.max(1e4, rho * V * cbar / mu), -0.2);
     P = 4.464e-5 * a5 * delta * c.b * c.share;
     const cphi2 = st2 > 1e-6 ? (c.plane === 'z' ? nd * nd : nr * nr) / st2 : 0.5;
-    D = 4 * cphi2 * (1 + ct) / 2;                                        // 4 cos^2 phi cos^2 (theta / 2)
+    D = 4 * fill(cphi2, 0.5) * fill((1 + ct) / 2, 0.5);                 // 4 cos^2 phi cos^2 (theta / 2)
     L = delta; F = F_TE;
   } else if (c.kind === 'flap') {
     const del = flapDelta(c, surf), s2 = Math.sin(del) ** 2;
@@ -380,12 +390,12 @@ export function finkComponent(c, src, dirs, r, dopL, gearPos, surf, out, amp = n
     P = 2.787e-4 * a5 * Mf * c.Sf * s2;
     const nn = c.normal === 'down' ? nd : c.normal === 'right' ? nr : -nr;
     const proj = Math.sin(del) * ct + Math.cos(del) * nn;               // 3 (sin d cos th + cos d sin th cos phi)^2
-    D = 3 * proj * proj;
+    D = 3 * fill(proj * proj, 1 / 3);
     L = c.Sf / c.bf; F = F_FLAP;
   } else {
     if (!(gearPos > 0.01)) return;
-    if (c.kind === 'wheel') { P = 4.349e-4 * a5 * Mf * c.N * c.d * c.d * gearPos; D = 1.5 * st2; F = F_WHEEL; }
-    else { P = 2.753e-4 * a5 * Mf * c.d * c.l * gearPos; D = 3 * nr * nr; F = F_STRUT; }      // 3 sin^2 th sin^2 phi
+    if (c.kind === 'wheel') { P = 4.349e-4 * a5 * Mf * c.N * c.d * c.d * gearPos; D = 1.5 * fill(st2, 2 / 3); F = F_WHEEL; }
+    else { P = 2.753e-4 * a5 * Mf * c.d * c.l * gearPos; D = 3 * fill(nr * nr, 1 / 3); F = F_STRUT; }   // 3 sin^2 th sin^2 phi
     L = c.d;
   }
   if (!(D > 0)) return;
@@ -484,16 +494,18 @@ export class AeroAcoustics {
       gear: a.gear * g + b.gear * f };
   }
 
-  /** emission times of the sound reaching Lp at time t: roots of c (t - te) = |Lp - S(te) - W (t - te)|.
-   * One root for a subsonic vehicle, two or none for a supersonic one (inside / outside its Mach cone) */
-  _emissions(t, Lp, c) {
+  /** emission times of the sound of the point p (body FRD) reaching Lp at time t: roots of
+   * c (t - te) = |Lp - P(te) - W (t - te)|.  One root for a subsonic vehicle, two or none for a supersonic
+   * one (inside / outside the Mach cone of that point: each part of the 37 m vehicle has its own, so
+   * the sound fades in and out over the cone instead of switching).  tMax: how far back to look */
+  _emissions(t, Lp, c, p, tMax) {
     const H = this.hist, roots = [];
     const g = (s) => {
-      const dt = t - s.t;
-      return c * dt - Math.hypot(Lp[0] - s.pos[0] - s.wind[0] * dt, Lp[1] - s.pos[1] - s.wind[1] * dt, Lp[2] - s.pos[2] - s.wind[2] * dt);
+      const dt = t - s.t, P = this._worldPos(s, p);
+      return c * dt - Math.hypot(Lp[0] - P[0] - s.wind[0] * dt, Lp[1] - P[1] - s.wind[1] * dt, Lp[2] - P[2] - s.wind[2] * dt);
     };
     let gb = g(H[H.length - 1]);
-    for (let j = H.length - 1; j > 0 && roots.length < 2; j--) {
+    for (let j = H.length - 1; j > 0 && roots.length < 2 && t - H[j].t < tMax; j--) {
       const ga = g(H[j - 1]);
       if ((ga >= 0) !== (gb >= 0)) {
         const f = gb / (gb - ga);                                           // fraction from j towards j-1
@@ -616,43 +628,49 @@ export class AeroAcoustics {
     const aS0 = atmosphere(now.alt), aM = atmosphere((now.alt + L.alt) / 2);
     const cP = (aS0.c + aL.c + 2 * aM.c) / 4;
     const Lp = L.pos;
-    const roots = this._emissions(L.t, Lp, cP);
-    if (!roots.length) return;
-    o.arrivals = roots.length;
-    o.delay = L.t - roots[0];
-    const pr = this._pr, wl = this._b;
-    wl.fill(0);
-    for (const te of roots) {
-      const s = this._at(te), dt = L.t - te;
-      const aS = atmosphere(s.alt), ss = this._srcState(s, aS);
-      const W = s.wind;
-      // geometry of the CG path (absorption, ground, shadow) - the components differ by metres
-      const d = [Lp[0] - s.pos[0] - W[0] * dt, Lp[1] - s.pos[1] - W[1] * dt, Lp[2] - s.pos[2] - W[2] * dt];
-      const r = Math.max(1, Math.hypot(d[0], d[1], d[2]));
-      const dh = Math.hypot(d[0], d[2]);
-      absorptionBands(s.alt, L.alt, r, L.groundAlt, L.rh ?? 60, this._abs);
-      const hs = s.alt - L.groundAlt, hl = L.alt - L.groundAlt;
-      groundBands(hs, hl, dh, cP, this._gnd);
-      // acoustic shadow of upward refraction (ray radius ~ c / |dc/dz| ~ 87 km), as for the thunder
-      const Rc = 87000, exc = dh - (Math.sqrt(2 * Rc * Math.max(hs, 2)) + Math.sqrt(2 * Rc * Math.max(hl, 1.5)));
-      const sh = exc > 0 ? Math.pow(10, -Math.min(30, 12 * Math.min(1, exc / 1500) + exc / 1000 * 3) / 10) : 1;
-      const imp = (aL.rho * aL.c) / (aS.rho * aS.c);
-      for (let i = 0; i < NB; i++) this._amp[i] = this._abs[i] * this._gnd[i] * sh * imp;
-      const VL = sub(L.vel, W);
-      pr.fill(0);
-      const dirs = { u: ss.u, dn: ss.dn, rt: ss.rt, n: v3() };
-      for (const comp of this.comps) {
+    // how far back emissions can lie: subsonic, c dt <= r_now + extent + V dt
+    const r0 = Math.hypot(Lp[0] - now.pos[0], Lp[1] - now.pos[1], Lp[2] - now.pos[2]);
+    const V0 = Math.hypot(now.vel[0] - now.wind[0], now.vel[1] - now.wind[1], now.vel[2] - now.wind[2]);
+    const tMax = (r0 + 60) / Math.max(cP - V0, 0.1 * cP) + 1;
+    const pr = this._pr, lat = this._b, VL = sub(L.vel, now.wind);
+    lat.fill(0);
+    let env = false, first = Infinity;
+    const dirs = { u: null, dn: null, rt: null, n: v3() };
+    for (const comp of this.comps) {
+      const roots = this._emissions(L.t, Lp, cP, comp.pos, tMax);
+      o.arrivals = Math.max(o.arrivals, roots.length);
+      for (const te of roots) {
+        const s = this._at(te), dt = L.t - te, W = s.wind;
+        first = Math.min(first, dt);
+        if (!env) {
+          // path terms from the first arrival (the parts of the vehicle differ by metres): absorption,
+          // ground reflection, refraction shadow, impedance
+          env = true;
+          const d = [Lp[0] - s.pos[0] - W[0] * dt, Lp[1] - s.pos[1] - W[1] * dt, Lp[2] - s.pos[2] - W[2] * dt];
+          const r = Math.max(1, Math.hypot(d[0], d[1], d[2])), dh = Math.hypot(d[0], d[2]);
+          absorptionBands(s.alt, L.alt, r, L.groundAlt, L.rh ?? 60, this._abs);
+          const hs = s.alt - L.groundAlt, hl = L.alt - L.groundAlt;
+          groundBands(hs, hl, dh, cP, this._gnd);
+          const Rc = 87000, exc = dh - (Math.sqrt(2 * Rc * Math.max(hs, 2)) + Math.sqrt(2 * Rc * Math.max(hl, 1.5)));
+          const sh = exc > 0 ? Math.pow(10, -Math.min(30, 12 * Math.min(1, exc / 1500) + exc / 1000 * 3) / 10) : 1;
+          const aS = atmosphere(s.alt), imp = (aL.rho * aL.c) / (aS.rho * aS.c);
+          for (let i = 0; i < NB; i++) this._amp[i] = this._abs[i] * this._gnd[i] * sh * imp;
+        }
+        const ss = this._srcState(s, atmosphere(s.alt));
+        dirs.u = ss.u; dirs.dn = ss.dn; dirs.rt = ss.rt;
         const P = this._worldPos(s, comp.pos);
         const e = [Lp[0] - P[0] - W[0] * dt, Lp[1] - P[1] - W[1] * dt, Lp[2] - P[2] - W[2] * dt];
         const rc = Math.max(3, Math.hypot(e[0], e[1], e[2]));
         dirs.n[0] = e[0] / rc; dirs.n[1] = e[1] / rc; dirs.n[2] = e[2] / rc;
         const dopL = Math.max(0.05, 1 - dot(dirs.n, VL) / cP);
+        pr.fill(0);
         finkComponent(comp, ss.src, dirs, rc, dopL, s.gear, s.surf, pr, this._amp);
+        // arrival direction across the listener (the sound comes from -n)
+        const la = Math.max(-1, Math.min(1, -dot(dirs.n, L.right)));
+        for (let i = 0; i < NB; i++) { o.dir[i] += pr[i]; lat[i] += pr[i] * la; }
       }
-      // arrival direction across the listener (the sound comes from -d)
-      const lat = Math.max(-1, Math.min(1, -(d[0] * L.right[0] + d[1] * L.right[1] + d[2] * L.right[2]) / r));
-      for (let i = 0; i < NB; i++) { o.dir[i] += pr[i]; wl[i] += pr[i] * lat; }
     }
-    for (let i = 0; i < NB; i++) o.lat[i] = o.dir[i] > 0 ? wl[i] / o.dir[i] : 0;
+    if (first < Infinity) o.delay = first;
+    for (let i = 0; i < NB; i++) o.lat[i] = o.dir[i] > 0 ? lat[i] / o.dir[i] : 0;
   }
 }

@@ -3,14 +3,24 @@
 // frame; the filter-bank synthesiser (aero_synth.js) turns it into sound - on the audio thread
 // (aero_worklet.js), or through a ScriptProcessorNode where AudioWorklet is unavailable (pages opened over
 // plain http from another machine: AudioWorklet exists only in secure contexts).  Levels are physical: 1 Pa (94 dB SPL) at
-// the listener plays at FS_DB dBFS, so the cabin at final approach, a low fly-by and the tower keep
-// their real level differences; the master compressor / soft clip of StormAudio catches the loudest.
+// the listener plays at FS_DB dBFS, so the cabin at final approach and a distant pass keep their real
+// level differences; above 95 dB SPL a 2:1 soft knee (playbackDb) tames close passes.
 
 import { AeroAcoustics, NB, FC } from './aeroacoustics.js';
 import { SpectralNoise } from './aero_synth.js';
 
 const FS_DB = -26;                         // dBFS (rms) of 1 Pa
 const GAIN = Math.pow(10, FS_DB / 20);
+// Playback level mapping, like the renderer's exposure: below KNEE dB SPL the physical level plays as
+// it is (cabin, distant passes keep their true differences); above it a RATIO:1 soft knee (WIDTH dB)
+// squeezes a 110-120 dB close pass into what speakers and ears can take.  Returns the gain change (dB)
+export const KNEE = 95, RATIO = 2, WIDTH = 10;
+export function playbackDb(spl) {
+  const x = spl - KNEE, s = 1 / RATIO - 1;
+  if (2 * x <= -WIDTH) return 0;
+  if (2 * x < WIDTH) return s * (x + WIDTH / 2) * (x + WIDTH / 2) / (2 * WIDTH);
+  return s * x;
+}
 
 export class AeroAudio {
   constructor(geometry) {
@@ -73,7 +83,7 @@ export class AeroAudio {
     for (let i = 0; i < NB; i++) {
       this._dir[i] = on ? o.dir[i] : 0; this._dif[i] = on ? o.dif[i] : 0; this._lat[i] = o.lat[i];
     }
-    this.node.port.postMessage({ dir: this._dir, lat: this._lat, dif: this._dif, gain: GAIN });
+    this.node.port.postMessage({ dir: this._dir, lat: this._lat, dif: this._dif, gain: GAIN * Math.pow(10, playbackDb(o.spl) / 20) });
   }
 
   reset() { this.model.reset(); }

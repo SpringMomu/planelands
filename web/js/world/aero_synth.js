@@ -9,9 +9,9 @@
 //   (no crossover interference).  The skirts of a loud band spill into its quiet neighbours (a cabin
 //   resonance 18 dB above the next band): the filters' powers are solved for so that the power falling
 //   in every 1/3-octave band is the model's (leakage matrix, non-negative Richardson-Lucy iterations)
-// * gains follow the model continuously: a 15 ms smoothing per 128 samples, ramped sample by sample;
-//   the only other delay is the filters' own group delay (a few ms at 1 kHz) - the sound follows the
-//   camera and the flight without frames or steps
+// * gains follow the model continuously: every new spectrum is reached by a straight glide in dB that
+//   lasts one message interval (measured: the page's frame time), ramped sample by sample - no steps
+//   at any frame rate; the only other delay is the filters' own group delay (a few ms at 1 kHz)
 // * two ears (spherical head, radius 8.75 cm): the directional part reaches the far ear later by the
 //   Woodworth time difference (a / c)(phi + sin phi) (up to 0.66 ms) and through the Brown & Duda (1998)
 //   head-shadow filter |H|^2 = (1 + (alpha w / 2 w0)^2) / (1 + (w / 2 w0)^2), w0 = c / a,
@@ -28,7 +28,7 @@
 const ORDER = 3;                    // Butterworth prototype order (band-pass order 2 * ORDER)
 const GT = 1 << 16;                 // Gaussian table (indexed by 16-bit hashes)
 const HEAD_A = 0.0875, C_AIR = 343;
-const TAU = 0.015;                  // gain smoothing (s)
+const FLOOR = 1e-16;                // Pa^2 floor of the dB glide (-66 dB SPL)
 const MAXD = 64;                    // delay line per band (samples, > 0.66 ms at 96 kHz)
 
 // complex helpers
@@ -145,8 +145,11 @@ export class SpectralNoise {
     }
     this.xD = new Float64Array(nb); this.xU = new Float64Array(nb); this.mx = new Float64Array(nb);
     // smoothed parameters and the gains last applied
+    // current / target values: band powers as ln(Pa^2), lateral direction, ln(gain)
     this.cDir = new Float64Array(nb); this.cDif = new Float64Array(nb); this.cLat = new Float64Array(nb); this.cGain = 0;
     this.tDir = new Float64Array(nb); this.tDif = new Float64Array(nb); this.tLat = new Float64Array(nb); this.tGain = 0;
+    this.pDir = new Float64Array(nb); this.pDif = new Float64Array(nb);
+    this.since = 0; this.interval = 0.033 * this.fs; this.left = 0;
     this.gL = new Float64Array(nb); this.gR = new Float64Array(nb); this.gU = new Float64Array(nb);
     this.hasT = false;
   }
@@ -155,8 +158,16 @@ export class SpectralNoise {
   message(d) {
     if (d.bands) { this._setup(d.bands); return; }
     if (!this.nb) return;
-    this.tDir.set(d.dir); this.tDif.set(d.dif); this.tLat.set(d.lat); this.tGain = d.gain;
-    if (!this.hasT) { this.cDir.set(d.dir); this.cDif.set(d.dif); this.cLat.set(d.lat); this.cGain = d.gain; this.hasT = true; }
+    for (let i = 0; i < this.nb; i++) {
+      this.tDir[i] = Math.log(Math.max(FLOOR, d.dir[i])); this.tDif[i] = Math.log(Math.max(FLOOR, d.dif[i]));
+      this.tLat[i] = d.lat[i];
+    }
+    this.tGain = Math.log(Math.max(1e-12, d.gain));
+    if (!this.hasT) { this.cDir.set(this.tDir); this.cDif.set(this.tDif); this.cLat.set(this.tLat); this.cGain = this.tGain; this.hasT = true; }
+    // glide to the new values over the time the next message is expected to take
+    if (this.since > 0) this.interval += (Math.min(this.since, 0.15 * this.fs) - this.interval) * 0.3;
+    this.left = Math.max(128, this.interval);
+    this.since = 0;
   }
 
   /** filter output powers x >= 0 whose power in each band (M x) matches the targets t (Richardson-Lucy) */
@@ -192,23 +203,28 @@ export class SpectralNoise {
   }
 
   _block(L, R, off, m) {
-    const fs = this.fs, nb = this.nb, S = ORDER, k = 1 - Math.exp(-m / fs / TAU);
+    const fs = this.fs, nb = this.nb, S = ORDER;
+    const k = this.left > 0 ? Math.min(1, m / this.left) : 1;
+    this.left -= m; this.since += m;
     this.cGain += (this.tGain - this.cGain) * k;
+    const gain = Math.exp(this.cGain);
     const gt = this.gt, ring = this.ring, co = this.co, st = this.st, w0 = this.w;
     let seed = this.seed;
     for (let i = 0; i < nb; i++) {
       this.cDir[i] += (this.tDir[i] - this.cDir[i]) * k;
       this.cDif[i] += (this.tDif[i] - this.cDif[i]) * k;
       this.cLat[i] += (this.tLat[i] - this.cLat[i]) * k;
+      this.pDir[i] = this.cDir[i] <= Math.log(FLOOR) + 1e-9 ? 0 : Math.exp(this.cDir[i]);
+      this.pDif[i] = this.cDif[i] <= Math.log(FLOOR) + 1e-9 ? 0 : Math.exp(this.cDif[i]);
     }
-    this._unleak(this.cDir, this.xD); this._unleak(this.cDif, this.xU);
+    this._unleak(this.pDir, this.xD); this._unleak(this.pDif, this.xU);
     for (let i = 0; i < nb; i++) {
       if (!this.on[i]) continue;
       // target gains of this block: level, head shadow (relative to a frontal source), time difference
       const lat = Math.max(-1, Math.min(1, this.cLat[i])), f = this.fc[i];
       const thR = Math.acos(lat), front = headShadow2(f, Math.PI / 2);
       const hR = Math.sqrt(headShadow2(f, thR) / front), hL = Math.sqrt(headShadow2(f, Math.PI - thR) / front);
-      const amp = this.cGain * this.inv[i];
+      const amp = gain * this.inv[i];
       const ad = Math.sqrt(this.xD[i]) * amp, au = Math.sqrt(this.xU[i]) * amp;
       const gL1 = ad * hL, gR1 = ad * hR, gU1 = au;
       const gL0 = this.gL[i], gR0 = this.gR[i], gU0 = this.gU[i];

@@ -72,10 +72,12 @@ const lis = (pos, extra = {}) => ({ t: 0, pos, vel: [0, 0, 0], alt: pos[1], grou
 {
   const ac = flight({ V: 150, alt: 300 });
   const c = A.atmosphere(150).c;          // (the model averages c over the layer; close to the mid value)
-  const out = ac.listen(lis([0, 1.7, 0]));
-  // analytic: |(0,h) - (V te, h)| = c (0 - te)  ->  te = -h' / sqrt(c^2 - V^2)
+  const out = { ...ac.listen(lis([0, 1.7, 0])) };
+  // analytic for the centre of gravity: |(0,h) - (V te, h)| = c (0 - te)  ->  te = -h' / sqrt(c^2 - V^2)
   const h = 300 - 1.7, te = -h / Math.sqrt(c * c - 150 * 150);
-  check('retarded time (subsonic flyover)', Math.abs(out.delay + te) < 0.02, `delay ${out.delay.toFixed(3)} s vs ${(-te).toFixed(3)} s, ${out.spl.toFixed(1)} dB`);
+  const [tc] = ac._emissions(0, [0, 1.7, 0], c, [0, 0, 0], 100);
+  check('retarded time (subsonic flyover)', Math.abs(tc - te) < 0.005 && Math.abs(out.delay + te) < 0.1,
+    `CG emission ${(-tc).toFixed(3)} s before vs ${(-te).toFixed(3)} s; first part heard ${out.delay.toFixed(3)} s, ${out.spl.toFixed(1)} dB`);
 }
 
 // ---- supersonic: ahead of the Mach cone silence, behind it two arrivals
@@ -183,14 +185,43 @@ const lis = (pos, extra = {}) => ({ t: 0, pos, vel: [0, 0, 0], alt: pos[1], grou
       Math.abs(ild(10) - want(10)) < 1 && Math.abs(ild(26) - want(26)) < 1.5 && ild(10) < 3 && ild(26) > 12 && Math.abs(bestLag - itd) <= 1,
       `ILD ${ild(10).toFixed(1)} dB at 200 Hz, ${ild(26).toFixed(1)} dB at 8 kHz (model ${want(10).toFixed(1)} / ${want(26).toFixed(1)}); ITD ${bestLag} samples (${(bestLag / fs * 1000).toFixed(2)} ms, Woodworth ${(itd / fs * 1000).toFixed(2)} ms)`);
   }
-  // latency: a step of the level, time until the 1 kHz band is within 3 dB of the new level
+  // no staircase: the page at 30 fps (1600 samples per frame) raising a band by 0.5 dB per frame - the
+  // synthesiser's level must rise in every 128-sample block (a staircase: ~9x between the first block of
+  // a frame and the last), not jump once a frame; 128-sample blocks against 1600-sample frames leave
+  // ~0.5x in a boundary block
+  {
+    const glide = (jitter) => {
+      const p = make(null), inc = [];
+      let next = 0, lvl = -60, last = null;
+      for (let o = 0; o < 4 * fs; o += 128) {
+        if (o >= next) {
+          const d = new Float32Array(A.NB); d[17] = Math.pow(10, lvl / 10);
+          p.message({ dir: d, lat: z, dif: z, gain: 1 });
+          lvl += 0.5; next += jitter ? 1200 + Math.floor(Math.random() * 800) : 1600;
+        }
+        p.render(new Float32Array(128), new Float32Array(128));
+        const v = p.cDir[17] * 10 / Math.LN10;
+        if (o > fs && last !== null) inc.push(v - last);
+        last = v;
+      }
+      const mean = inc.reduce((x, y) => x + y, 0) / inc.length;
+      return { mean, lo: Math.min(...inc) / mean, hi: Math.max(...inc) / mean, flat: inc.filter((x) => x < 0.05 * mean).length / inc.length };
+    };
+    const g = glide(false), gj = glide(true);
+    check('synth: smooth glide between frames (30 fps, no steps)', g.lo > 0.3 && g.hi < 1.5 && gj.flat < 0.15,
+      `steady frames: block increments ${g.lo.toFixed(2)}-${g.hi.toFixed(2)} x mean; jittered frames (25-40 fps): ${(gj.flat * 100).toFixed(0)} % of blocks without change`);
+  }
+  // latency: a step of the level while the page sends a spectrum every frame (16 ms), time until the
+  // 1 kHz band is within 3 dB of the new level; and the glide is monotonic (no steps)
   {
     const p = make({ dir: z, lat: z, dif: z, gain: 1 });
-    run(p, 0.6);
+    const frame = 768, quiet = { dir: z, lat: z, dif: z, gain: 1 };
+    const tmp = new Float32Array(128), tmp2 = new Float32Array(128);
+    for (let o = 0; o < 0.6 * fs; o += 128) { if (o % frame === 0) p.message(quiet); p.render(tmp, tmp2); }
     const b17 = new Float32Array(A.NB); b17[17] = 1e-2;
-    p.message({ dir: b17, lat: z, dif: z, gain: 1 });
+    const loud = { dir: b17, lat: z, dif: z, gain: 1 };
     const n = fs, L = new Float32Array(n), R = new Float32Array(n);
-    for (let o = 0; o < n; o += 128) p.render(L.subarray(o, o + 128), R.subarray(o, o + 128));
+    for (let o = 0; o < n; o += 128) { if (o % frame === 0) p.message(loud); p.render(L.subarray(o, o + 128), R.subarray(o, o + 128)); }
     const win = 240;                                      // 5 ms rms windows
     let t3 = -1;
     for (let o = 0; o + win <= n; o += win / 4) {
@@ -204,6 +235,26 @@ const lis = (pos, extra = {}) => ({ t: 0, pos, vel: [0, 0, 0], alt: pos[1], grou
     const so = ts.slice(500).sort((x, y) => x - y), pq = (x) => so[Math.floor(x * (so.length - 1))];
     check('synth: follows a change within ~30 ms; steady cost per render call', t3 > 0 && t3 < 35 && pq(0.999) < 1.0,
       `1 kHz band within 3 dB after ${t3.toFixed(1)} ms; per 128 samples p50 ${pq(0.5).toFixed(3)} ms, p99.9 ${pq(0.999).toFixed(3)} ms (budget 2.67 ms)`);
+  }
+}
+
+// ---- playback mapping: physical below the knee, continuous and monotonic soft knee above
+{
+  const { playbackDb, KNEE } = await import('../web/js/world/aero_audio.js');
+  let ok = true, prev = -1e9;
+  for (let x = 60; x <= 140; x += 0.25) { const y = x + playbackDb(x); if (y <= prev || Math.abs(playbackDb(x) - playbackDb(x - 0.25)) > 0.2) ok = false; prev = y; }
+  check('playback mapping: unchanged below the knee, smooth 2:1 above', ok && playbackDb(85) === 0 && Math.abs(playbackDb(KNEE + 20) + 10) < 1e-9,
+    `85 -> ${85 + playbackDb(85)}, 105 -> ${(105 + playbackDb(105)).toFixed(1)}, 115 -> ${(115 + playbackDb(115)).toFixed(1)} dB`);
+  // the chase camera around the orbiter (75 m, horizontal plane): physical and played levels
+  for (const [name, V, alt, surf] of [['M0.6 5 km, clean', 192, 5000, {}], ['M0.9 10 km, speed brake 60', 270, 10000, { speedbrake: 60 }]]) {
+    const ac = flight({ V, alt, surf });
+    const row = [];
+    for (const az of [0, 45, 90, 135, 180]) {
+      const a = az * Math.PI / 180;
+      const o = ac.listen({ ...lis([75 * Math.cos(a), alt, 75 * Math.sin(a)]), vel: [V, 0, 0] });
+      row.push(`${az}°:${o.spl.toFixed(0)}→${(o.spl + playbackDb(o.spl)).toFixed(0)}`);
+    }
+    console.log(`     chase around, ${name.padEnd(28)} ${row.join('  ')}  (dB SPL → played)`);
   }
 }
 
