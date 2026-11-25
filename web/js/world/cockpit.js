@@ -249,7 +249,7 @@ ${kind === 'struct' || kind === 'frame' || kind === 'floor' || kind === 'flock' 
   f = f.replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
   ${kind === 'paint' ? 'totalEmissiveRadiance += letterLit * uPanelLit * vec3(1.0, 0.96, 0.86);' : ''}
   ${kind === 'legend' ? 'totalEmissiveRadiance += legendTex * uChan[vCh] * uLegendK;' : ''}
-  ${kind === 'screen' ? 'totalEmissiveRadiance *= uScreenK * (0.45 + 0.55 * pow(abs(dot(normal, normalize(vViewPosition))), 0.7));' : ''}
+  ${kind === 'screen' ? 'totalEmissiveRadiance *= uScreenK * (0.62 + 0.38 * pow(abs(dot(normal, normalize(vViewPosition))), 0.7));' : ''}
   ${kind === 'led' ? 'totalEmissiveRadiance *= uLegendK * 1.4;' : ''}`);
   f = f.replace('#include <lights_fragment_maps>', `#include <lights_fragment_maps>
   {
@@ -1167,9 +1167,10 @@ export class Cockpit {
     u.uFlood.value.setRGB(1.0, 0.93, 0.80).multiplyScalar(0.12 * lit);
     u.uPanelLit.value = 0.030 * lit;
     const ex = Math.max(1e-3, d.exposure || 1);
-    u.uScreenK.value = 0.62 / Math.pow(ex / 0.62, 0.80);
+    // AMLCD MDUs are sunlight-readable: about 2.3x the earlier luminance (≈ +1.2 EV)
+    u.uScreenK.value = 1.45 / Math.pow(ex / 0.62, 0.80);
     u.uLegendK.value = 0.9 / Math.pow(ex / 0.62, 0.80);
-    u.uMduGlow.value.setRGB(0.55, 0.65, 0.62).multiplyScalar(u.uScreenK.value * 0.35);
+    u.uMduGlow.value.setRGB(0.55, 0.65, 0.62).multiplyScalar(u.uScreenK.value * 0.18);   // spill onto the panel (kept near its old level)
     // ---- light channels
     const ch = u.uChan.value; ch.fill(0); ch[1] = 1;
     if (st) {
