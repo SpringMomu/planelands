@@ -126,6 +126,9 @@ async function main() {
   scene.add(gncViz.group);
   let lastPlan = null, lastMpc = null;
   let prevWow = null;
+  // tyre peripheral speed per gear (m/s): spun up by the runway, slowly spinning down in the air
+  // (bearing friction + windage); the touchdown smoke comes from the spin-up slip
+  const wheelV = [0, 0, 0];
 
   // sun light (shadows for the orbiter + its shadow on the ground)
   const sun = new THREE.DirectionalLight(0xffffff, 20);
@@ -567,12 +570,25 @@ async function main() {
         groundY, sunDir: sd, sunRad: light.sunRad, camera, time: st.t || 0,
       });
       shuttle.setChuteDoor(chute.mode !== 'stowed');
-      // touchdown spin-up smoke: rising edge of weight-on-wheels at speed
+      // touchdown spin-up smoke.  A tyre touching down skids until its peripheral speed has caught
+      // up with the ground speed; the rubber burnt in that skid is the smoke, and the energy dissipated
+      // in it is proportional to the square of the speed difference.  A wheel still spinning from the
+      // first contact (bounce) therefore makes (almost) no smoke on the second one, a wet runway little
       const wow = st.gear?.wow || [false, false, false];
       const gsp = Math.hypot(st.vel[0], st.vel[1]);
-      if (prevWow && prevEp === st._ep) {
-        for (let i = 0; i < 3; i++) {
-          if (wow[i] && !prevWow[i] && gsp > 20) smoke.touchdown(i, THREE.MathUtils.clamp(gsp / 100, 0.3, 1.1) * (i === 0 ? 0.75 : 1));
+      const fresh = !prevWow || prevEp !== st._ep;
+      for (let i = 0; i < 3; i++) {
+        if (fresh) { wheelV[i] = wow[i] ? gsp : 0; continue; }           // new flight: wheels at rest in the air
+        if (wow[i]) {
+          if (!prevWow[i]) {
+            const dv = Math.max(gsp - wheelV[i], 0);
+            const dry = 1 - 0.85 * THREE.MathUtils.clamp(U.uWet.value, 0, 1);
+            const str = Math.min(1.2, (dv / 95) ** 2) * dry * (i === 0 ? 0.6 : 1);
+            if (str > 0.015) smoke.touchdown(i, str, dv);
+          }
+          wheelV[i] = gsp;                                                 // rolling
+        } else {
+          wheelV[i] = Math.max(0, wheelV[i] * Math.exp(-sdt / 25) - 0.3 * sdt);
         }
       }
       if (prevEp !== st._ep) cockpit.rain?.clear();        // new episode: fresh, dry windows (re-wetted from the weather)
