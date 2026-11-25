@@ -1,5 +1,6 @@
 // Synthesised storm sound (WebAudio, no assets): a faint rain ambience for cameras near the ground in
-// rain, and thunder computed from the lightning channel itself.
+// rain, and thunder computed from the lightning channel itself.  The context and master bus also
+// carry the airflow sound of the orbiter (aero_audio.js).
 //
 // Thunder (after Few 1969/1982, Ribner & Roy 1982, Bass 1980):
 // * source: the hot channel expands as a cylindrical shock that decays into weak N-waves; every metre
@@ -181,6 +182,7 @@ export function synthThunder(P) {
 export class StormAudio {
   constructor() {
     this.ctx = null;
+    this.aero = null;            // AeroAudio (aero_audio.js): the airflow sound, on the same context / master bus
     this.enabled = true;
     this.ambient = 0;
     this.lis = { pos: [0, 0, 0], vel: [0, 0, 0], groundY: 0, right: [1, 0, 0], inCockpit: false };
@@ -260,10 +262,18 @@ export class StormAudio {
     this.cabLP.connect(this.cabG).connect(this.master);
     this.setRain(this.ambient);
     this._applyListener(true);
+    if (this.aero) this.aero.attach(ctx, this.master);
+  }
+
+  /** the airflow sound shares the context (created on the first user gesture) and the master bus */
+  attachAero(aero) {
+    this.aero = aero;
+    if (this.ctx) aero.attach(this.ctx, this.master);
   }
 
   setEnabled(v) {
     this.enabled = v;
+    if (this.aero) this.aero.setEnabled(v);
     if (this.master) this.master.gain.setTargetAtTime(v ? 0.9 : 0, this.ctx.currentTime, 0.1);
   }
 

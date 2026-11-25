@@ -1146,6 +1146,62 @@ $`J`$ 是完整的惯量张量，包括 $`I_{xz}`$。$`M_0`$ 是在当前舵面�
   - 渲染时视线按斯涅尔定律和菲涅尔公式穿过玻璃 → 水 → 空气。
 - **头部运动**：用眼位比力（质心过载加上 $`\dot\omega\times r + \omega\times(\omega\times r)`$）驱动三个轴的阻尼弹簧，另外叠加抖振、湍流和跑道颠簸。
 
+## 气动声学：滑翔时的风声（`web/js/world/aeroacoustics.js`）
+
+轨道器没有发动机，滑翔时听到的只有气流本身。风声不用录音或预设音色：每帧从飞行状态（真空速、Mach、
+当地大气、风和阵风、各舵面偏角、起落架位置、姿态和轨迹）算出听者处每个 1/3 倍频程（20 Hz–20 kHz，31 个频带）
+的均方声压（Pa²），再由 AudioWorklet 合成出谱完全相同的高斯噪声。
+
+**座舱里**：前机身湍流边界层的壁面压力脉动，透过舱壁传进乘员舱。
+
+- **壁面压力谱**：Goody（2004）谱形；边界层按距机头的流程长度当平板计算（Schultz-Grunow 当地摩擦系数，
+  Eckert 参考温度修正压缩性，绝热壁，防热瓦粗糙度系数与 `sim/aero.py` 相同）。
+  量级用内变量标度 $`(p_\mathrm{rms}/\tau_w)^2 = 6.5 + 1.86\ln(Re_\tau/333)`$（Farabee & Casarella 1991），
+  与 Lowson 的飞行关联式 $`p_\mathrm{rms}/q = 0.006/(1+0.14M^2)`$ 相差 1–4 dB。
+- **舱壁传声**：按真实层次写成斜入射平面波传递矩阵，再在 0–78° 上做扩散场平均：外蒙皮加防热瓦、前机身与乘员舱之间的
+  夹层（向外界通气，所以夹层空气是外界的气压；部分填充隔热毯，用 Delany–Bazley 模型）、乘员舱壁；舷窗是热防护窗、
+  通气夹层和承压窗。每块板都有面密度、弯曲刚度（因此有吻合效应）、板的基频和损耗因子。高空空气稀薄，夹层的“空气弹簧”
+  变软，质量–空气–质量共振移到低频，通过夹层的空气声几乎传不过来。剩下的是乘员舱安装点的结构声，
+  用 Sharp 点连接模型计算（两层板合成质量定律，再加 $`20\lg(e f_c) + 20\lg\frac{m_1}{m_1+m_2} - 45`$ dB）。
+- **舱内声场**：混响声场 $`4W/R`$（房间常数由随频率上升的吸声系数算出），加上眼睛旁边前风挡的直达声。
+- 下面这些机体噪声源（座舱正下方的前起落架、升降副翼、远在尾部的减速板）也经同一套舱壁传进来。
+  超声速飞行时，后方的声音追不上座舱。
+
+**座舱外**（追随、塔台、跑道、掠过相机）：听到的是机体向远场辐射的噪声。
+
+- **声源**：Fink（1977）机体噪声方法，用 ANOPP 的无量纲写法
+  $`p^2 = \rho^2c^4\,\Pi^*\,D(\theta,\phi)\,F(S)\,/\,[4\pi r^2(1-M\cos\theta)^4]`$。
+  部件包括：机翼、垂尾和体襟翼后缘（$`\Pi^* \propto M^5\delta b`$，$`\delta`$ 为后缘处的湍流边界层厚度）；
+  偏转的升降副翼、体襟翼，以及向两侧张开的方向舵/减速板两片面板，都按后缘襟翼处理（$`\propto M^6 S_f\sin^2\delta`$，偶极子垂直于偏转后的表面）；
+  起落架机轮（$`\propto M^6 N d^2`$）和支柱，按放出程度缩放。
+  每个谱函数 $`F(S)`$ 对 1/3 倍频程求和都等于 1，自检会核对这一点。
+- **传播**：在记录下来的飞行轨迹上解推迟时间。此刻听到的声音，是飞机过去某一时刻在当时位置发出的，所以塔台处的轰鸣要等飞机飞过以后才到。
+  计入风对声传播的搬运、声源和听者运动造成的多普勒频移、对流放大（取 Ffowcs Williams 有限相干时间形式，在马赫锥上有界）、
+  超声速时的两个发声点或无发声点（马赫锥外完全无声）、球面扩散、沿斜程积分的 ISO 9613-1 空气吸收（湿度随高度递减，空气越稀薄吸收越强）、
+  地面反射（Delany–Bazley 地面阻抗，平面波反射系数，干涉在频带内平均）、上折射声影区，以及声源到听者的 $`\rho c`$ 阻抗变化。
+- **回放**：听者处 1 Pa（94 dB SPL）对应 −16 dBFS（有效值），座舱、低空掠过和远处塔台之间保留真实的响度差。
+  最响的情形交给主压缩器和软削波。
+
+由模型算出的典型声级（`node tools/aeroacoustic_selftest.mjs` 打印）：
+
+| 工况 | 总声级 | A 计权 |
+|---|---|---|
+| 座舱，TAEM，Mach 2.5 / 25 km | 73 dB | 67 dBA |
+| 座舱，Mach 0.9 / 11 km | 83 dB | 74 dBA |
+| 座舱，进近 155 m/s / 3 km，减速板 60° | 91 dB | 79 dBA |
+| 座舱，135 m/s / 100 m，放起落架 | 95 dB | 82 dBA |
+| 后方 75 m 追随相机，155 m/s | 81 dB | 74 dBA |
+| 正下方地面，135 m/s 在 100 m 高掠过，放起落架 | 103 dB | 99 dBA |
+| 塔台，侧向 3 km，155 m/s / 600 m | 56 dB | 49 dBA |
+
+**合成**（`web/js/world/aero_worklet.js`）：每 43 ms 生成一帧 8192 点的随机相位谱。各频点是独立的复高斯数，
+方差为 $`N f_s G(f)/2`$；$`G`$ 在频带中心之间按对数–对数插值，再逐频带缩放，使每个频带的能量严格等于目标值。
+逆变换后加 Hann 窗，75% 重叠相加。指向性的直达声两声道用同一噪声，按频带给出左右声级差；扩散声两声道各用独立噪声。
+自检在离线运行中核对：50 Hz–12.5 kHz 各频带与模型的偏差在 1.5 dB 以内（实测约 0.5 dB），直达声左右相关系数为 1，扩散声约为 0。
+
+简化：湍流边界层被当作等效扩散声场来激励舱壁，没有解析它的对流波数结构；风挡处用自由流条件，不算机头上的局部加速，
+Mach 1 以上也不算激波层；Fink 关联式来自常规亚声速运输机，Mach 0.8 以上把功率和 Strouhal 标度固定在 0.8；没有模拟音爆。
+
 ## 渲染
 
 - **大气**：Hillaire 2020 方案的四张 LUT，逐像素计算空气透视。
@@ -1153,6 +1209,7 @@ $`J`$ 是完整的惯量张量，包括 $`I_{xz}`$。$`M_0`$ 是在当前舵面�
 - **地形**：14 级几何裁剪图，CDLOD 形变消除接缝。
 - **机场**：FAA 标线，进近灯，PAPI（包括 20° 外下滑道 PAPI）。
 - **雷暴**：雨幡、闪电（含回击）、按声速延迟的雷声、地面积水的屏幕空间反射。
+- **风声**：由气动声学模型实时计算，见上一节。
 - **机体**：材质为程序化的防热瓦，操纵面绕真实铰链轴转动。
 
 ---
@@ -1165,6 +1222,7 @@ python tools/gnc_selftest.py                  # GNC 回归：多进程并行，�
 python tools/gnc_selftest.py --wind --turb    # 有风和湍流
 python tools/gnc_selftest.py --fault-scp 90   # 前 90 s 所有规划都失败，检验降级模式
 python tools/readme_figures.py               # 重新生成 README 插图（另需 matplotlib；飞行数据缓存在 .cache/）
+node tools/aeroacoustic_selftest.mjs          # 气动声学：对照参考值（ISO 9613、质量定律、Fink 归一化、推迟时间、马赫锥、合成器谱）
 ```
 
 **成功标准**：在跑道入口之后接地，下沉率 < 3 m/s，偏离中线 < 20 m，并在跑道上停住。
@@ -1235,7 +1293,7 @@ worldgen/              程序化世界生成：地形侵蚀、海岸、河湖、
 shared/                Python 与 JS 共用：orbiter_geometry.json（机体几何）、world.json
 web/                   three.js r170 前端（已随仓库附带）
   js/render/           大气、体积云、地形、后处理
-  js/world/            航天飞机模型、机场、座舱、天气、雨水
+  js/world/            航天飞机模型、机场、座舱、天气、雨水、雷声、气动声学（风声）
   js/ui/               相机、HUD、MEDS 显示器、头部运动
   js/sim/              浏览器版：Pyodide 启动、仿真 Worker、规划 Worker
 tools/                 自检、GNC 回归测试、气动报告、浏览器版构建与发布、README 插图（readme_figures.py）
@@ -1253,6 +1311,7 @@ deploy/                nginx 配置示例
 - 无头测试使用同步规划器，求解期间仿真时间不推进。实时服务中求解是异步的，冷启动的几秒延迟在测试中没有覆盖。
 - 规划模型用配平后的 3-DOF 气动表，不含地面效应；A/L 段的俯仰由着陆律控制，不经过 MPC。
 - 动力学按平面地球计算，不考虑高超声速段。
+- 风声的舱体参数（蒙皮、夹层、窗层厚度、安装点间距）是根据公开资料估计的，不是实测值；没有模拟音爆。
 
 ---
 
@@ -1269,6 +1328,14 @@ deploy/                nginx 配置示例
 9. S. Sieberling, Q. P. Chu, J. A. Mulder. *Robust Flight Control Using Incremental Nonlinear Dynamic Inversion and Angular Acceleration Prediction.* Journal of Guidance, Control, and Dynamics, 2010.
 10. MIL-F-8785C. *Flying Qualities of Piloted Airplanes*, 1980. ——Dryden 湍流模型。
 11. S. Hillaire. *A Scalable and Production Ready Sky and Atmosphere Rendering Technique.* EGSR, 2020.
+12. M. Goody. *Empirical Spectral Model of Surface Pressure Fluctuations.* AIAA Journal, 42(9), 2004.
+13. T. M. Farabee, M. J. Casarella. *Spectral Features of Wall Pressure Fluctuations Beneath Turbulent Boundary Layers.* Physics of Fluids A, 3(10), 1991.
+14. M. V. Lowson. *Prediction of Boundary Layer Pressure Fluctuations.* AFFDL-TR-67-167, 1968.
+15. M. R. Fink. *Airframe Noise Prediction Method.* FAA-RD-77-29, 1977；W. E. Zorumski. *Aircraft Noise Prediction Program Theoretical Manual.* NASA TM-83199, 1982.
+16. ISO 9613-1:1993. *Acoustics — Attenuation of Sound during Propagation Outdoors — Part 1: Calculation of the Absorption of Sound by the Atmosphere.*
+17. B. H. Sharp. *Prediction Methods for the Sound Transmission of Building Elements.* Noise Control Engineering, 11(2), 1978.
+18. M. E. Delany, E. N. Bazley. *Acoustical Properties of Fibrous Absorbent Materials.* Applied Acoustics, 3(2), 1970.
+19. J. E. Ffowcs Williams. *The Noise from Turbulence Convected at High Speed.* Phil. Trans. R. Soc. A, 255, 1963.
 
 ---
 

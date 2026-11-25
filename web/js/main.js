@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { loadAssets, dataURL } from './core/assets.js';
 import { SimLink } from './core/net.js';
 import { LocalSim } from './core/local_sim.js';
-import { enuToThree, bodyQuatToThree, curvatureDrop } from './core/frames.js';
+import { enuToThree, threeToEnu, bodyQuatToThree, curvatureDrop } from './core/frames.js';
 import { Atmosphere, sunDirection, sunTransmittanceCPU } from './render/atmosphere.js';
 import { Terrain } from './render/terrain.js';
 import { Clouds } from './render/clouds.js';
@@ -15,6 +15,7 @@ import { DragChute } from './world/chute.js';
 import { TireSmoke } from './world/smoke.js';
 import { zhEvent } from './ui/i18n.js';
 import { Weather } from './world/weather.js';
+import { AeroAudio } from './world/aero_audio.js';
 import { GncViz } from './world/gnc_viz.js';
 import { CameraRig, CAMERA_MODES, CAMERA_LABELS } from './ui/cameras.js';
 import { Hud } from './ui/hud.js';
@@ -122,6 +123,9 @@ async function main() {
   scene.add(chute.group);
   const smoke = new TireSmoke();
   const weather = new Weather({ U, weatherData: A.weatherData, scene });
+  // airflow sound of the gliding orbiter, computed from the flight state (aeroacoustics.js)
+  const aero = new AeroAudio(geometry);
+  weather.audio.attachAero(aero);
   const gncViz = new GncViz(terrain);
   scene.add(gncViz.group);
   let lastPlan = null, lastMpc = null;
@@ -458,6 +462,7 @@ async function main() {
   const pos3 = new THREE.Vector3(), vel3 = new THREE.Vector3(), quat3 = new THREE.Quaternion();
   const tmpQ = new THREE.Quaternion(), tmpV = new THREE.Vector3(), tmpV2 = new THREE.Vector3();
   const wind3 = new THREE.Vector3(), vAir3 = new THREE.Vector3(), attachW = new THREE.Vector3();
+  const aeroAx = { f: new THREE.Vector3(), u: new THREE.Vector3(), r: new THREE.Vector3(), cr: new THREE.Vector3() };
   const sunRad = new THREE.Color(), ambC = new THREE.Color();
   const contacts = [];
   const groundY = (x, z) => enuToThree(x, -z, terrain.surfaceAt(x, -z), tmpV).y;
@@ -625,6 +630,18 @@ async function main() {
       if (frame % 20 === 0 && weather.settings.wetAuto) { $('#wet').value = weather.wet; $('#wet-o').textContent = `自动 ${weather.wet.toFixed(2)}`; }
     }
 
+    // ---------------- airflow sound: the vehicle's trajectory, heard at the camera (or in the flight deck)
+    if (st) {
+      aeroAx.f.set(1, 0, 0).applyQuaternion(quat3); aeroAx.u.set(0, 1, 0).applyQuaternion(quat3); aeroAx.r.set(0, 0, 1).applyQuaternion(quat3);
+      aero.pushVehicle({ t: st.t || 0, pos: pos3, vel: vel3, wind: wind3, fwd: aeroAx.f, up: aeroAx.u, right: aeroAx.r,
+        alt: st.pos[2], agl, surf: st.surf, gear: st.gear ? st.gear.pos : 0 });
+      const ce = threeToEnu(camera.position);
+      aeroAx.cr.setFromMatrixColumn(camera.matrixWorld, 0);
+      aero.update({ t: st.t || 0, pos: camera.position, vel: weather.camVel, right: aeroAx.cr, alt: ce[2],
+        groundAlt: terrain.surfaceAt(ce[0], ce[1]), cabin: inCockpit, rh: 60 + 35 * Math.min(1, weather.rainCam),
+        mute: !!st.paused });
+    }
+
     // ---------------- render
     // in the flight deck the eye adapts to the darker cabin: about +0.6 EV
     const exposure = Math.pow(2, settings.exposureEV) * 0.62 * (1 + night * 6) * (1 + 0.5 * weather.rainCam) * (inCockpit ? 1.5 : 1);
@@ -671,7 +688,7 @@ async function main() {
   }
   loop();
   window.__planelands = {
-    THREE, renderer, scene, camera, U, terrain, airport, shuttle, clouds, post, atmo, rig, link, setCam, gncViz, hud, meds, chute, smoke, trail, weather, cockpit,
+    THREE, renderer, scene, camera, U, terrain, airport, shuttle, clouds, post, atmo, rig, link, setCam, gncViz, hud, meds, chute, smoke, trail, weather, cockpit, aero,
     injectPlan(m) { lastPlan = m; gncViz.setPlan(m); }, injectMpc(p) { lastMpc = p; gncViz.setMpc(p); },
     // debug helper: free camera at runway-frame (u, v, height) looking at heading/pitch (deg)
     look(u, v, h, hdgDeg, pitchDeg) { setCam('free'); airport.toWorld(u, v, h, rig.free.pos); rig.free.yaw = -hdgDeg * Math.PI / 180; rig.free.pitch = pitchDeg * Math.PI / 180; },
