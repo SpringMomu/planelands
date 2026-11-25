@@ -24,8 +24,11 @@ Phases:  PLAN -> TAEM (ACQ / HAC / PRF) -> A/L (OGS / PREFLARE / IGS / FLARE)
   tracking error; "always": on every replan; "off": never
 * tracking: LTV-MPC on the combined reference (TAEM plan + A/L reference) at 2.5 Hz with
   spatial re-indexing; the control sequence is interpolated between MPC updates
-* flare / touchdown / rollout: proven sink-rate flare with tail-scrape protection, centreline
-  capture by bank, derotation by the FCS, drag chute, brakes, nose-wheel steering
+* A/L pitch (OGS, preflare, IGS): Orbiter-style autoland law - Nz from the altitude and altitude-rate
+  errors to the altitude-for-range profile plus the path-curvature feed-forward (the MPC keeps bank
+  and speedbrake); final flare from the Orbiter sink-rate-versus-altitude table, entered at 30-80 ft
+  depending on the sink rate; tail-scrape protection, centreline capture by bank
+* touchdown / rollout: derotation by the FCS, drag chute, brakes, nose-wheel steering
 """
 from __future__ import annotations
 
@@ -35,7 +38,9 @@ import os
 import numpy as np
 
 from ..guidance import GuidanceBase, GuidanceCommand, register
-from .approach import PH_FLARE, PH_IGS, PH_NAMES, PH_OGS, flare_alpha, lateral_bank, rollout_steer
+from .approach import (FF_SINK_TD, PH_FLARE, PH_IGS, PH_NAMES, PH_OGS, al_vertical_accel, alpha_for_accel,
+                       ff_trigger_height, flare_alpha, lateral_bank, rollout_steer, tail_scrape_alpha_max,
+                       vertical_profile)
 from .geometry import TWO_PI, ApproachConfig, runway_ends, wrap_pi
 from .model import G0, PlanningModel
 from .mpc import AL_W, TAEM_W, Mpc
@@ -61,7 +66,9 @@ class ScpMpcGuidance(GuidanceBase):
     wind_replan_dv = 3.0     # wind change (vector, m/s at 10 m) that triggers an immediate replan ...
     wind_replan_dt = 10.0    # ... at most this often (s)
     reselect_mode = "wind"   # "wind" | "always" | "off"
-    flare_h = 22.0           # main-gear height that starts the final flare
+    al_blend = 3.0           # s: MPC alpha -> autoland pitch law blend at the A/L interface
+    al_ki = 0.03             # 1/s^2: integral gain on the A/L altitude error (lift-model error trim) ...
+    al_int_lim = 1.0         # ... limited to this vertical acceleration (m/s^2)
     degraded_replan = 5.0    # degraded modes: cold re-plan this often (s)
     terrain_clear = 250.0    # degraded modes: required clearance over terrain above the field (m) ...
     terrain_look = (8.0, 16.0, 24.0, 32.0, 45.0, 60.0)    # ... along the predicted glide (s ahead)
@@ -115,6 +122,10 @@ class ScpMpcGuidance(GuidanceBase):
         self.fi = 0.0
         self.gear = False
         self.flare = False
+        self.t_al = None             # time the autoland pitch law took over (A/L segment)
+        self.al_int = 0.0            # its integral term (m/s^2)
+        self.t_al_last = None
+        self._prof = (None, None)    # (A/L reference, its H(x)) cache
         self.t_nose = None
         self._chute_on = False
         self.mpc_fail = 0
@@ -374,8 +385,10 @@ class ScpMpcGuidance(GuidanceBase):
         i = min(int(round(fi)), len(self.ref.t) - 1)
         seg = int(self.ref.seg[i])
         xr, ur, gr = self.ref.interp_index(fi)
-        if s.agl_gear < self.flare_h and seg == 1:
+        if seg == 1 and not self.flare and s.agl_gear < ff_trigger_height(s.vs):
             self.flare = True
+            self.event("info", f"final flare at {s.agl_gear / 0.3048:.0f} ft, sink {-s.vs / 0.3048:.1f} fps, "
+                               f"{s.eas / 0.514444:.0f} KEAS")
         prev = (self.phase, self.sub)
         if self.flare:
             self.phase, self.sub = "A/L", "FLARE"
@@ -465,7 +478,12 @@ class ScpMpcGuidance(GuidanceBase):
             j = int(min(max(math.floor(k), 0), len(self.u_plan) - 2))
             f = min(max(k - j, 0.0), 1.0)
             u = self.u_plan[j] + f * (self.u_plan[j + 1] - self.u_plan[j])
-            cmd = GuidanceCommand(alpha_deg=float(u[0]), bank_deg=float(u[1] * R2D), speedbrake_deg=float(u[2]),
+            alpha = float(u[0])
+            if seg == 1:
+                alpha = self._al_pitch(t, s, alpha, float(u[2]))
+            else:
+                self.t_al = None
+            cmd = GuidanceCommand(alpha_deg=alpha, bank_deg=float(u[1] * R2D), speedbrake_deg=float(u[2]),
                                   gear_down=self.gear, info=f"{self.phase}/{self.sub}")
         self.u_prev = np.array([cmd.alpha_deg, cmd.bank_deg * D2R, cmd.speedbrake_deg])
         # ---------------------------------------------------------- telemetry
@@ -655,9 +673,35 @@ class ScpMpcGuidance(GuidanceBase):
         return GuidanceCommand(alpha_deg=alpha, bank_deg=bank * R2D, speedbrake_deg=sb, gear_down=self.gear,
                                info=f"TAEM/{self.degraded}")
 
+    def _al_pitch(self, t, s, alpha_mpc, sb):
+        """A/L pitch: autoland altitude/altitude-rate law on the A/L profile (blended in from the MPC's
+        alpha over ``al_blend`` s at the interface)."""
+        al = self.ref.al
+        if self._prof[0] is not al:
+            self._prof = (al, vertical_profile(al.cfg)[0])
+        H = self._prof[1]
+        rwy = al.rwy
+        x, _ = rwy.to_rwy(s.pos[0], s.pos[1])
+        vx = float(s.vel[0] * rwy.d[0] + s.vel[1] * rwy.d[1])
+        if self.t_al is None:
+            self.al_int, self.t_al_last = 0.0, t
+        az, eh = al_vertical_accel(H, float(x), vx, float(s.alt - rwy.elev), s.vs, self.al_int,
+                                   h_gear=s.agl_gear)
+        dt = min(max(t - self.t_al_last, 0.0), 0.5)
+        self.t_al_last = t
+        if -0.6 * G0 < az < 1.2 * G0:          # anti-windup
+            self.al_int = float(np.clip(self.al_int + self.al_ki * eh * dt, -self.al_int_lim, self.al_int_lim))
+        gear = 1.0 if self.gear else 0.0
+        a = alpha_for_accel(self.ctx.tables, self.ctx.mass, self.ctx.S, s, az, sb, gear)
+        a = float(np.clip(a, 0.0, min(float(self.pm.alpha_max(s.mach)) + 2.0, tail_scrape_alpha_max(s, s.agl_gear))))
+        if self.t_al is None:
+            self.t_al = t
+        w = min(max((t - self.t_al) / self.al_blend, 0.0), 1.0)
+        return (1.0 - w) * alpha_mpc + w * a
+
     def _flare(self, t, s):
         sb = float(self.ref.al.sb_pf) if self.ref is not None else 0.0
-        sink_td = 0.9
+        sink_td = FF_SINK_TD
         if self.ref is not None and self.rwy is not None:
             # touchdown-zone awareness: floating past the aim point (excess speed, tailwind, shear
             # balloon) -> settle it with a firmer sink and the speedbrake open instead of using
@@ -667,7 +711,7 @@ class ScpMpcGuidance(GuidanceBase):
             if over > 0.0:
                 sink_td += float(np.clip(over / 300.0, 0.0, 1.0)) * 1.0
                 sb += (98.6 - sb) * float(np.clip(over / 250.0, 0.0, 1.0))
-        a = flare_alpha(self.ctx.tables, self.ctx.mass, self.ctx.S, s, gear=1.0, sink_td=sink_td)
+        a = flare_alpha(self.ctx.tables, self.ctx.mass, self.ctx.S, s, sb=sb, gear=1.0, sink_floor=sink_td)
         bank = lateral_bank(self.rwy, s, bank_lim_deg=5.0) if self.rwy is not None else 0.0
         return GuidanceCommand(alpha_deg=a, bank_deg=bank, speedbrake_deg=sb, gear_down=True, info="A/L/FLARE")
 

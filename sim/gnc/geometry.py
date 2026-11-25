@@ -73,12 +73,20 @@ class ApproachConfig:
     eas_ogs: float = 290.0 * KT      # equivalent airspeed on the OGS
     d_prefinal: float = 2500.0       # straight leg between HAC exit (WP2) and the ALI
     r_hac: float = 5500.0            # HAC radius
-    gamma_igs_deg: float = -1.5
-    x_aim_igs: float = 450.0
-    x_td: float = 760.0              # touchdown point past the threshold (Orbiter: 2500 ft)
+    gamma_igs_deg: float = -1.5      # inner (shallow) glide slope
+    x_aim_igs: float = 520.0         # IGS ground intercept past the threshold (Orbiter: 1000 ft, touchdown
+                                     # ~2500 ft; here the touchdown follows from the final-flare law,
+                                     # ~575 m calm; threshold crossing ~30 ft wheel height)
+    x_td: float = 760.0              # nominal touchdown point past the threshold (Orbiter: 2500 ft);
+                                     # the reference's own touchdown point is keys["x_td"]
     h_td_cg: float = 4.4             # CG height above the runway at touchdown
-    r_preflare: float = 9000.0
-    v_td: float = 102.0              # target touchdown true airspeed (~198 KTAS)
+    r_preflare: float = 8000.0       # pull-up circle (Orbiter: ~0.33 g increment, tangent at ~1700 ft)
+    dh_pf_igs: float = 5.33          # the circle ends tangent to a line this far above the IGS (17.5 ft) ...
+    dh_pf_exp: float = 10.67         # ... left 35 ft above the IGS for an exponential onto the IGS
+    v_ff: float = 112.0              # ground speed assumed for the final-flare geometry (m/s)
+    v_td: float = 98.0               # touchdown true airspeed the speed integration aims at: it leaves out
+                                     # the ground-effect drag reduction, so the 6-DOF lands ~4 m/s faster,
+                                     # ~102 m/s = 198 KTAS (Orbiter: 195 KEAS light, 205 KEAS heavy)
 
     @property
     def x_ali(self):

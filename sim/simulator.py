@@ -625,8 +625,15 @@ class Simulator:
             if a == "reset":
                 seed = msg.get("seed")
                 if msg.get("scenario") == "final":
-                    # short-final demo (RWY33): exercises flare, touchdown, derotation, chute and rollout
-                    self.reset(init=approach_state(self.terrain, self.tables, height_agl=30.0, V=115.0, gamma_deg=-2.0))
+                    # short-final demo (RWY33): on the inner glide slope at 130 ft / ~262 KEAS like the
+                    # Orbiter a few seconds before the final flare; exercises the IGS, final flare,
+                    # touchdown, derotation, chute and rollout
+                    cfg = ApproachConfig()
+                    h_g = 40.0
+                    x_thr = cfg.x_aim_igs - (h_g + 4.9) / math.tan(math.radians(-cfg.gamma_igs_deg))
+                    self.reset(init=approach_state(self.terrain, self.tables, height_agl=h_g, V=135.0,
+                                                   gamma_deg=cfg.gamma_igs_deg,
+                                                   offset_along=-self.terrain.rwy_half_len + x_thr))
                 elif msg.get("scenario") == "custom":
                     init, warn = self._custom_init(msg.get("spawn") or {})
                     a = self.assess_spawn(init)
