@@ -23,6 +23,12 @@ try:
     import osqp
 except ImportError:  # pragma: no cover
     osqp = None
+clarabel = None
+if osqp is None:          # e.g. the browser build (Pyodide ships Clarabel, not OSQP)
+    try:
+        import clarabel
+    except ImportError:   # pragma: no cover
+        clarabel = None
 
 from .model import G0, atm
 from .scp import DU, DX
@@ -195,6 +201,27 @@ class Mpc:
                     dU = np.asarray(res.x)
                     ok = True
                 self.status = st
+            except Exception as e:  # pragma: no cover
+                self.status = f"error {e}"
+                self._solver = None
+        elif clarabel is not None:
+            # same QP for Clarabel: l <= A x <= u  ->  [A; -A] x + s = [u; -l], s >= 0
+            try:
+                if self._solver is None:
+                    self._A2 = sp.vstack([self.Acon, -self.Acon], format="csc")
+                    st = clarabel.DefaultSettings()
+                    st.verbose = False
+                    st.max_iter = 60
+                    self._solver = st
+                Pu = sp.triu(sp.csc_matrix(H), format="csc")
+                solver = clarabel.DefaultSolver(Pu, g, self._A2, np.concatenate([u, -l]),
+                                                [clarabel.NonnegativeConeT(self._A2.shape[0])], self._solver)
+                res = solver.solve()
+                st = str(res.status)
+                if st in ("Solved", "AlmostSolved"):
+                    dU = np.asarray(res.x)
+                    ok = True
+                self.status = st.lower()
             except Exception as e:  # pragma: no cover
                 self.status = f"error {e}"
                 self._solver = None

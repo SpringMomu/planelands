@@ -22,8 +22,10 @@ const lerpObj = (a, b, t) => {
 };
 
 export class SimLink {
-  constructor({ port = 8765, onHello, onEvent, onAero, onStatus, onPlan, onMpc, onState, onEpisode } = {}) {
+  constructor({ port = 8765, local = null, onLoading, onHello, onEvent, onAero, onStatus, onPlan, onMpc, onState, onEpisode } = {}) {
     this.port = port;
+    this.local = local;              // browser build: a LocalSim (simulator in Web Workers) instead of a server
+    this.onLoading = onLoading;
     this.onHello = onHello; this.onEvent = onEvent; this.onAero = onAero; this.onStatus = onStatus;
     this.onPlan = onPlan; this.onMpc = onMpc;
     this.onState = onState;          // every raw state as it arrives (also while the tab is hidden)
@@ -38,13 +40,18 @@ export class SimLink {
     this.ws = null;
     this._retry = 0;
     this._connect();
-    this._offlineTimer = setTimeout(() => { if (!this.connected) this._startOffline(); }, 2500);
+    // kinematic preview while the backend connects (or, for the browser build, while Python loads)
+    this._offlineTimer = setTimeout(() => { if (!this.connected) this._startOffline(); }, this.local ? 300 : 2500);
   }
 
   _connect() {
     const host = location.hostname || 'localhost';
     let ws;
-    try { ws = new WebSocket(`ws://${host}:${this.port}`); } catch (e) { this._scheduleRetry(); return; }
+    if (this.local) {
+      ws = this.local;                 // a LocalSim (already loading); attached below, once wired up
+    } else {
+      try { ws = new WebSocket(`ws://${host}:${this.port}`); } catch (e) { this._scheduleRetry(); return; }
+    }
     this.ws = ws;
     ws.onopen = () => {
       this.connected = true; this.offline = false; this._retry = 0;
@@ -69,8 +76,15 @@ export class SimLink {
         case 'spawn_check': this.onSpawnCheck?.(m); break;
       }
     };
+    if (this.local) {
+      ws.attach({
+        onProgress: (m) => this.onLoading?.(m),
+        onFatal: (text) => this.onStatus?.('failed', text),
+      });
+    }
   }
   _scheduleRetry() {
+    if (this.local) { this._startOffline(); return; }      // the in-browser simulator does not come back
     this._retry = Math.min(this._retry + 1, 6);
     setTimeout(() => { if (!this.connected) this._connect(); }, 600 * this._retry);
     if (!this.offline && !this.connected && this._retry > 2) this._startOffline();

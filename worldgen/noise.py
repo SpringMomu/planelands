@@ -3,8 +3,8 @@
 All functions operate on numpy float32 arrays.  Two families:
   * Perlin2   - infinite (hash based) 2-D gradient noise with analytic derivatives,
                 used for the terrain heightmap.
-  * tileable  - periodic 2-D / 3-D Perlin and Worley noise for the cloud volumes
-                and the weather map (textures that wrap seamlessly on the GPU).
+  * tileable  - periodic 2-D Perlin and Worley noise for the cloud weather map (a texture that
+                wraps seamlessly on the GPU; the 3-D cloud volumes: web/js/render/cloud_noise.js).
 """
 from __future__ import annotations
 
@@ -137,57 +137,6 @@ def ridged(noise: Perlin2, x, y, octaves=8, gain=0.5, offset=1.0):
 
 
 # ----------------------------------------------------------------------------- tileable noise
-def _grid_coords3(res: int):
-    c = (np.arange(res, dtype=F32) + 0.5) / F32(res)
-    return np.meshgrid(c, c, c, indexing="ij")  # z, y, x order -> we index [z, y, x]
-
-
-def perlin3_tileable(res: int, freq: int, seed: int):
-    """Periodic 3-D Perlin noise sampled on a res^3 grid, period = freq cells. ~[-1, 1]."""
-    rng = np.random.default_rng(seed)
-    g = rng.normal(size=(freq, freq, freq, 3)).astype(F32)
-    g /= np.linalg.norm(g, axis=-1, keepdims=True)
-    zc, yc, xc = _grid_coords3(res)
-    px, py, pz = xc * freq, yc * freq, zc * freq
-    ix, iy, iz = np.floor(px).astype(np.int32), np.floor(py).astype(np.int32), np.floor(pz).astype(np.int32)
-    fx, fy, fz = px - ix, py - iy, pz - iz
-    out = np.zeros(px.shape, dtype=F32)
-    u, v, w = _fade(fx), _fade(fy), _fade(fz)
-    for dz in (0, 1):
-        wz = w if dz else 1.0 - w
-        for dy in (0, 1):
-            wy = v if dy else 1.0 - v
-            for dx in (0, 1):
-                wx = u if dx else 1.0 - u
-                gi = g[(iz + dz) % freq, (iy + dy) % freq, (ix + dx) % freq]
-                dot = gi[..., 0] * (fx - dx) + gi[..., 1] * (fy - dy) + gi[..., 2] * (fz - dz)
-                out += wx * wy * wz * dot
-    return out * F32(1.6)
-
-
-def worley3_tileable(res: int, freq: int, seed: int):
-    """Periodic inverted Worley (1 - F1), [0, 1], res^3 grid, freq cells per period."""
-    rng = np.random.default_rng(seed)
-    pts = rng.random((freq, freq, freq, 3)).astype(F32)
-    zc, yc, xc = _grid_coords3(res)
-    px, py, pz = xc * freq, yc * freq, zc * freq
-    ix, iy, iz = np.floor(px).astype(np.int32), np.floor(py).astype(np.int32), np.floor(pz).astype(np.int32)
-    best = np.full(px.shape, 1e9, dtype=F32)
-    for oz in (-1, 0, 1):
-        cz = iz + oz
-        for oy in (-1, 0, 1):
-            cy = iy + oy
-            for ox in (-1, 0, 1):
-                cx = ix + ox
-                f = pts[cz % freq, cy % freq, cx % freq]
-                ddx = cx + f[..., 0] - px
-                ddy = cy + f[..., 1] - py
-                ddz = cz + f[..., 2] - pz
-                d2 = ddx * ddx + ddy * ddy + ddz * ddz
-                np.minimum(best, d2, out=best)
-    return np.clip(1.0 - np.sqrt(best), 0.0, 1.0).astype(F32)
-
-
 def perlin2_tileable(res: int, freq: int, seed: int):
     rng = np.random.default_rng(seed)
     ang = rng.uniform(0, 2 * np.pi, (freq, freq))

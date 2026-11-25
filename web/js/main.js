@@ -1,6 +1,7 @@
 import * as THREE from 'three';
-import { loadAssets } from './core/assets.js';
+import { loadAssets, dataURL } from './core/assets.js';
 import { SimLink } from './core/net.js';
+import { LocalSim } from './core/local_sim.js';
 import { enuToThree, bodyQuatToThree, curvatureDrop } from './core/frames.js';
 import { Atmosphere, sunDirection, sunTransmittanceCPU } from './render/atmosphere.js';
 import { Terrain } from './render/terrain.js';
@@ -51,6 +52,20 @@ function toast(text, level = 'info', ms = 4200) {
 }
 
 async function main() {
+  // Where the simulator runs. Browser build (tools/build_web.py sets window.PLANELANDS.sim = 'browser';
+  // or ?sim=browser): Python in Web Workers on this machine - started right away so Pyodide loads while
+  // the world data and the scene do. Otherwise the server.py WebSocket backend.
+  const PL = globalThis.PLANELANDS || {};
+  const qs = new URLSearchParams(location.search);
+  const abs = (u) => new URL(u, document.baseURI).href;
+  const local = (qs.get('sim') || PL.sim) !== 'browser' ? null : new LocalSim({
+    pyodide: abs(PL.pyodide || 'https://cdn.jsdelivr.net/pyodide/v314.0.8/full/'),
+    bundle: abs(PL.bundle || 'py/sim.zip'),
+    terrain: abs(dataURL('terrain_height.f32')),
+    terrainEnc: PL.enc?.['terrain_height.f32'],
+    spawn: qs.get('spawn') || 'feasible',
+  });
+
   ld('加载世界数据…', 0.02);
   const A = await loadAssets((name, f) => ld(`加载${name}… ${Math.round(f * 100)}%`, 0.05 + 0.5 * f));
   await nextFrame();
@@ -166,13 +181,19 @@ async function main() {
 
   // ------------------------------------------------------------------ simulator link
   let elements = null;
-  // WebSocket port: ?ws=PORT, else whatever the HTTP server reports, else the default
-  let wsPort = +(new URLSearchParams(location.search).get('ws')) || 0;
-  if (!wsPort) {
+  // WebSocket backend (server.py): port ?ws=PORT, else whatever the HTTP server reports, else the default
+  let wsPort = +qs.get('ws') || 0;
+  if (!wsPort && !local) {
     try { wsPort = (await (await fetch('api/config', { cache: 'no-store' })).json()).ws_port || 0; } catch { wsPort = 0; }
   }
+  const linkPill = (text) => { $('#pill-link em').textContent = text; };
   const link = new SimLink({
     port: wsPort || 8765,
+    local,
+    onLoading: (m) => {
+      if (link.connected) return;
+      linkPill(`加载仿真 · ${m.who === 'planner' ? '规划器 ' : ''}${m.stage} ${Math.round((m.f || 0) * 100)}%`);
+    },
     onHello: (m) => {
       if (m.elements) { elements = m.elements; forces.setElements(m.elements); }
       if (m.guidance && m.guidance.available) {
@@ -181,7 +202,7 @@ async function main() {
         sel.innerHTML = m.guidance.available.map((g) => `<option value="${g}">${names[g] || g}</option>`).join('');
         sel.value = m.guidance.active;
       }
-      toast('已连接 Python 仿真后端（6-DOF 气动 + 飞控）', 'info');
+      toast(local ? '浏览器内 Python 仿真已就绪（6-DOF 气动 + 飞控 + SCP/MPC 制导）' : '已连接 Python 仿真后端（6-DOF 气动 + 飞控）', 'info');
       sendEnv(true);
       setTimeout(() => spawnPanel?.requestCheck(), 50);
     },
@@ -196,13 +217,26 @@ async function main() {
     onEpisode: () => { trail.clear(); hud.clearTrail(); smoke.clear(); chute.reset(); shuttle.setChuteDoor(false); prevWow = null; meds.resetAlarms(); },
     onMpc: (m) => { lastMpc = m.pred; gncViz.setMpc(m.pred); },
     onEvent: (m) => { toast(zhEvent(m.text), m.level || 'info', m.level === 'error' ? 8000 : 5000); meds.event(m); },
-    onStatus: (s) => {
+    onStatus: (s, info) => {
       const p = $('#pill-link');
       p.classList.toggle('ok', s === 'online'); p.classList.toggle('bad', s !== 'online');
-      p.querySelector('em').textContent = s === 'online' ? '在线 6-DOF' : s === 'local' ? '离线 · 本地预览' : '断开';
+      p.querySelector('em').textContent = s === 'online' ? (local ? '本机 6-DOF' : '在线 6-DOF')
+        : s === 'failed' ? '仿真加载失败 · 本地预览' : s === 'local' ? (local ? '加载仿真…' : '离线 · 本地预览') : '断开';
+      if (s === 'failed') toast(`浏览器内仿真加载失败：${info}`, 'error', 12000);
     },
   });
   let lastAero = null;
+  // browser build: tell open pages when a new release has been deployed (index.html is revalidated)
+  if (PL.ver) {
+    let told = false;
+    setInterval(async () => {
+      if (told || document.hidden) return;
+      try {
+        const v = await (await fetch(PL.versionURL || 'version.json', { cache: 'no-store' })).json();
+        if (v.ver && v.ver !== PL.ver) { told = true; toast('网站已更新：刷新页面即可使用新版本', 'info', 20000); }
+      } catch { /* offline */ }
+    }, 5 * 60 * 1000);
+  }
   // start-position editor (own tab): place the vehicle anywhere and start from there
   const spawnPanel = new SpawnPanel({ root: $('#spawn-panel'), hud, link, world: A.world, onStart: () => clearEpisode() });
   link.onSpawnCheck = (m) => spawnPanel.onCheck(m);

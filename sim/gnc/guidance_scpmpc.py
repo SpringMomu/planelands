@@ -79,6 +79,9 @@ class ScpMpcGuidance(GuidanceBase):
         self.mpc = Mpc(self.pm)
         if self.planner_mode == "async":
             self.planner = AsyncPlanner()
+        elif self.planner_mode == "external":     # browser build: planner in its own Web Worker
+            from .planner import ExternalPlanner
+            self.planner = ExternalPlanner()
         else:
             self.planner = SyncPlanner(_Ctx(ctx.tables, ctx.mass, ctx.S, ctx.world,
                                             getattr(ctx, "terrain", None)))

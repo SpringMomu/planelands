@@ -74,6 +74,15 @@ class Handler(SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if self.path.split("?")[0] == "/py/sim.zip":        # dev: ?sim=browser runs the simulator in the page
+            from tools.build_web import make_bundle
+            body = make_bundle()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         super().do_GET()
 
     def log_message(self, fmt, *args):   # quiet

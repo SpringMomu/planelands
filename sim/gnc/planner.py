@@ -376,6 +376,73 @@ class SyncPlanner:
         pass
 
 
+class ExternalPlanner:
+    """Planner in another JavaScript Web Worker (browser build, Pyodide): requests and results are
+    pickled bytes. ``EXTERNAL_POST(seq, bytes)`` is installed by the host (sim/browser.py); the host
+    hands results back through ``deliver``. Same interface and semantics as AsyncPlanner."""
+    mode = "async"
+    post = None
+
+    def __init__(self):
+        if ExternalPlanner.post is None:
+            raise RuntimeError("ExternalPlanner.post is not installed")
+        self.seq = 0
+        self.pending = None
+        self._res = None
+        ExternalPlanner.active = self
+
+    @property
+    def busy(self):
+        return self.pending is not None
+
+    def submit(self, req):
+        if self.pending is not None:
+            return False
+        import pickle
+        self.seq += 1
+        self.pending = self.seq
+        ExternalPlanner.post(self.seq, pickle.dumps(req, protocol=pickle.HIGHEST_PROTOCOL))
+        return True
+
+    def deliver(self, seq, data):
+        if seq != self.pending:
+            return                      # cancelled / superseded
+        import pickle
+        try:
+            self._res = pickle.loads(bytes(data))
+        except Exception as e:
+            self._res = {"error": repr(e)}
+
+    def fail(self, seq, text):
+        if seq == self.pending:
+            self._res = {"error": str(text)}
+
+    def poll(self):
+        if self._res is not None:
+            r, self._res, self.pending = self._res, None, None
+            return r
+        return None
+
+    def cancel(self):
+        self.pending = None
+        self._res = None
+
+    def close(self):
+        self.cancel()
+
+
+def plan_pickled(data):
+    """Planner-worker side of ExternalPlanner: pickled request -> pickled result."""
+    import pickle
+    init_worker()
+    req = pickle.loads(bytes(data))
+    try:
+        res = plan(req)
+    except Exception as e:
+        res = {"error": repr(e), "episode": req.get("episode")}
+    return pickle.dumps(res, protocol=pickle.HIGHEST_PROTOCOL)
+
+
 class AsyncPlanner:
     mode = "async"
 

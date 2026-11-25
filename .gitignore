@@ -13,3 +13,6 @@ sim/data/
 .claude/settings.local.json
 .vscode/
 *.log
+# browser release build (tools/build_web.py) and its download cache
+dist/
+.cache/

@@ -18,6 +18,7 @@ ECOS fallback), all quantities scaled to O(1):
 from __future__ import annotations
 
 import math
+import sys
 import time
 from dataclasses import dataclass
 
@@ -188,12 +189,17 @@ class _Problem:
     def solve(self):
         for solver in ("CLARABEL", "ECOS"):
             try:
-                self.prob.solve(solver=solver, warm_start=True)
+                self.prob.solve(solver=solver, warm_start=True, **_CANON)
                 if self.prob.status in ("optimal", "optimal_inaccurate"):
                     return self.prob.status
             except Exception:  # solver failure -> fallback
                 continue
         return self.prob.status or "failed"
+
+
+# Browser build (Pyodide, wasm32): cvxpy's default COO canonicalisation backend fails there
+# (int64 -> int32 index cast) and the C++ one is not built; the SciPy backend gives identical problems.
+_CANON = {"canon_backend": "SCIPY"} if sys.platform == "emscripten" else {}
 
 
 @dataclass

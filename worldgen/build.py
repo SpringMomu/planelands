@@ -6,7 +6,7 @@ Files written to web/data/:
   terrain_height.f32    float32 LE heightmap (size x size, row 0 = south)
   terrain_landcover.u8  RGBA8 land cover (same grid)
   terrain_meta.json     metadata
-  cloud_shape.u8        128^3 RGBA8, cloud_detail.u8 32^3 RGBA8, cloud_weather.u8 512^2 RGBA8
+  cloud_weather.u8      512^2 RGBA8 weather map (the 3-D cloud noise is generated in the browser)
   assets.json           manifest (versions / sizes) read by the web client
 """
 from __future__ import annotations
@@ -71,12 +71,8 @@ def ensure_assets(force: bool = False, log=print) -> Path:
     (DATA / "terrain_height.f32").write_bytes(np.ascontiguousarray(h, dtype="<f4").tobytes())
     (DATA / "terrain_landcover.u8").write_bytes(np.ascontiguousarray(lc).tobytes())
     (DATA / "terrain_meta.json").write_text(json.dumps(meta), encoding="utf-8")
-    log("[worldgen] generating cloud noise volumes ...")
-    shape = clouds.shape_volume(128, log=log)
-    detail = clouds.detail_volume(32)
+    log("[worldgen] generating the cloud weather map ...")
     weather = clouds.weather_map(512)
-    (DATA / "cloud_shape.u8").write_bytes(np.ascontiguousarray(shape).tobytes())
-    (DATA / "cloud_detail.u8").write_bytes(np.ascontiguousarray(detail).tobytes())
     (DATA / "cloud_weather.u8").write_bytes(np.ascontiguousarray(weather).tobytes())
     man = {
         "version": ASSET_VERSION,
@@ -85,8 +81,6 @@ def ensure_assets(force: bool = False, log=print) -> Path:
             "terrain_height.f32": {"type": "f32", "size": [meta["size"], meta["size"]]},
             "terrain_landcover.u8": {"type": "rgba8", "size": [meta["size"], meta["size"]]},
             "terrain_meta.json": {"type": "json"},
-            "cloud_shape.u8": {"type": "rgba8", "size": [128, 128, 128]},
-            "cloud_detail.u8": {"type": "rgba8", "size": [32, 32, 32]},
             "cloud_weather.u8": {"type": "rgba8", "size": [512, 512]},
         },
         "build_seconds": round(time.time() - t0, 1),

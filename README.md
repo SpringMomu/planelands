@@ -16,6 +16,36 @@ python server.py                       # http://localhost:8000  (WebSocket: 8765
 参数：`--http-port`、`--ws-port`、`--seed N`（固定随机出生点）、`--guidance scp_mpc|hold_glide`（默认 `scp_mpc`）、`--spawn feasible|any`（默认只在能飞回跑道的能量带内随机出生）。
 后端没启动时，网页会自动进入「本地预览」模式（只有运动学，没有气动），方便单独调画面。
 
+### 在线版：整个仿真跑在访问者的浏览器里
+
+在线版没有后端进程。服务器只提供静态文件，访客打开多少个页面都不占服务器 CPU，所以也不限制同时在线人数。
+页面里 WebGL 负责渲染；同一套 Python 仿真代码（6-DOF + 飞控 + SCP/MPC 制导）用 [Pyodide](https://pyodide.org)（WebAssembly 版 CPython）跑在两个 Web Worker 里：
+
+- `web/js/sim/sim_worker.js`：仿真主循环，60 Hz，对应 `server.py`；
+- `web/js/sim/plan_worker.js`：SCP 规划，对应服务器版的规划进程。
+
+两个 Worker 和页面之间收发的 JSON 消息与 WebSocket 版完全相同，页面通过 `core/local_sim.js` 把 Worker 当成一个 socket 来用。
+
+```bash
+python tools/build_web.py --serve 8090    # 构建 dist/ 并在本机预览 http://localhost:8090
+tools/deploy_web.sh jp                    # 构建并发布到 jp:/var/www/planelands（nginx: deploy/）
+python server.py  →  http://localhost:8000/?sim=browser    # 开发时：不构建，直接在浏览器里跑仿真（Pyodide 走 CDN）
+```
+
+- **缓存与更新**（`tools/build_web.py`）：
+  - 每次发布是一个以内容哈希命名的目录 `v/<ver>/`（js、css、three.js、小 JSON、`py/sim.zip` 里的 Python 源码和配平表）。
+  - 大数据按内容寻址放在 `d/<sha>/`（地形、地表覆盖、天气图），Pyodide 运行时和 wheel 自托管在 `pyodide/<版本>/`。
+  - 这三类都设为 `immutable` 长期缓存；只有 `index.html` 和 `version.json` 每次访问都向服务器确认（内容没变时只回一个 304）。
+  - 改了代码再发布，只上传变化的文件，数据没变就不会重新下载。已经打开的页面每 5 分钟检查一次 `version.json`，有新版本会提示刷新。`deploy_web.sh` 最后才切换 `index.html`，保留最近 5 个版本，所以发布前打开的页面不受影响。
+- **首次访问**：大约下载 35 MB。地形和天气数据 gzip 后约 10 MB，其中高程图用无损的平面预测 + 字节分组编码（`core/terrain_codec.js`），从 13.3 MB 降到 7.4 MB；Pyodide 加 numpy/scipy/cvxpy/clarabel 约 25 MB。以后都从缓存读。体积云的 3D 噪声不再下载，由页面在 Worker 里生成（`render/cloud_noise.js`，约 1–3 s，和下载同时进行）。Pyodide 在页面打开时就开始加载，和地形、场景构建同时进行；加载完成前先运行运动学预览。
+- **性能**：
+  - WebAssembly 里的 Python 大约比原生慢 3 倍。仿真每 tick 约 11 ms（预算 16.7 ms），一次 SCP 规划约 1–3 s（在独立 Worker 里，不卡仿真）。
+  - 在 2.4 GHz 的服务器虚拟核上，仿真大约 0.75–0.9 倍实时，普通台式机和笔记本一般能跑满实时。CPU 跟不上时仿真时间会变慢，但不会丢步或发散。
+  - 时间倍率要看本机 CPU，高倍率通常达不到。
+- **与原生环境的差异**：
+  - Pyodide 里没有 OSQP，MPC 改用 Clarabel 求解同一个 QP（`gnc/mpc.py`），结果与 OSQP 相差 <5e-4。
+  - cvxpy 默认的 COO 规范化后端在 wasm32 上会因 int64→int32 转换出错，所以在 Pyodide 里改用 SciPy 后端（`gnc/scp.py`）。测试的几个种子下，选出的跑道、迭代次数和飞行时间都与原生一致。
+
 | 操作 | 按键 / 鼠标 |
 |---|---|
 | 视角：追随 / 驾驶舱 / 塔台 / 跑道旁 / 飞掠 / 自由 / 俯瞰 | `1`–`7`，或底部按钮 |
@@ -95,6 +125,7 @@ python server.py                       # http://localhost:8000  (WebSocket: 8765
 
 ```
 server.py              HTTP 静态服务 + WebSocket；实时仿真循环（时间倍率 0.25–8×）
+tools/build_web.py     在线版构建（浏览器内仿真，静态文件，内容哈希缓存）；tools/deploy_web.sh 发布，deploy/ 为 nginx 配置
 sim/                   飞行仿真（Python，numpy 向量化）
   aero.py              分片 / 部件叠加气动：机翼条带 ×32、4 片升降副翼、体襟翼、垂尾 + 分裂式方向舵/减速板、
                        28 段机身细长体（Munk 项 + 粘性横流）、起落架、减速伞
@@ -107,12 +138,14 @@ sim/                   飞行仿真（Python，numpy 向量化）
   reduced_model.py     3-DOF 质点模型 + 由全量气动生成的配平表
   gnc/                 自主 GNC（默认制导 scp_mpc）：规划模型、HAC/Dubins 几何、进近基准、SCP、MPC、规划进程、阶段状态机
   spawn.py terrain.py  随机出生点、地形高度查询（与网页共用同一张高程图）
-worldgen/              程序化世界生成：侵蚀风格地形、海岸/沙洲/泻湖、河流湖泊、地表覆盖、体积云 3D 噪声
+  browser.py           在线版入口：Pyodide Web Worker 里的实时循环（消息格式同 server.py）
+worldgen/              程序化世界生成：侵蚀风格地形、海岸/沙洲/泻湖、河流湖泊、地表覆盖、云天气图（体积云 3D 噪声在浏览器里生成：web/js/render/cloud_noise.js）
 shared/                Python 和 JS 共用的定义：orbiter_geometry.json（机体几何，气动和建模都用它）、world.json
 web/                   three.js r170（已打包在本地，无需联网）
   js/render/           大气 LUT、体积云、几何裁剪图地形、后处理
   js/world/            航天飞机程序化模型、机场、材质补丁、轨迹/气动力矢量
   js/ui/               相机、HUD/仪表、地图
+  js/sim/              在线版：Pyodide 启动、仿真 Worker、规划 Worker
 ```
 
 ### 气动标定（重心 x=0，起落架收起，减速板关闭）
