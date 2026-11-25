@@ -106,19 +106,15 @@ const lis = (pos, extra = {}) => ({ t: 0, pos, vel: [0, 0, 0], alt: pos[1], grou
   check('cabin: levels finite', a.spl > 40 && a.spl < 130 && b.spl > 30 && b.spl < 130, `M0.6 ${a.spl.toFixed(1)} dB, M1.5 ${b.spl.toFixed(1)} dB`);
 }
 
-// ---- the AudioWorklet synthesiser reproduces a requested spectrum (mocked worklet scope)
+// ---- the spectral synthesiser (AudioWorklet / ScriptProcessor) reproduces a requested spectrum
 {
-  let Proc = null;
-  globalThis.sampleRate = 48000;
-  globalThis.AudioWorkletProcessor = class { constructor() { this.port = {}; } };
-  globalThis.registerProcessor = (name, cls) => { Proc = cls; };
-  await import('../web/js/world/aero_worklet.js');
+  const { SpectralNoise } = await import('../web/js/world/aero_synth.js');
   const run = (msg, seconds) => {
-    const p = new Proc();
-    p.port.onmessage({ data: { bands: Float64Array.from(A.FC) } });
-    p.port.onmessage({ data: msg });
+    const p = new SpectralNoise(48000);
+    p.message({ bands: Float64Array.from(A.FC) });
+    p.message(msg);
     const n = Math.floor(seconds * 48000 / 128) * 128, L = new Float32Array(n), R = new Float32Array(n);
-    for (let o = 0; o < n; o += 128) { const l = L.subarray(o, o + 128), r = R.subarray(o, o + 128); p.process([], [[l, r]]); }
+    for (let o = 0; o < n; o += 128) p.render(L.subarray(o, o + 128), R.subarray(o, o + 128));
     return { L: L.subarray(8192), R: R.subarray(8192) };          // skip the start-up
   };
   // 1/3-octave analysis: averaged Hann periodograms
@@ -161,11 +157,11 @@ const lis = (pos, extra = {}) => ({ t: 0, pos, vel: [0, 0, 0], alt: pos[1], grou
   let worst = 0, wb = 0;
   for (let i = 4; i < 29; i++) { const e = Math.abs(10 * Math.log10(got[i] / tgt[i])); if (e > worst) { worst = e; wb = i; } }
   const ms = L.reduce((s, v) => s + v * v, 0) / L.length, msT = sum(tgt);
-  check('worklet: band levels follow the model (50 Hz - 12.5 kHz)', worst < 1.5, `worst ${worst.toFixed(2)} dB at ${A.FC[wb].toFixed(0)} Hz; overall ${(10 * Math.log10(ms / msT)).toFixed(2)} dB`);
+  check('synth: band levels follow the model (50 Hz - 12.5 kHz)', worst < 1.5, `worst ${worst.toFixed(2)} dB at ${A.FC[wb].toFixed(0)} Hz; overall ${(10 * Math.log10(ms / msT)).toFixed(2)} dB`);
   const corr = (x, y) => { let a = 0, b = 0, c = 0; for (let i = 0; i < x.length; i++) { a += x[i] * y[i]; b += x[i] * x[i]; c += y[i] * y[i]; } return a / Math.sqrt(b * c); };
   const z = new Float32Array(A.NB), w5 = new Float32Array(A.NB).fill(0.5), one = new Float32Array(A.NB).fill(1e-4);
   const d = run({ dir: one, wl: w5, dif: z, gain: 1 }, 3), u = run({ dir: z, wl: w5, dif: one, gain: 1 }, 3);
-  check('worklet: direct sound correlated, diffuse sound decorrelated', corr(d.L, d.R) > 0.99 && Math.abs(corr(u.L, u.R)) < 0.05,
+  check('synth: direct sound correlated, diffuse sound decorrelated', corr(d.L, d.R) > 0.99 && Math.abs(corr(u.L, u.R)) < 0.05,
     `direct ${corr(d.L, d.R).toFixed(3)}, diffuse ${corr(u.L, u.R).toFixed(3)}`);
 }
 
