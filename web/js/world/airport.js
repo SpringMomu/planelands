@@ -188,15 +188,20 @@ void main(){
     col = elev > aParam.z ? vec3(1.0, 0.95, 0.85) : vec3(1.0, 0.05, 0.02);
     inten *= smoothstep(0.2, 0.6, facing);
   } else if (aType > 1.5){
+    // sequenced flasher ("rabbit"): fires twice a second, far to near.  The real flash lasts ~1 ms;
+    // drawn as a 60 ms decaying pulse so it shows on every frame rate (persistence of vision)
     float ph = fract(uTime * 2.0 - aParam.x);
-    inten *= ph < 0.04 ? 4.0 : 0.0;
+    float k = 1.0 - ph / 0.12;
+    inten *= ph < 0.12 ? 7.0 * k * k : 0.0;
   }
   float px = clamp(inten * 900.0 / max(dist, 1.0), 1.6, 26.0) * uPixelRatio;
   gl_PointSize = px;
   gl_Position = projectionMatrix * mv;
   // keep total energy ~ constant as the sprite shrinks to its minimum size
   float energy = inten * 900.0 / max(dist, 1.0) / (px / uPixelRatio);
-  vCol = col * mix(1.2, 30.0, uVis) * clamp(energy, 0.05, 1.0);
+  // the lights burn at the same candela day and night (intensity step 5 by day); the camera exposure
+  // makes them dominate at night.  Day: bright enough to bloom against sunlit ground
+  vCol = col * mix(45.0, 32.0, uVis) * clamp(energy, 0.08, 1.0);
   #include <logdepthbuf_vertex>
 }`;
 const LIGHT_FS = /* glsl */ `
