@@ -167,6 +167,9 @@ class Clicks {
 }
 
 // ------------------------------------------------------------------ DPS character screen (51 x 26)
+// rows 0..23 are clear of the edge-key legends (separator at y 474); page content must end above the
+// fault message row, graphics above y ~446
+const DPS_FAULT_ROW = 23;
 class Dps {
   constructor() { this.cells = []; this.clear(); }
   clear() { this.cells = Array.from({ length: 26 }, () => Array(51).fill(null)); }
@@ -885,7 +888,8 @@ function dpsHeader(scr, d, w, spec, title) {
   scr.put(0, Math.round(25 - title.length / 2), title);
   scr.put(0, 37, `${w.spec.idp} ${gmt}`);
   scr.put(1, 39, met);
-  if (w.m.fault && !w.m.faultAck) scr.put(24, 0, w.m.fault.slice(0, 51), w.m.faultNew() ? 1 : 0);
+  // fault message line: the last row above the edge-key legends (rows 24-25 lie under them, y > 468)
+  if (w.m.fault && !w.m.faultAck) scr.put(DPS_FAULT_ROW, 0, w.m.fault.slice(0, 51), w.m.faultNew() ? 1 : 0);
 }
 const fx = (v, w, dgt = 0, sign = false) => {
   if (!fin(v)) return ' '.repeat(Math.max(0, w - 1)) + '-';
@@ -927,7 +931,7 @@ function drawHorizSit(g, w, d) {
   scr.put(14, 1, `        ${valid ? 'A  A  A' : '-  -  -'}           ${valid ? 'A  A  A' : '-  -  -'}           ${valid && isAL(gnc) ? 'A  A  A' : '-  -  -'}`);
   scr.draw(g);
   // graphic: runway-centred horizontal situation, fixed north-up, 20 NM square
-  const gx0 = 20, gy0 = 302, gw = 472, gh = 150, cx = gx0 + gw / 2, cy = gy0 + gh / 2;
+  const gx0 = 20, gy0 = 302, gw = 472, gh = 140, cx = gx0 + gw / 2, cy = gy0 + gh / 2;   // ends above the fault row
   g.save(); g.beginPath(); g.rect(gx0, gy0, gw, gh); g.clip();
   g.strokeStyle = COL.dpsDim; g.lineWidth = 1; g.strokeRect(gx0 + 0.5, gy0 + 0.5, gw - 1, gh - 1);
   const ppn = gh / 2 / 12;
@@ -976,7 +980,7 @@ function drawVertSit(g, w, d) {
   }
   scr.draw(g);
   // plot
-  const X0 = 46, X1 = 384, Y0 = 52, Y1 = 440;
+  const X0 = 46, X1 = 384, Y0 = 52, Y1 = 412;                 // axis labels end above the fault row
   const xmax = two ? 12 : 60, ymax = two ? 25 : 100;                         // NM, kft
   const X = (r) => X0 + clamp(r / xmax, 0, 1.02) * (X1 - X0);
   const Y = (hk) => Y1 - clamp(hk / ymax, -0.02, 1.02) * (Y1 - Y0);
