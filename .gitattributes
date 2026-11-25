@@ -4,3 +4,4 @@
 *.f32 binary
 *.u8 binary
 *.npz binary
+*.cmd text eol=crlf

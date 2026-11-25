@@ -28,7 +28,9 @@ python server.py                       # http://localhost:8000  (WebSocket: 8765
 
 ```bash
 python tools/build_web.py --serve 8090    # 构建 dist/ 并在本机预览 http://localhost:8090
-tools/deploy_web.sh jp                    # 构建并发布到 jp:/var/www/planelands（nginx: deploy/）
+tools/deploy_web.sh jp                    # 构建并发布到 jp:/var/www/planelands（nginx: deploy/）；Linux / macOS / Git Bash
+tools\deploy_web.cmd jp                   # 同上，Windows cmd / PowerShell（都只需要 Python 3 和 ssh，不需要 rsync）
+python tools/deploy_web.py jp --dry-run   # 只列出要上传的文件；--no-build 直接发布现有 dist/，--keep N 保留版本数
 python server.py  →  http://localhost:8000/?sim=browser    # 开发时：不构建，直接在浏览器里跑仿真（Pyodide 走 CDN）
 ```
 
@@ -36,7 +38,7 @@ python server.py  →  http://localhost:8000/?sim=browser    # 开发时：不�
   - 每次发布是一个以内容哈希命名的目录 `v/<ver>/`（js、css、three.js、小 JSON、`py/sim.zip` 里的 Python 源码和配平表）。
   - 大数据按内容寻址放在 `d/<sha>/`（地形、地表覆盖、天气图），Pyodide 运行时和 wheel 自托管在 `pyodide/<版本>/`。
   - 这三类都设为 `immutable` 长期缓存；只有 `index.html` 和 `version.json` 每次访问都向服务器确认（内容没变时只回一个 304）。
-  - 改了代码再发布，只上传变化的文件，数据没变就不会重新下载。已经打开的页面每 5 分钟检查一次 `version.json`，有新版本会提示刷新。`deploy_web.sh` 最后才切换 `index.html`，保留最近 5 个版本，所以发布前打开的页面不受影响。
+  - 改了代码再发布，只上传变化的文件，数据没变就不会重新下载。已经打开的页面每 5 分钟检查一次 `version.json`，有新版本会提示刷新。`deploy_web.py`（`.sh` / `.cmd` 是它的启动脚本）通过 ssh 传一个 tar 流上传，最后才切换 `index.html`，保留最近 5 个版本，所以发布前打开的页面不受影响。
 - **首次访问**：大约下载 35 MB。地形和天气数据 gzip 后约 10 MB，其中高程图用无损的平面预测 + 字节分组编码（`core/terrain_codec.js`），从 13.3 MB 降到 7.4 MB；Pyodide 加 numpy/scipy/cvxpy/clarabel 约 25 MB。以后都从缓存读。体积云的 3D 噪声不再下载，由页面在 Worker 里生成（`render/cloud_noise.js`，约 1–3 s，和下载同时进行）。Pyodide 在页面打开时就开始加载，和地形、场景构建同时进行；加载完成前先运行运动学预览。
 - **性能**：
   - WebAssembly 里的 Python 大约比原生慢 3 倍。仿真每 tick 约 11 ms（预算 16.7 ms），一次 SCP 规划约 1–3 s（在独立 Worker 里，不卡仿真）。
@@ -158,7 +160,7 @@ python server.py  →  http://localhost:8000/?sim=browser    # 开发时：不�
 
 ```
 server.py              HTTP 静态服务 + WebSocket；实时仿真循环（时间倍率 0.25–8×）
-tools/build_web.py     在线版构建（浏览器内仿真，静态文件，内容哈希缓存）；tools/deploy_web.sh 发布，deploy/ 为 nginx 配置
+tools/build_web.py     在线版构建（浏览器内仿真，静态文件，内容哈希缓存）；tools/deploy_web.py 发布（启动脚本 deploy_web.sh / deploy_web.cmd），deploy/ 为 nginx 配置
 sim/                   飞行仿真（Python，numpy 向量化）
   aero.py              分片 / 部件叠加气动：机翼条带 ×32、4 片升降副翼、体襟翼、垂尾 + 分裂式方向舵/减速板、
                        28 段机身细长体（Munk 项 + 粘性横流）、起落架、减速伞
