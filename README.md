@@ -1194,10 +1194,14 @@ $`J`$ 是完整的惯量张量，包括 $`I_{xz}`$。$`M_0`$ 是在当前舵面�
 | 正下方地面，135 m/s 在 100 m 高掠过，放起落架 | 103 dB | 99 dBA |
 | 塔台，侧向 3 km，155 m/s / 600 m | 56 dB | 49 dBA |
 
-**合成**（`web/js/world/aero_synth.js`，在 AudioWorklet 里运行；不支持时改用 ScriptProcessorNode）：每 43 ms 生成一帧 8192 点的随机相位谱。各频点是独立的复高斯数，
-方差为 $`N f_s G(f)/2`$；$`G`$ 在频带中心之间按对数–对数插值，再逐频带缩放，使每个频带的能量严格等于目标值。
-逆变换后加 Hann 窗，75% 重叠相加。下一帧在当前帧播放期间分约 35 个小步算完，每个 128 样本的音频回调只做 3 步（p99 约 0.09 ms），不会超出回调预算造成爆音。指向性的直达声两声道用同一噪声，按频带给出左右声级差；扩散声两声道各用独立噪声。
-自检在离线运行中核对：50 Hz–12.5 kHz 各频带与模型的偏差在 1.5 dB 以内（实测约 0.5 dB），直达声左右相关系数为 1，扩散声约为 0。
+**合成**（`web/js/world/aero_synth.js`，在 AudioWorklet 里运行；不支持时改用 ScriptProcessorNode）：1/3 倍频程滤波器组。
+每个频带用独立的白高斯噪声，经 6 阶 Butterworth 带通滤波；输入增益按滤波器的实际噪声带宽（$`|H|^2`$ 的积分）设定。
+响的频带的裙边会漏进安静的相邻频带，比如座舱里的共振峰比相邻频带高 18 dB；用泄漏矩阵和非负 Richardson–Lucy 迭代反解各滤波器的功率，使每个 1/3 倍频程内的功率等于模型值。
+增益每 128 个样本做 15 ms 平滑，并在块内逐样本插值。除滤波器本身的群延迟（1 kHz 处几毫秒）外没有别的延迟，声音能紧跟相机和飞行状态，自检中声级变化约 10 ms 后到位。
+两耳按球形人头（半径 8.75 cm）计算：直达声到达远侧耳朵的时间差按 Woodworth 公式 $`(a/c)(\varphi+\sin\varphi)`$ 计算（最大 0.66 ms），
+声级差用 Brown & Duda（1998）的头影滤波器计算，低频几乎为 0，高频可达约 16 dB；以正前方声源为 0 dB 基准。座舱里风挡的直达声随转头改变方向；扩散声两耳各用独立噪声。
+听者是装在相机平台上的麦克风：追随、座舱、俯瞰相机随轨道器一起运动（转视角不算穿过空气的运动），塔台、跑道、掠过相机固定在地面，自由相机按实际移动计算多普勒。
+自检核对：各频带与模型的偏差在统计误差内（平直谱 ≤ 0.4 dB，陡峭的座舱谱 ≤ 1.3 dB），两耳的声级差和时间差与模型一致，直达声两耳完全相关、扩散声不相关，每次音频回调耗时约 0.1–0.5 ms（预算 2.67 ms）。
 
 简化：湍流边界层被当作等效扩散声场来激励舱壁，没有解析它的对流波数结构；风挡处用自由流条件，不算机头上的局部加速，
 Mach 1 以上也不算激波层；Fink 关联式来自常规亚声速运输机，Mach 0.8 以上把功率和 Strouhal 标度固定在 0.8；没有模拟音爆。
@@ -1336,6 +1340,8 @@ deploy/                nginx 配置示例
 17. B. H. Sharp. *Prediction Methods for the Sound Transmission of Building Elements.* Noise Control Engineering, 11(2), 1978.
 18. M. E. Delany, E. N. Bazley. *Acoustical Properties of Fibrous Absorbent Materials.* Applied Acoustics, 3(2), 1970.
 19. J. E. Ffowcs Williams. *The Noise from Turbulence Convected at High Speed.* Phil. Trans. R. Soc. A, 255, 1963.
+20. C. P. Brown, R. O. Duda. *A Structural Model for Binaural Sound Synthesis.* IEEE Trans. Speech and Audio Processing, 6(5), 1998.
+21. R. S. Woodworth. *Experimental Psychology.* Holt, 1938. ——耳间时间差的球形人头公式。
 
 ---
 

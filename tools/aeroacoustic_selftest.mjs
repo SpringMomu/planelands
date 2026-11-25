@@ -106,16 +106,15 @@ const lis = (pos, extra = {}) => ({ t: 0, pos, vel: [0, 0, 0], alt: pos[1], grou
   check('cabin: levels finite', a.spl > 40 && a.spl < 130 && b.spl > 30 && b.spl < 130, `M0.6 ${a.spl.toFixed(1)} dB, M1.5 ${b.spl.toFixed(1)} dB`);
 }
 
-// ---- the spectral synthesiser (AudioWorklet / ScriptProcessor) reproduces a requested spectrum
+// ---- the synthesiser (AudioWorklet / ScriptProcessor): band levels, two ears, latency, real-time cost
 {
-  const { SpectralNoise } = await import('../web/js/world/aero_synth.js');
-  const run = (msg, seconds) => {
-    const p = new SpectralNoise(48000);
-    p.message({ bands: Float64Array.from(A.FC) });
-    p.message(msg);
-    const n = Math.floor(seconds * 48000 / 128) * 128, L = new Float32Array(n), R = new Float32Array(n);
+  const S = await import('../web/js/world/aero_synth.js');
+  const fs = 48000;
+  const make = (msg) => { const p = new S.SpectralNoise(fs); p.message({ bands: Float64Array.from(A.FC) }); if (msg) p.message(msg); return p; };
+  const run = (p, seconds) => {
+    const n = Math.floor(seconds * fs / 128) * 128, L = new Float32Array(n), R = new Float32Array(n);
     for (let o = 0; o < n; o += 128) p.render(L.subarray(o, o + 128), R.subarray(o, o + 128));
-    return { L: L.subarray(8192), R: R.subarray(8192) };          // skip the start-up
+    return { L: L.subarray(fs / 2), R: R.subarray(fs / 2) };      // skip the filters' start-up
   };
   // 1/3-octave analysis: averaged Hann periodograms
   const fft = (re, im) => {
@@ -140,29 +139,72 @@ const lis = (pos, extra = {}) => ({ t: 0, pos, vel: [0, 0, 0], alt: pos[1], grou
       for (let i = 0; i < n; i++) re[i] = x[o + i] * w[i];
       fft(re, im);
       for (let k = 1; k < n / 2; k++) {
-        const f = k * 48000 / n, b = Math.round(10 * Math.log10(f / A.FC[0]));
-        if (b >= 0 && b < A.NB) out[b] += 2 * (re[k] * re[k] + im[k] * im[k]) / (n * wss);   // one-sided power per bin
+        const f = k * fs / n, b = Math.round(10 * Math.log10(f / A.FC[0]));
+        if (b >= 0 && b < A.NB) out[b] += 2 * (re[k] * re[k] + im[k] * im[k]) / (n * wss);
       }
       segs++;
     }
     return out.map((v) => v / segs);
   };
-  // a smooth spectrum (cockpit, final approach) as direct + diffuse parts
-  const ac = flight({ V: 135, alt: 100, gear: 1, surf: { speedbrake: 40 } });
-  const o = ac.listen({ cabin: true });
-  const g = 0.01;
-  const tgt = Array.from(o.dir, (v, i) => (v + o.dif[i]) * g * g);
-  const { L, R } = run({ dir: Float32Array.from(o.dir), wl: Float32Array.from(o.wl), dif: Float32Array.from(o.dif), gain: g }, 12);
-  const got = bandsOf(L);
-  let worst = 0, wb = 0;
-  for (let i = 4; i < 29; i++) { const e = Math.abs(10 * Math.log10(got[i] / tgt[i])); if (e > worst) { worst = e; wb = i; } }
-  const ms = L.reduce((s, v) => s + v * v, 0) / L.length, msT = sum(tgt);
-  check('synth: band levels follow the model (50 Hz - 12.5 kHz)', worst < 1.5, `worst ${worst.toFixed(2)} dB at ${A.FC[wb].toFixed(0)} Hz; overall ${(10 * Math.log10(ms / msT)).toFixed(2)} dB`);
-  const corr = (x, y) => { let a = 0, b = 0, c = 0; for (let i = 0; i < x.length; i++) { a += x[i] * y[i]; b += x[i] * x[i]; c += y[i] * y[i]; } return a / Math.sqrt(b * c); };
-  const z = new Float32Array(A.NB), w5 = new Float32Array(A.NB).fill(0.5), one = new Float32Array(A.NB).fill(1e-4);
-  const d = run({ dir: one, wl: w5, dif: z, gain: 1 }, 3), u = run({ dir: z, wl: w5, dif: one, gain: 1 }, 3);
-  check('synth: direct sound correlated, diffuse sound decorrelated', corr(d.L, d.R) > 0.99 && Math.abs(corr(u.L, u.R)) < 0.05,
-    `direct ${corr(d.L, d.R).toFixed(3)}, diffuse ${corr(u.L, u.R).toFixed(3)}`);
+  const ms = (x) => x.reduce((s, v) => s + v * v, 0) / x.length;
+  const z = new Float32Array(A.NB), one = new Float32Array(A.NB).fill(1e-4);
+  // levels: a flat spectrum, and the steep, resonant cabin spectrum
+  {
+    // (estimates over T seconds scatter by ~4.3 / sqrt(B T) dB: ~0.3 dB at 63 Hz in 20 s)
+    const flat = bandsOf(run(make({ dir: one, lat: z, dif: z, gain: 1 }), 20).L);
+    let wf = 0; for (let i = 8; i < 30; i++) wf = Math.max(wf, Math.abs(10 * Math.log10(flat[i] / 1e-4)));
+    const ac = flight({ V: 135, alt: 100, gear: 1, surf: { speedbrake: 40 } });
+    const o = ac.listen({ cabin: true });
+    const g = 0.01, tgt = Array.from(o.dir, (v, i) => (v + o.dif[i]) * g * g);
+    const { L } = run(make({ dir: Float32Array.from(o.dir), lat: z, dif: Float32Array.from(o.dif), gain: g }), 12);
+    const got = bandsOf(L);
+    let worst = 0, wb = 0;
+    for (let i = 4; i < 29; i++) { const e = Math.abs(10 * Math.log10(got[i] / tgt[i])); if (e > worst) { worst = e; wb = i; } }
+    check('synth: band levels follow the model (flat 63 Hz-16 kHz; cabin 50 Hz-12.5 kHz)', wf < 0.75 && worst < 1.5,
+      `flat worst ${wf.toFixed(2)} dB; cabin worst ${worst.toFixed(2)} dB at ${A.FC[wb].toFixed(0)} Hz, overall ${(10 * Math.log10(ms(L) / sum(tgt))).toFixed(2)} dB`);
+  }
+  const corr = (x, y, lag = 0) => { let a = 0, b = 0, c = 0; for (let i = 64; i < x.length - 64; i++) { a += x[i] * y[i + lag]; b += x[i] * x[i]; c += y[i + lag] * y[i + lag]; } return a / Math.sqrt(b * c); };
+  {
+    const d = run(make({ dir: one, lat: z, dif: z, gain: 1 }), 3), u = run(make({ dir: z, lat: z, dif: one, gain: 1 }), 3);
+    check('synth: frontal direct sound identical at both ears, diffuse sound decorrelated', corr(d.L, d.R) > 0.999 && Math.abs(corr(u.L, u.R)) < 0.03,
+      `direct ${corr(d.L, d.R).toFixed(4)}, diffuse ${corr(u.L, u.R).toFixed(3)}`);
+  }
+  // a source on the right: level difference grows with frequency, the left ear hears it later
+  {
+    const right = new Float32Array(A.NB).fill(1);
+    const r = run(make({ dir: one, lat: right, dif: z, gain: 1 }), 8);
+    const bl = bandsOf(r.L), br = bandsOf(r.R);
+    const ild = (i) => 10 * Math.log10(br[i] / bl[i]);
+    const want = (i) => 10 * Math.log10(S.headShadow2(A.FC[i], 0) / S.headShadow2(A.FC[i], Math.PI));
+    let bestLag = 0, best = -1;
+    for (let lag = 0; lag < 50; lag++) { const c = corr(r.R, r.L, lag); if (c > best) { best = c; bestLag = lag; } }
+    const itd = 0.0875 / 343 * (Math.PI / 2 + 1) * fs;
+    check('synth: source on the right - head-shadow level difference, Woodworth time difference',
+      Math.abs(ild(10) - want(10)) < 1 && Math.abs(ild(26) - want(26)) < 1.5 && ild(10) < 3 && ild(26) > 12 && Math.abs(bestLag - itd) <= 1,
+      `ILD ${ild(10).toFixed(1)} dB at 200 Hz, ${ild(26).toFixed(1)} dB at 8 kHz (model ${want(10).toFixed(1)} / ${want(26).toFixed(1)}); ITD ${bestLag} samples (${(bestLag / fs * 1000).toFixed(2)} ms, Woodworth ${(itd / fs * 1000).toFixed(2)} ms)`);
+  }
+  // latency: a step of the level, time until the 1 kHz band is within 3 dB of the new level
+  {
+    const p = make({ dir: z, lat: z, dif: z, gain: 1 });
+    run(p, 0.6);
+    const b17 = new Float32Array(A.NB); b17[17] = 1e-2;
+    p.message({ dir: b17, lat: z, dif: z, gain: 1 });
+    const n = fs, L = new Float32Array(n), R = new Float32Array(n);
+    for (let o = 0; o < n; o += 128) p.render(L.subarray(o, o + 128), R.subarray(o, o + 128));
+    const win = 240;                                      // 5 ms rms windows
+    let t3 = -1;
+    for (let o = 0; o + win <= n; o += win / 4) {
+      let e = 0; for (let i = o; i < o + win; i++) e += L[i] * L[i];
+      if (e / win > 1e-2 / 2) { t3 = (o + win / 2) / fs * 1000; break; }
+    }
+    // real-time cost per 128-sample render call, all bands active (cabin spectrum + direction)
+    const q = make({ dir: one, lat: new Float32Array(A.NB).fill(0.4), dif: one, gain: 1 });
+    const a = new Float32Array(128), b = new Float32Array(128), ts = [];
+    for (let i = 0; i < 6000; i++) { const t0 = performance.now(); q.render(a, b); ts.push(performance.now() - t0); }
+    const so = ts.slice(500).sort((x, y) => x - y), pq = (x) => so[Math.floor(x * (so.length - 1))];
+    check('synth: follows a change within ~30 ms; steady cost per render call', t3 > 0 && t3 < 35 && pq(0.999) < 1.0,
+      `1 kHz band within 3 dB after ${t3.toFixed(1)} ms; per 128 samples p50 ${pq(0.5).toFixed(3)} ms, p99.9 ${pq(0.999).toFixed(3)} ms (budget 2.67 ms)`);
+  }
 }
 
 // ---- levels in typical conditions (information)

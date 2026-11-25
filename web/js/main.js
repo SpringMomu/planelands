@@ -462,7 +462,7 @@ async function main() {
   const pos3 = new THREE.Vector3(), vel3 = new THREE.Vector3(), quat3 = new THREE.Quaternion();
   const tmpQ = new THREE.Quaternion(), tmpV = new THREE.Vector3(), tmpV2 = new THREE.Vector3();
   const wind3 = new THREE.Vector3(), vAir3 = new THREE.Vector3(), attachW = new THREE.Vector3();
-  const aeroAx = { f: new THREE.Vector3(), u: new THREE.Vector3(), r: new THREE.Vector3(), cr: new THREE.Vector3() };
+  const aeroAx = { f: new THREE.Vector3(), u: new THREE.Vector3(), r: new THREE.Vector3(), cr: new THREE.Vector3(), zero: new THREE.Vector3() };
   const sunRad = new THREE.Color(), ambC = new THREE.Color();
   const contacts = [];
   const groundY = (x, z) => enuToThree(x, -z, terrain.surfaceAt(x, -z), tmpV).y;
@@ -642,7 +642,12 @@ async function main() {
         alt: st.pos[2], agl, surf: st.surf, gear: st.gear ? st.gear.pos : 0 });
       const ce = threeToEnu(camera.position);
       aeroAx.cr.setFromMatrixColumn(camera.matrixWorld, 0);
-      aero.update({ t: st.t || 0, pos: camera.position, vel: weather.camVel, right: aeroAx.cr, alt: ce[2],
+      // the listener is a microphone on the camera's platform: the chase / cockpit / overview cameras ride
+      // with the orbiter (turning or orbiting the view is not motion through the air), tower, runway and
+      // fly-by cameras stand on the ground, the free camera flies where it is moved
+      const m = rig.mode;
+      const lv = m === 'free' ? weather.camVel : (m === 'chase' || m === 'cockpit' || m === 'overview') ? vel3 : aeroAx.zero;
+      aero.update({ t: st.t || 0, pos: camera.position, vel: lv, right: aeroAx.cr, alt: ce[2],
         groundAlt: terrain.surfaceAt(ce[0], ce[1]), cabin: inCockpit, rh: 60 + 35 * Math.min(1, weather.rainCam),
         mute: !!st.paused });
     }

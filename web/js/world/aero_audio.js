@@ -1,6 +1,6 @@
 // The airflow sound of the gliding orbiter (WebAudio): web/js/world/aeroacoustics.js computes the
 // pressure spectrum at the listener (the camera, or the flight deck) from the flight state every
-// frame; the spectral synthesiser (aero_synth.js) turns it into sound - on the audio thread
+// frame; the filter-bank synthesiser (aero_synth.js) turns it into sound - on the audio thread
 // (aero_worklet.js), or through a ScriptProcessorNode where AudioWorklet is unavailable (pages opened over
 // plain http from another machine: AudioWorklet exists only in secure contexts).  Levels are physical: 1 Pa (94 dB SPL) at
 // the listener plays at FS_DB dBFS, so the cabin at final approach, a low fly-by and the tower keep
@@ -21,8 +21,7 @@ export class AeroAudio {
     this.enabled = true;
     this.spl = 0;                          // overall level at the listener (dB re 20 uPa), for display / debugging
     this.delay = 0;
-    this._dir = new Float32Array(NB); this._wl = new Float32Array(NB); this._dif = new Float32Array(NB);
-    this._sent = 0;
+    this._dir = new Float32Array(NB); this._lat = new Float32Array(NB); this._dif = new Float32Array(NB);
   }
 
   /** start the worklet on the audio context (after the user gesture that unlocked it) */
@@ -34,7 +33,7 @@ export class AeroAudio {
       try {
         const synth = new SpectralNoise(ctx.sampleRate);
         synth.message({ bands: Float64Array.from(FC) });
-        const sp = ctx.createScriptProcessor(16384, 1, 2);      // large: rides out main-thread stalls
+        const sp = ctx.createScriptProcessor(4096, 1, 2);       // ~85 ms: rides out short stalls, little lag
         sp.onaudioprocess = (e) => synth.render(e.outputBuffer.getChannelData(0), e.outputBuffer.getChannelData(1));
         sp.connect(dest);
         this.node = { port: { postMessage: (m) => synth.message(m) }, sp };
@@ -70,15 +69,11 @@ export class AeroAudio {
     });
     this.spl = o.spl; this.delay = o.delay;
     if (!this.node) return;
-    // the synthesiser takes a new spectrum every 43 ms: send at about that rate, not every frame
-    const now = performance.now();
-    if (now - this._sent < 40) return;
-    this._sent = now;
     const on = this.enabled && !L.mute;
     for (let i = 0; i < NB; i++) {
-      this._dir[i] = on ? o.dir[i] : 0; this._dif[i] = on ? o.dif[i] : 0; this._wl[i] = o.wl[i];
+      this._dir[i] = on ? o.dir[i] : 0; this._dif[i] = on ? o.dif[i] : 0; this._lat[i] = o.lat[i];
     }
-    this.node.port.postMessage({ dir: this._dir, wl: this._wl, dif: this._dif, gain: GAIN });
+    this.node.port.postMessage({ dir: this._dir, lat: this._lat, dif: this._dif, gain: GAIN });
   }
 
   reset() { this.model.reset(); }

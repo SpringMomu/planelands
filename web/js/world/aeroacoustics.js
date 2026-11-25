@@ -450,7 +450,7 @@ export class AeroAcoustics {
     this._tau = { key: '', wall: new Float64Array(NB), win: new Float64Array(NB) };
     this._b = new Float64Array(NB); this._b2 = new Float64Array(NB); this._abs = new Float64Array(NB); this._gnd = new Float64Array(NB);
     this._amp = new Float64Array(NB); this._ff = new Float64Array(NB); this._pr = new Float64Array(NB);
-    this.out = { dir: new Float64Array(NB), wl: new Float64Array(NB), dif: new Float64Array(NB), spl: 0, delay: 0, arrivals: 0 };
+    this.out = { dir: new Float64Array(NB), lat: new Float64Array(NB), dif: new Float64Array(NB), spl: 0, delay: 0, arrivals: 0 };
   }
 
   reset() { this.hist.length = 0; }
@@ -507,15 +507,16 @@ export class AeroAcoustics {
   /**
    * Sound at the listener.  L: { t (sim s), pos, vel (world, m/s), alt (m MSL), groundAlt (terrain under
    * the listener, m MSL), right (unit), cabin (bool: in the flight deck), rh (% at the ground) }.
-   * Returns this.out: dir (band Pa^2 of the directional sound), wl (its share on the left, 0..1),
+   * Returns this.out: dir (band Pa^2 of the directional sound), lat (its arrival direction across the
+   * listener: sin(azimuth), -1 left .. +1 right, energy-weighted per band),
    * dif (band Pa^2 of the diffuse / decorrelated sound), spl (overall dB re 20 uPa), delay (s), arrivals
    */
   listen(L) {
     const o = this.out;
-    o.dir.fill(0); o.dif.fill(0); o.wl.fill(0.5); o.spl = 0; o.delay = 0; o.arrivals = 0;
+    o.dir.fill(0); o.dif.fill(0); o.lat.fill(0); o.spl = 0; o.delay = 0; o.arrivals = 0;
     const H = this.hist;
     if (!H.length) return o;
-    if (L.cabin) this._cabin(H[H.length - 1], o);
+    if (L.cabin) this._cabin(H[H.length - 1], o, L.right);
     else this._external(L, o);
     let p2 = 0;
     for (let i = 0; i < NB; i++) p2 += o.dir[i] + o.dif[i];
@@ -558,7 +559,7 @@ export class AeroAcoustics {
   }
 
   // ---- in the flight deck
-  _cabin(s, o) {
+  _cabin(s, o, right) {
     const atm = atmosphere(s.alt), ss = this._srcState(s, atm), U = ss.src.V;
     if (U < 3) return;
     const { wall: tw, win: tg } = this.hullTransmission(atm);
@@ -603,6 +604,8 @@ export class AeroAcoustics {
       o.dif[i] = 4 * zc * (Wtbl + Wsrc) / R;
       o.dir[i] = zc * tg[i] * pg[i] / (8 * zo) * gd;                     // forward windscreen next to the eye
     }
+    // the windscreen is ahead of the crew: turning the head moves it to the side
+    if (right) o.lat.fill(Math.max(-1, Math.min(1, dot(s.fwd, right))));
   }
 
   // ---- outside
@@ -646,11 +649,10 @@ export class AeroAcoustics {
         const dopL = Math.max(0.05, 1 - dot(dirs.n, VL) / cP);
         finkComponent(comp, ss.src, dirs, rc, dopL, s.gear, s.surf, pr, this._amp);
       }
-      // stereo: equal-power pan from the arrival direction (the sound comes from -d)
-      const pan = Math.max(-1, Math.min(1, -(d[0] * L.right[0] + d[1] * L.right[1] + d[2] * L.right[2]) / r));
-      const gl = (1 - pan) / 2;
-      for (let i = 0; i < NB; i++) { o.dir[i] += pr[i]; wl[i] += pr[i] * gl; }
+      // arrival direction across the listener (the sound comes from -d)
+      const lat = Math.max(-1, Math.min(1, -(d[0] * L.right[0] + d[1] * L.right[1] + d[2] * L.right[2]) / r));
+      for (let i = 0; i < NB; i++) { o.dir[i] += pr[i]; wl[i] += pr[i] * lat; }
     }
-    for (let i = 0; i < NB; i++) o.wl[i] = o.dir[i] > 0 ? wl[i] / o.dir[i] : 0.5;
+    for (let i = 0; i < NB; i++) o.lat[i] = o.dir[i] > 0 ? wl[i] / o.dir[i] : 0;
   }
 }
