@@ -126,7 +126,7 @@ void main(){
         vec3 Ls = sunCol * sc * powder;
         vec3 amb = (irrUp * (0.25 + 0.75 * smoothstep(0.0, 1.0, hf)) + irrDn * 0.35 * (1.0 - hf)) * (uAmbient / (2.0 * PI));
         // lightning inside / near the cloud lights it from within (scattered, softened by the cloud depth)
-        vec3 Lf = flashLight(p) * (0.35 + 0.65 * exp(-od * 0.25));
+        vec3 Lf = flashLightOcc(p);         // through the cloud between the flash and p
         vec3 S = (Ls + amb + Lf) * sigma;
         float Ts = exp(-sigma * st);
         cCol += cT * (S - S * Ts) / sigma;
@@ -177,7 +177,7 @@ void main(){
         float covS = cloudCoverageAt(sampleWeather(q));
         float covU = cloudCoverageAt(sampleWeather(p));
         vec3 sunC = uSunIntensity * sunTransmittance(p, uSunDir) * exp(-covS * 5.0 * uCloudDensity) * phR;
-        vec3 S = (sunC + ambR * mix(1.0, 0.28, covU) + flashLight(p) * 0.45) * vec3(0.86, 0.9, 0.97) * sigma;
+        vec3 S = (sunC + ambR * mix(1.0, 0.28, covU) + flashLightOcc(p) * 0.45) * vec3(0.86, 0.9, 0.97) * sigma;
         float Ts = exp(-sigma * dt);
         rCol += rT * (S - S * Ts) / sigma;
         float dT = rT * (1.0 - Ts);

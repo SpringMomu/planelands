@@ -3,7 +3,7 @@ import * as THREE from 'three';
 import { COMMON, ATMOSPHERE, SKYVIEW, CLOUD_COMMON } from './glsl.js';
 import { FullscreenPass, makeRT } from './pass.js';
 
-const COMPOSITE_FS = COMMON + ATMOSPHERE + SKYVIEW + /* glsl */ `
+const COMPOSITE_FS = COMMON + ATMOSPHERE + SKYVIEW + CLOUD_COMMON + /* glsl */ `
 uniform sampler2D uScene;
 uniform sampler2D uDepth;
 uniform sampler2D uCloud;
@@ -17,7 +17,6 @@ uniform float uLogFar;
 uniform float uTime;
 uniform float uCirrus;
 uniform float uCirrusAlt;
-uniform vec2 uWindOffset;
 uniform float uStars;
 uniform float uCloudsOn;
 uniform float uAPSteps;
@@ -25,13 +24,14 @@ uniform sampler2D uSmoke;
 uniform float uSmokeOn;
 uniform sampler2D uRainLayer;
 uniform float uRainOn;
-uniform float uCloudBase;
 uniform mat4 uViewProj;
 uniform float uRainNow;       // precipitation at the camera (ripples on nearby water)
 uniform float uRainTime;
 uniform float uOvercast;
-uniform vec4 uFlash;
-uniform vec3 uFlashCol;
+uniform sampler2D uIrrLUT;
+uniform float uCloudExt;       // = the cloud marcher's extinction / ambient (synced from Clouds)
+uniform float uCloudAmbient;
+uniform float uFlashVis;       // fraction of the flash light reaching the camera (clouds in between; weather.js)
 vec3 rayDir(vec2 uv){
   vec4 v = uInvProj * vec4(uv * 2.0 - 1.0, 1.0, 1.0);
   return normalize((uCamWorld * vec4(v.xyz / v.w, 0.0)).xyz);
@@ -76,6 +76,55 @@ vec2 rippleGrad(vec2 x, float t){
     }
   }
   return g * 0.35;
+}
+// clouds seen from the surface point P in the reflected direction R: (in-scattered radiance,
+// transmittance).  Evaluated from the cloud field itself, so the reflection does not depend on what
+// happens to be on screen: the cloud buffer only covers directions inside the view, and taking clouds
+// from it left a camera-fixed, hard-edged region (the screen edges / anything blocking the sky,
+// mirrored onto the ground) clear-sky bright next to the cloud-darkened rest.
+vec4 reflClouds(vec3 P, vec3 R){
+  if (uCloudsOn < 0.5 || uCloudCoverage <= 0.0) return vec4(0.0, 0.0, 0.0, 1.0);
+  vec3 C = vec3(0.0, -R_GROUND, 0.0);
+  vec3 up = normalize(P - C);
+  float h = length(P - C) - R_GROUND;
+  float b0 = uCloudBase, b1 = uCloudBase + uCloudThick;
+  if (h >= b1) return vec4(0.0, 0.0, 0.0, 1.0);
+  float ru = max(dot(R, up), 0.02);
+  float t0 = max((b0 - h) / ru, 0.0);
+  float t1 = min((b1 - h) / ru, t0 + 25000.0);
+  float fade = 1.0 - smoothstep(77000.0, 140000.0, t0);        // the marcher's distance fade
+  if (fade <= 0.0) return vec4(0.0, 0.0, 0.0, 1.0);
+  const int N = 6;
+  float dt = (t1 - t0) / float(N);
+  float od = 0.0;
+  for (int i = 0; i < N; i++){
+    vec3 q = P + R * (t0 + (float(i) + 0.5) * dt);
+    od += cloudDensity(q, cloudHeightFrac(q), false) * dt;
+  }
+  od *= uCloudExt * fade;
+  float T = exp(-od);
+  if (T > 0.999) return vec4(0.0, 0.0, 0.0, 1.0);
+  // light at the visible (lower) part of the clouds, as in the marcher: sky ambient near the base,
+  // plus the sunlight that gets through the layer above it
+  vec3 qe = P + R * (t0 + min(dt, 300.0));
+  float hf = cloudHeightFrac(qe);
+  vec3 irrUp = texture(uIrrLUT, vec2(0.5, 1.0 - 0.5 / 16.0)).rgb * uSunIntensity;
+  vec3 irrDn = texture(uIrrLUT, vec2(0.5, 0.5 / 16.0)).rgb * uSunIntensity;
+  vec3 amb = (irrUp * (0.25 + 0.75 * hf) + irrDn * 0.35 * (1.0 - hf)) * (uCloudAmbient / (2.0 * PI));
+  float odS = 0.0;
+  if (uSunDir.y > 0.0){
+    float ls = uCloudThick * 0.12, lt = ls * 0.5;
+    for (int j = 0; j < 3; j++){
+      vec3 q = qe + uSunDir * lt;
+      odS += cloudDensity(q, cloudHeightFrac(q), false) * ls;
+      ls *= 1.8; lt += ls;
+    }
+  }
+  float cosT = dot(R, uSunDir);
+  float ph = mix(hg(cosT, 0.82), hg(cosT, -0.22), 0.28);
+  vec3 sunC = uSunIntensity * sunTransmittance(qe, uSunDir) * (exp(-odS * uCloudExt) * ph + exp(-odS * uCloudExt * 0.12) * 0.06);
+  vec3 Lc = amb + sunC + flashLightOcc(qe) * 0.5;
+  return vec4(Lc * (1.0 - T), T);
 }
 // mirror reflection on wet pavement / puddles: screen-space march for the scene, sky + clouds otherwise.
 // returns (reflected radiance, Fresnel)
@@ -127,14 +176,8 @@ vec4 wetReflect(vec3 P, vec3 rd, float dist, bool doSSR){
   }
   vec3 sky = skyRadiance(R);
   sky = mix(sky, vec3(luma(sky)) * 0.5, uOvercast);
-  vec4 cs = uViewProj * vec4(uCamPos + R * 1e5, 1.0);
-  if (cs.w > 0.0){
-    vec2 su = cs.xy / cs.w * 0.5 + 0.5;
-    if (su.x > 0.0 && su.y > 0.0 && su.x < 1.0 && su.y < 1.0 && texture(uDepth, su).r >= 0.999999){
-      vec4 cl = cloudUpsample(su, 1e9);
-      sky = sky * cl.a + cl.rgb;
-    }
-  }
+  vec4 rc = reflClouds(P, R);
+  sky = sky * rc.a + rc.rgb;
   return vec4(mix(sky, hitCol, hitW), F);
 }
 float cirrusDensity(vec2 p){
@@ -185,7 +228,7 @@ void main(){
       vec3 fd = uFlash.xyz - uCamPos;
       float fl = length(fd);
       float ca = max(dot(rd, fd / fl), 0.0);
-      col += uFlashCol * uFlash.w * (0.003 * pow(ca, 8.0) + 0.0005) / (1.0 + fl * fl / 4e8);
+      col += uFlashCol * uFlash.w * uFlashVis * (0.003 * pow(ca, 8.0) + 0.0005) / (1.0 + fl * fl / 4e8);
     }
   } else {
     vec4 sc = texture(uScene, uv);
@@ -327,6 +370,7 @@ export class Post {
       uCirrus: { value: 0.6 }, uCirrusAlt: { value: 9800 }, uStars: { value: 1 }, uCloudsOn: { value: 1 },
       uAPSteps: { value: 14 }, uSmoke: { value: null }, uSmokeOn: { value: 0 }, uRainLayer: { value: null }, uRainOn: { value: 0 },
       uViewProj: { value: new THREE.Matrix4() }, uRainNow: { value: 0 }, uRainTime: { value: 0 },
+      uCloudExt: { value: 0.045 }, uCloudAmbient: { value: 1.0 },
     };
     this.composite = new FullscreenPass(COMPOSITE_FS, { ...uniforms, ...this.cu });
     this.bloomU = {
@@ -375,6 +419,7 @@ export class Post {
     cu.uCloud.value = clouds.texture;
     cu.uCloudDepth.value = clouds.depthTexture;
     cu.uCloudRes.value.set(clouds.rtMarch.width, clouds.rtMarch.height);
+    if (clouds.cu) { cu.uCloudExt.value = clouds.cu.uCloudExt.value; cu.uCloudAmbient.value = clouds.cu.uAmbient.value; }
     cu.uInvProj.value.copy(camera.projectionMatrixInverse);
     cu.uCamWorld.value.copy(camera.matrixWorld);
     cu.uCamPos.value.copy(camera.position);

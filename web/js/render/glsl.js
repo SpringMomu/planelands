@@ -312,4 +312,31 @@ float cloudShadow(vec3 p, vec3 sunDir){
   }
   return mix(1.0, exp(-od * 0.0018), uCloudShadowStrength);
 }
+// Lightning light through the cloud field: fraction of the flash reaching p.  Optical depth along the
+// straight line flash -> p (5 shape-only taps; extinction = the cloud marcher's uCloudExt default),
+// then direct transmission plus the multiply-scattered (diffuse) part of a two-stream slab,
+// 1 / (1 + 3/4 (1 - g) tau) with g ~ 0.85: the base of a cloud lit from below stays bright, the top
+// of a thick deck above a flash only glows faintly - seen from above, a flash deep in a cumulonimbus
+// is a dim diffuse glow, not a searchlight.
+#define FLASH_EXT 0.045
+float flashTransfer(vec3 p){
+  vec3 a = uFlash.xyz, d = p - a;
+  float L = length(d);
+  if (L < 1.0) return 1.0;
+  float od = 0.0;
+  for (int i = 0; i < 5; i++){
+    vec3 q = a + d * ((float(i) + 0.5) / 5.0);
+    float hf = cloudHeightFrac(q);
+    if (hf > 0.0 && hf < 1.0) od += cloudDensity(q, hf, false);
+  }
+  od *= L / 5.0 * FLASH_EXT;
+  float Td = exp(-od);
+  return Td + (1.0 - Td) * 0.6 / (1.0 + 0.11 * od);
+}
+vec3 flashLightOcc(vec3 p){
+  if (uFlash.w <= 0.0) return vec3(0.0);
+  vec3 L = flashLight(p);
+  if (max(L.r, max(L.g, L.b)) < 1e-4 * uFlash.w) return L;
+  return L * flashTransfer(p);
+}
 `;

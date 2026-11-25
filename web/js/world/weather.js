@@ -9,6 +9,14 @@ const WEATHER_SCALE = 1 / 52000;
 const R_EARTH = 6371000;
 const ss = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
 const sat = (x) => Math.min(1, Math.max(0, x));
+// vertical density profile of the cloud types (heightProfile() in glsl.js)
+function heightProfile(h, t) {
+  const strat = ss(0, 0.06, h) * (1 - ss(0.18, 0.42, h));
+  const cumu = ss(0, 0.14, h) * (1 - ss(0.42, 0.92, h));
+  const cb = ss(0, 0.08, h) * (1 - ss(0.8, 1, h));
+  return t < 0.5 ? strat + (cumu - strat) * t * 2 : cumu + (cb - cumu) * (t * 2 - 1);
+}
+const FLASH_EXT = 0.045;     // cloud extinction per unit density (clouds.js uCloudExt)
 
 export class Weather {
   constructor({ U, weatherData, scene }) {
@@ -110,6 +118,31 @@ export class Weather {
     return { turb, gust, draft, level: Math.max(col.cb * (hf < 1.1 ? 1 : 0), turb) };
   }
 
+  /** mean cloud density at a point (the shader's density field averaged over its noise) */
+  cloudDensityAvg(x, y, z) {
+    const U = this.U, base = U.uCloudBase.value, thick = U.uCloudThick.value;
+    const hf = (y + (x * x + z * z) / (2 * R_EARTH) - base) / thick;
+    if (hf <= 0 || hf >= 1) return 0;
+    const col = this.column(x, z);
+    if (col.cov <= 0.001) return 0;
+    const hp = heightProfile(hf, col.ctype);
+    return col.cov * sat((0.65 * hp - (1 - col.cov)) / col.cov) * Math.min(1.5, U.uCloudDensity.value);
+  }
+
+  /** fraction of a flash at `a` reaching `b` through the clouds (flashTransfer() in glsl.js) */
+  flashTransfer(a, bx, by, bz) {
+    const N = 16, dx = bx - a.x, dy = by - a.y, dz = bz - a.z;
+    const L = Math.hypot(dx, dy, dz);
+    let od = 0;
+    for (let i = 0; i < N; i++) {
+      const f = (i + 0.5) / N;
+      od += this.cloudDensityAvg(a.x + dx * f, a.y + dy * f, a.z + dz * f);
+    }
+    od *= L / N * FLASH_EXT;
+    const Td = Math.exp(-od);
+    return Td + (1 - Td) * 0.6 / (1 + 0.11 * od);
+  }
+
   /** a cloud-to-ground strike a few km in front of the camera (demo button) */
   strikeNow(camera, groundY) {
     const U = this.U;
@@ -121,7 +154,7 @@ export class Weather {
     const d = 2500 + Math.random() * 3500, side = (Math.random() - 0.5) * 2500;
     const x = camera.position.x + f.x * d - f.z * side, z = camera.position.z + f.z * d + f.x * side;
     const ev = this.lightning.spawn({ type: 'cg', pos: new THREE.Vector3(x, 0, z), groundY: groundY(x, z), base: U.uCloudBase.value, thick: U.uCloudThick.value, camPos: camera.position });
-    this.audio.thunder(ev.dist, 1, true);
+    this.audio.thunder(ev);
   }
 
   /**
@@ -181,8 +214,14 @@ export class Weather {
     } else this.wet = S.wet;
     U.uWet.value = this.wet;
 
+    // listener for the thunder: the camera (moving, possibly in the cockpit)
+    this._right = this._right || new THREE.Vector3();
+    this._right.setFromMatrixColumn(c.camera.matrixWorld, 0);
+    this.audio.setListener({ pos: cp, vel: this.camVel, groundY: c.groundYCam, right: this._right, inCockpit: !!c.inCockpit });
+
     // lightning
     const rate = S.rain > 0 ? S.lightning * 0.45 : 0;
+    const gY = c.groundYCam;
     const fl = this.lightning.update(dtSim, {
       rate, camPos: cp, base, thick, groundY: c.groundY,
       findSite: () => {
@@ -193,10 +232,25 @@ export class Weather {
         }
         return null;
       },
-      onStrike: (ev) => this.audio.thunder(ev.dist, ev.type === 'cg' ? 1 : 0.6, ev.type === 'cg'),
+      onStrike: (ev) => this.audio.thunder(ev),
+      // the flash light reaching the camera (lights the objects around it: hemisphere light, sky glow)
+      // and the ground below it, through whatever cloud lies in between - from above a thick deck a
+      // flash inside / below it is only a faint diffuse glow of the cloud tops
+      vis: (ev) => {
+        const f = ev.flashPos;
+        if (!ev._vis || ev._visT === undefined || Math.abs(ev.t - ev._visT) > 0.05) {
+          ev._vis = {
+            cam: this.flashTransfer(f, cp.x, cp.y, cp.z), dCam: f.distanceTo(cp),
+            gnd: this.flashTransfer(f, cp.x, gY + 2, cp.z), dGnd: Math.hypot(f.x - cp.x, f.y - gY, f.z - cp.z),
+          };
+          ev._visT = ev.t;
+        }
+        return ev._vis;
+      },
     });
     if (fl.pos) U.uFlash.value.set(fl.pos.x, fl.pos.y, fl.pos.z, fl.I); else U.uFlash.value.w = 0;
-    U.uFlashAmb.value = fl.amb;
+    U.uFlashAmb.value = fl.ambG;
+    U.uFlashVis.value = fl.vis;
     this.hemi.intensity = fl.amb;
     this.flashActive = fl.I > 1;
 

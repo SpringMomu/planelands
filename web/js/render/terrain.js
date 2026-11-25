@@ -498,7 +498,7 @@ void main(){
     color += vec3(1.0, 0.62, 0.30) * lights * flick * uNight * 0.035 * (1.0 + 2.0 * step(0.97, hash12(floor(en / 15.0))));
   }
   // lightning
-  if (uFlash.w > 0.0) color += albedo * (flashLight(vWorld) * 0.6 + uFlashCol * uFlashAmb) / PI;
+  if (uFlash.w > 0.0) color += albedo * (flashLightOcc(vWorld) * 0.6 + uFlashCol * uFlashAmb) / PI;
   gl_FragColor = vec4(color, 1.0 + wetRefl);
 }
 `;

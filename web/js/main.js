@@ -96,7 +96,7 @@ async function main() {
     uTime: { value: 0 }, uNight: { value: 0 }, uEnvCloud: { value: 0.3 }, uOvercast: { value: 0 },
     // precipitation / thunderstorm
     uRain: { value: 0 }, uWet: { value: 0 }, uStormCell: { value: new THREE.Vector4(0, 0, 1, 0) }, uRainSlant: { value: new THREE.Vector2() },
-    uFlash: { value: new THREE.Vector4() }, uFlashCol: { value: new THREE.Vector3(0.78, 0.85, 1.0) }, uFlashAmb: { value: 0 },
+    uFlash: { value: new THREE.Vector4() }, uFlashCol: { value: new THREE.Vector3(0.78, 0.85, 1.0) }, uFlashAmb: { value: 0 }, uFlashVis: { value: 1 },
   };
 
   ld('预计算大气散射 LUT…', 0.6); await nextFrame();
@@ -602,7 +602,7 @@ async function main() {
       weather.update(dt * ts, dt, {
         camera, vehPos3: st ? pos3 : null, vehAlt: st ? st.pos[2] : 0, vehAgl: agl, vehTas: st ? (st.air?.tas ?? 0) : 0,
         onGround: !!(st && st.gear?.wow?.some((w) => w)), camDist: st ? camera.position.distanceTo(pos3) : 1e9,
-        wind3, groundY, groundYCam: cgY, camAgl: camera.position.y - cgY, amb: light.amb, ts,
+        wind3, groundY, groundYCam: cgY, camAgl: camera.position.y - cgY, amb: light.amb, ts, inCockpit,
       });
       shuttle.setWet(weather.bodyWet, weather.flowTime);
       // storm forcing for the flight model (a few times per second)
