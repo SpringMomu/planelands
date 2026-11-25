@@ -625,15 +625,16 @@ class Simulator:
             if a == "reset":
                 seed = msg.get("seed")
                 if msg.get("scenario") == "final":
-                    # short-final demo (RWY33): on the inner glide slope at 130 ft / ~262 KEAS like the
-                    # Orbiter a few seconds before the final flare; exercises the IGS, final flare,
-                    # touchdown, derotation, chute and rollout
-                    cfg = ApproachConfig()
-                    h_g = 40.0
-                    x_thr = cfg.x_aim_igs - (h_g + 4.9) / math.tan(math.radians(-cfg.gamma_igs_deg))
-                    self.reset(init=approach_state(self.terrain, self.tables, height_agl=h_g, V=135.0,
-                                                   gamma_deg=cfg.gamma_igs_deg,
-                                                   offset_along=-self.terrain.rwy_half_len + x_thr))
+                    # short-final demo (RWY33): on the A/L reference profile 1 km before the threshold
+                    # (end of the pull-up, ~260 KEAS); exercises the transition onto the inner glide
+                    # slope, final flare, touchdown, derotation, chute and rollout
+                    from .gnc.approach import vertical_profile
+                    H, _, _ = vertical_profile(ApproachConfig())
+                    x_thr = -1000.0
+                    h_cg = float(H(x_thr))
+                    gam = math.degrees(math.atan((float(H(x_thr + 5.0)) - float(H(x_thr - 5.0))) / 10.0))
+                    self.reset(init=approach_state(self.terrain, self.tables, height_agl=h_cg - 4.9, V=135.0,
+                                                   gamma_deg=gam, offset_along=-self.terrain.rwy_half_len + x_thr))
                 elif msg.get("scenario") == "custom":
                     init, warn = self._custom_init(msg.get("spawn") or {})
                     a = self.assess_spawn(init)

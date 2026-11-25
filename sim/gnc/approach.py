@@ -143,8 +143,9 @@ def vertical_profile(cfg: ApproachConfig):
         g = np.where(x <= x_min, exp_part, lin_part)
         return hg_off + np.maximum(g, 0.0)
 
-    keys = dict(x_ali=cfg.x_ali, x_pf=x_t1, H_pf=H_t1, x_exp=x_e, H_exp=H_e, x_igs=x_e + 3.0 * lam,
-                H_igs=float(h_pre(x_e + 3.0 * lam)), x_flare=x_f0, H_flare=H_f0, x_td=x_td, x_c=xc, H_c=Hc,
+    x_ig = min(x_e + lam, x_f0)        # (mostly) settled onto the IGS, or the flare starts first
+    keys = dict(x_ali=cfg.x_ali, x_pf=x_t1, H_pf=H_t1, x_exp=x_e, H_exp=H_e, x_igs=x_ig,
+                H_igs=float(h_pre(x_ig)), x_flare=x_f0, H_flare=H_f0, x_td=x_td, x_c=xc, H_c=Hc,
                 r_pf=R, lam=lam)
 
     def H(x):
@@ -154,8 +155,6 @@ def vertical_profile(cfg: ApproachConfig):
         out = np.where((x > x_f0) & (x <= x_td), h_ff(x), out)
         out = np.where(x > x_td, cfg.h_td_cg, out)
         return out
-
-    x_ig = keys["x_igs"]
 
     def phase(x):
         x = np.asarray(x, float)

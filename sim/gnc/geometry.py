@@ -68,7 +68,9 @@ def runway_ends(world):
 @dataclass
 class ApproachConfig:
     gamma_ogs_deg: float = -20.0     # outer glide slope (Orbiter lightweight OGS; matches the OGS PAPI)
-    x_aim_ogs: float = -2300.0       # OGS aim point (before the threshold)
+    x_aim_ogs: float = -1500.0       # OGS aim point before the threshold (Orbiter: 7500 ft nominal, 6500 ft
+                                     # close-in; closer here so the pull-up ends nearer the runway and the
+                                     # shallow segment is short instead of a long low run-in)
     h_ali: float = 3000.0            # ALI height above the runway
     eas_ogs: float = 290.0 * KT      # equivalent airspeed on the OGS
     d_prefinal: float = 2500.0       # straight leg between HAC exit (WP2) and the ALI
