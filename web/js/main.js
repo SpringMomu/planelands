@@ -290,6 +290,8 @@ async function main() {
   const wetEl = bindRange('wet', (v) => (weather.settings.wetAuto ? `自动 ${weather.wet.toFixed(2)}` : v.toFixed(2)), (v) => { weather.settings.wet = v; });
   wetEl.addEventListener('input', () => { weather.settings.wetAuto = false; $('#wet-auto').checked = false; $('#wet-o').textContent = (+wetEl.value).toFixed(2); });
   $('#wet-auto').addEventListener('change', (e) => { weather.settings.wetAuto = e.target.checked; if (!e.target.checked) weather.settings.wet = weather.wet; });
+  // the storm cell over the airport is off by default (browsers may restore an earlier tick on reload)
+  $('#storm-cell').checked = false; weather.settings.cell = false;
   $('#storm-cell').addEventListener('change', (e) => { weather.settings.cell = e.target.checked; clouds.invalidate(); });
   $('#sound').addEventListener('change', (e) => weather.audio.setEnabled(e.target.checked));
   $('#btn-strike').addEventListener('click', () => weather.strikeNow(camera, groundY));
