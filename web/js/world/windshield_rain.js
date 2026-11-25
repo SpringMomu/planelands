@@ -1,9 +1,14 @@
 // Water on the flight-deck windows: rain drops on the OUTER panes, simulated and rendered physically.
 //
 // Simulation (CPU, cockpit frame, metres, per window in its own 2D plane coordinates):
-//   * impacts: drops of the rain hit each pane at a rate set by the rain intensity and the flux of rain
-//     through the pane (relative velocity of the rain to the vehicle . pane normal): parked, the rain
-//     falls onto the panes facing up; flying, the forward panes catch ~10x more water than the side ones
+//   * impacts, per drop size class (Marshall-Palmer sizes for the rain rate, each class falling at its own
+//     terminal speed and drifting with the wind): the flux through a pane is the expected positive part of
+//     (drop velocity relative to the vehicle . pane normal) under the gust spread of the drop velocities;
+//     on the lee side of the vehicle the flow is slowed and the rain falls more steeply.  Parked, every
+//     pane that faces the sky catches rain (less in a tail wind, never none); flying, the forward panes
+//     catch ~10x more water than the side ones.  Impacts splash by K = We^1/2 Re^1/4 (parked the big
+//     drops already throw satellite droplets, in flight all do), the splat sweeps the fine droplets under
+//     it and merges with the beads it touches, which jump toward the impact
 //   * every tracked drop is a spherical cap (contact angle ~70 deg).  Forces in the pane plane: gravity
 //     (minus the vehicle's acceleration: braking pushes the water forward), aerodynamic drag of the air
 //     flowing over the glass (relative wind projected on the pane, ~ rho u^2 r^2) and contact-line
@@ -15,10 +20,13 @@
 //     back over the windshield (back along the side windows), in streaks that leave a wet trail
 //   * running drops sweep up the small droplets in their path and shed tiny trail droplets behind them;
 //     drops that touch coalesce (volume conserved) and big drops break up in strong airflow
-// Rendering (GPU): a water atlas (all panes, ~1.3 texels / mm) holds the water thickness (R), a thin
-// water film (G) and the density of sub-millimetre droplets (B).  A persistent residue layer keeps
-// trail droplets, film and mist (with evaporation / blow-off); each frame the tracked drops are drawn
-// on top as height fields.  The pane shader then refracts the view ray through the water surface
+//   * a running drop leaves a wet track: a thin rivulet that drains in ~12 s parked (stripped at once by
+//     the airflow in flight) and pins the next drops less, so later drops run into the old paths
+// Rendering (GPU): a water atlas (all panes, ~1.3 texels / mm) holds the bead / droplet water height
+// (R, mm), the rivulet height of the wet tracks (G, mm) and the density of sub-millimetre droplets (B).
+// A persistent residue layer keeps trail droplets, tracks and mist (with evaporation / blow-off); each
+// frame the tracked drops are drawn on top as height fields.  The pane shader then refracts the view ray
+// through the water surface (R + G: a bead is a strong lens, a rivulet bends the view at its edges)
 // (glass -> water -> air, Snell + Fresnel, total internal reflection at the steep rims) and looks the
 // refracted direction up in a mip-mapped copy of the frame: every drop shows its own small, inverted
 // image of the world (sky at the bottom, ground at the top), dark rims, sun glints and runway lights.
@@ -47,9 +55,24 @@ const RMIN = 0.00028 * VIS;         // smaller tracked drops are handed to the r
 const RMAX = 0.005 * VIS;
 const CELL = 0.010 * VIS;           // coalescence grid (>= 2 RMAX)
 const ATLAS_W = 2048;
+// wet tracks (cockpit frame, per pane): a running drop leaves wetted glass behind; drops landing on it
+// or running into it are pinned less, so later drops follow the old paths
+const TC = 0.0025;                  // track grid cell (m)
+const TRACK_PIN = 0.35;             // pinning reduction on a fresh track
+// rain drop size classes that become tracked drops on the glass (air diameter, mm); smaller drops
+// go into the mist of sub-millimetre droplets
+const DBIN = [0.7, 0.95, 1.3, 1.75, 2.35, 3.1, 4.2];
+const N0_MP = 8000;                 // Marshall-Palmer intercept, m^-3 mm^-1
+// terminal fall speed of a rain drop of diameter D (mm), m/s (Atlas et al. 1973)
+const vTerm = (D) => Math.max(0.3, 9.65 - 10.3 * Math.exp(-0.6 * D));
+// contact radius (m) of a spherical cap holding the volume of an air drop of diameter D (mm)
+const capR = (D) => Math.cbrt((Math.PI * D * D * D / 6) / CV) * 0.001;
 
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 const ss = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+// standard normal pdf / cdf (logistic fit, |err| < 0.01)
+const phi = (x) => 0.3989423 * Math.exp(-0.5 * x * x);
+const Phi = (x) => 1 / (1 + Math.exp(-1.702 * x));
 
 function hash2(ix, iy, s) {
   let h = (Math.imul(ix, 374761393) + Math.imul(iy, 668265263) + Math.imul(s, 1442695041)) | 0;
@@ -82,10 +105,10 @@ const BLOB_VS = /* glsl */ `
 precision highp float;
 in vec3 position;              // quad corners (-1..1)
 in vec4 aP;                    // tail/previous (xy) -> head/current (zw), atlas px
-in vec4 aR;                    // radius (px), peak height (mm) or film value, tail length (in radii), seed
-in float aK;                   // kind: 0 drop / droplet, 1 film streak
+in vec4 aR;                    // radius / rivulet half width (px), peak height (mm), tail length (in radii), seed
+in float aK;                   // kind: 0 drop / droplet, 1 wet track (rivulet)
 uniform vec2 uAtlas;
-out vec2 vL; out vec4 vR; out float vLen; out float vK;
+out vec2 vL; out vec4 vR; out float vLen; out float vK; out vec2 vA;
 void main(){
   vec2 d = aP.zw - aP.xy; float L = length(d);
   vec2 dir = L > 1e-3 ? d / L : vec2(0.0, 1.0);
@@ -96,16 +119,20 @@ void main(){
   float v = position.y * (r + m);
   vL = vec2(u, v); vR = aR; vLen = L; vK = aK;
   vec2 px = aP.zw + dir * u + perp * v;
+  vA = px;
   gl_Position = vec4(px / uAtlas * 2.0 - 1.0, 0.0, 1.0);
 }`;
 
 const BLOB_FS = /* glsl */ `
 precision highp float;
-in vec2 vL; in vec4 vR; in float vLen; in float vK;
+in vec2 vL; in vec4 vR; in float vLen; in float vK; in vec2 vA;
 uniform int uMode;             // 0: drops into the water map (MAX)  1: erase residue (multiply)  2: residue stamps (MAX)
 out vec4 o;
 // spherical cap, contact angle 48 deg: height fraction at squared normalised radius q
 float cap(float q){ return max(0.0, (sqrt(1.8107 - q) - 0.9004) / 0.4452); }
+float h21(vec2 p){ vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
+float vn(vec2 p){ vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(h21(i), h21(i + vec2(1, 0)), f.x), mix(h21(i + vec2(0, 1)), h21(i + vec2(1, 1)), f.x), f.y); }
 void main(){
   float r = vR.x, tail = vR.z;
   vec2 p = vL;
@@ -118,17 +145,28 @@ void main(){
   float au = p.x >= 0.0 ? re : re + vLen + tail * r;
   float wv = p.x >= 0.0 ? re : re * mix(1.0, 0.6, clamp(-p.x / au, 0.0, 1.0));
   float q = (p.x * p.x) / (au * au) + (p.y * p.y) / (wv * wv);
-  if (q >= 1.0 && uMode != 1) discard;
   float tf = p.x >= 0.0 ? 1.0 : mix(1.0, 0.3, clamp(-p.x / au, 0.0, 1.0));
+  if (uMode == 2 && vK > 0.5) {
+    // wet track behind a running drop: a thin rivulet (G, water height in mm) along the path, a little
+    // wavy in width; parabolic cross-section, so its edges are small cylindrical lenses
+    float sx = clamp(p.x, -vLen, 0.0);
+    // (noise in atlas space: continuous from one path segment to the next)
+    float wob = 0.86 + 0.3 * vn(vA / max(2.5 * r, 1.5) + 17.0);
+    float wr = max(r * wob, 0.6);
+    float dd = length(vec2(p.x - sx, p.y)) / wr;
+    if (dd >= 1.0) discard;
+    o = vec4(0.0, vR.y * (1.0 - dd * dd), 0.0, 1.0);
+    return;
+  }
+  if (q >= 1.0 && uMode != 1) discard;
   if (uMode == 0) {
-    float h = vR.y * tf * cap(q);
-    o = vec4(h, 0.85, 0.0, 1.0);
+    o = vec4(vR.y * tf * cap(q), 0.0, 0.0, 1.0);
   } else if (uMode == 1) {
+    // a drop running or landing here takes up the fine droplets, the mist and most of an old track
     float m = 1.0 - smoothstep(0.75, 1.15, q);
-    o = vec4(1.0 - m, 1.0, 1.0 - 0.9 * m, 1.0);
+    o = vec4(1.0 - m, 1.0 - 0.7 * m, 1.0 - 0.9 * m, 1.0);
   } else {
-    if (vK < 0.5) o = vec4(vR.y * tf * cap(q), 0.55, 0.0, 1.0);
-    else o = vec4(0.0, vR.y * (1.0 - smoothstep(0.3, 1.0, q)), 0.0, 1.0);
+    o = vec4(vR.y * tf * cap(q), 0.0, 0.0, 1.0);
   }
 }`;
 
@@ -204,34 +242,32 @@ void main(){
   if (sceneW(suv) < vViewZ - 0.004) discard;               // cabin structure in front of the pane
   const float LW = 0.55;                                    // defocus of the water layer (mip level)
   vec4 w0 = textureLod(uWater, vAt, LW);
-  if (w0.r < 0.002 && w0.g < 0.01 && w0.b < 0.01) discard;
+  // water height (mm): beads and droplets (R) on top of the wet tracks / rivulets (G)
+  float h = w0.r + w0.g;
+  if (h < 0.002 && w0.b < 0.01) discard;
   vec2 tx = 1.0 / uAtlas;
   // gradient of the water surface over ~1.5 texels
   float e = 1.5;
   vec4 wx1 = textureLod(uWater, vAt + vec2(tx.x * e, 0.0), LW), wx0 = textureLod(uWater, vAt - vec2(tx.x * e, 0.0), LW);
   vec4 wy1 = textureLod(uWater, vAt + vec2(0.0, tx.y * e), LW), wy0 = textureLod(uWater, vAt - vec2(0.0, tx.y * e), LW);
-  vec2 g = vec2(wx1.r - wx0.r, wy1.r - wy0.r) / (2.0 * e * uTexelMM);    // dh/ds (mm / mm)
-  vec2 gf = vec2(wx1.g - wx0.g, wy1.g - wy0.g);
-  float h = w0.r, film = w0.g, mist = 1.0 - exp(-w0.b);
+  vec2 g = vec2(wx1.r + wx1.g - wx0.r - wx0.g, wy1.r + wy1.g - wy0.r - wy0.g) / (2.0 * e * uTexelMM);    // dh/ds (mm / mm)
+  float mist = 1.0 - exp(-w0.b);
 
   vec3 T = normalize(vT), B = normalize(vB), N = normalize(vN);          // N: out of the cabin
   vec3 V = normalize(vW - uCam);
-  // ---- thin film + mist: a wavy, slightly milky water sheet
-  float fl = vn(vAt * uAtlas / 9.0 + vec2(0.0, uFlowT)) - 0.5;
-  vec2 foff = gf * 0.06 + vec2(fl, -fl) * 0.004 * film;
-  vec3 fd = normalize(V + (T * foff.x + B * foff.y) * 1.0);
+  // ---- mist of sub-millimetre droplets: scatters the view (blur), grain, forward scattering of daylight
   float ok;
-  vec2 fuv = outsideUv(suv, dirUv(vW, fd, ok));
-  float mlod = 0.4 + mist * 3.0 + film * 0.4;
+  vec2 fuv = suv;
+  float mlod = 0.4 + mist * 3.0;
   vec3 filmCol = textureLod(uBg, fuv, mlod).rgb;
-  // sub-millimetre droplets: grain + forward scattering of the daylight
   float grain = h21(floor(vAt * uAtlas * 1.7));
   filmCol *= 1.0 - mist * 0.18 * step(0.55, grain);
   filmCol += uSky * mist * 0.05 + uSunCol * mist * 0.004 * pow(max(dot(V, uSunDir), 0.0), 8.0);
-  float aFilm = clamp(film * 0.22 + mist * 0.6, 0.0, 0.85);
+  float aFilm = clamp(mist * 0.6, 0.0, 0.85);
 
-  // ---- drops: Snell through the flat glass/water interface and the curved water/air surface
-  float cov = smoothstep(0.0, 0.045, h);
+  // ---- water: Snell through the flat glass/water interface and the curved water/air surface (a bead
+  // is a strong lens; a rivulet is flat in the middle and bends the view at its edges)
+  float cov = smoothstep(0.0, 0.03, h);
   vec3 dropCol = filmCol;
   if (cov > 0.0) {
     vec3 nd = normalize(N - T * g.x - B * g.y);       // outward normal of the water surface
@@ -303,6 +339,7 @@ export class WindshieldRain {
       this.win.push({
         name: ap.name, q, O, T, B, N, pts, x0, x1, y0, y1, edges, area: Math.abs(A) / 2,
         g: [0, 0], u: [0, 0], uS: 0, flux: 0, gust: Math.random() * 100, keep: [1, 1, 1], mistAdd: 0,
+        rate: new Float32Array(DBIN.length - 1), vn: new Float32Array(DBIN.length - 1), tauT: 40,
       });
     }
     // shelf packing at the highest density (px / m) that fits the atlas width
@@ -327,7 +364,11 @@ export class WindshieldRain {
       w.rect = [w.ax, w.ay, w.ax + (w.x1 - w.x0) * dens, w.ay + (w.y1 - w.y0) * dens];
       const cols = Math.ceil((w.x1 - w.x0) / CELL) + 1, rows = Math.ceil((w.y1 - w.y0) / CELL) + 1;
       w.gc = cols; w.gr = rows; w.head = new Int32Array(cols * rows);
+      // wet tracks: time each cell was last wetted by a running drop
+      w.tw = Math.ceil((w.x1 - w.x0) / TC) + 2; w.th = Math.ceil((w.y1 - w.y0) / TC) + 2;
+      w.trT = new Float32Array(w.tw * w.th).fill(-1e9);
     }
+    this.clock = 0;
     const Atot = this.win.reduce((a, w) => a + w.area, 0);
     for (const w of this.win) { w.cap = Math.floor(MAXD * w.area / Atot); w.cnt = 0; }
     console.info(`[windshield] ${this.win.length} panes, water atlas ${this.atlas.x}x${this.atlas.y} @ ${(dens / 1000).toFixed(2)} px/mm`);
@@ -448,6 +489,41 @@ export class WindshieldRain {
     return m;
   }
 
+  // wetness of the track at (x, y) of pane w: 1 on a fresh track, fading as it drains / dries
+  _track(w, x, y) {
+    const fx = (x - w.x0) / TC, fy = (y - w.y0) / TC;
+    const ix = Math.floor(fx), iy = Math.floor(fy);
+    if (ix < 0 || iy < 0 || ix >= w.tw - 1 || iy >= w.th - 1) return 0;
+    const T = w.trT, k = iy * w.tw + ix, c = this.clock, it = 1 / w.tauT;
+    const a = Math.exp((T[k] - c) * it), b = Math.exp((T[k + 1] - c) * it);
+    const d = Math.exp((T[k + w.tw] - c) * it), e = Math.exp((T[k + w.tw + 1] - c) * it);
+    const tx = fx - ix, ty = fy - iy;
+    return (a + (b - a) * tx) * (1 - ty) + (d + (e - d) * tx) * ty;
+  }
+  // pinning strength of the glass under a contact line at (x, y): patchy glass, less on wet tracks
+  _sticky(wi, x, y) {
+    const w = this.win[wi];
+    return w.tauT < 1 ? sticky(wi, x, y) : sticky(wi, x, y) * (1 - TRACK_PIN * this._track(w, x, y));
+  }
+  // a running drop wets the glass along its path (half width hw, m)
+  _markTrack(w, x0, y0, x1, y1, hw) {
+    if (w.tauT < 1) return;                          // in flight the airflow strips the tracks at once
+    const L = Math.hypot(x1 - x0, y1 - y0), ns = Math.max(1, Math.ceil(L / (TC * 0.7)));
+    const rc = Math.max(1, Math.round(hw / TC)), rc2 = (hw / TC) * (hw / TC) + 0.25;
+    const T = w.trT, c = this.clock;
+    for (let s = 0; s <= ns; s++) {
+      const f = s / ns;
+      const cx = Math.round((x0 + (x1 - x0) * f - w.x0) / TC), cy = Math.round((y0 + (y1 - y0) * f - w.y0) / TC);
+      for (let oy = -rc; oy <= rc; oy++) {
+        const yy = cy + oy; if (yy < 0 || yy >= w.th) continue;
+        for (let ox = -rc; ox <= rc; ox++) {
+          const xx = cx + ox; if (xx < 0 || xx >= w.tw || ox * ox + oy * oy > rc2) continue;
+          T[yy * w.tw + xx] = c;
+        }
+      }
+    }
+  }
+
   _inside(w, x, y, margin = 0) {
     for (const e of w.edges) if (e[0] * x + e[1] * y + e[2] < margin) return false;
     return true;
@@ -514,7 +590,7 @@ export class WindshieldRain {
     this.dw[i] = wi; this.dx[i] = x; this.dy[i] = y; this.px[i] = x; this.py[i] = y;
     this.vx[i] = vx; this.vy[i] = vy; this.dr[i] = r; this.seed[i] = Math.random();
     this.trail[i] = Math.random() * 0.004; this.dead[i] = 0;
-    this.stk[i] = sticky(wi, x, y); this.act[i] = 1;
+    this.stk[i] = this._sticky(wi, x, y); this.act[i] = 1;
     return i;
   }
 
@@ -536,9 +612,22 @@ export class WindshieldRain {
     }
     const gC = new THREE.Vector3(0, -G0, 0).sub(this.acc).applyQuaternion(qInv);
     const airC = p.wind.clone().sub(p.vel).applyQuaternion(qInv);
-    const rainC = p.fall.clone().sub(p.vel).applyQuaternion(qInv);
     const rain = clamp(p.rain, 0, 1);
     const n = this.win.length;
+    // ---- the rain reaching each pane, per drop size class.  Drops drift with the (low-passed) wind and
+    // fall at their own terminal speed: small drops are blown at a slant, big ones fall steeply.  Gusts
+    // spread the drop velocities (sigH), so a pane facing away from the mean rain still catches some of
+    // it; on the lee side of the vehicle the flow is slowed and recirculates (shelter), which lets the
+    // rain fall more steeply there (parked with a tail wind the windshield gets less rain, never none).
+    const driftC = new THREE.Vector3(p.fall.x, 0, p.fall.z).sub(p.vel).applyQuaternion(qInv);
+    const upC = new THREE.Vector3(0, 1, 0).applyQuaternion(qInv);
+    const sigH = 0.5 + 0.3 * Math.hypot(p.wind.x, p.wind.z);
+    // Marshall-Palmer drop sizes; rain 1 ~ 60 mm/h (thunderstorm core), 0.3 ~ 11 mm/h, 0.1 ~ 2.4 mm/h
+    const Rmm = 60 * Math.pow(rain, 1.4);
+    const lamMP = 4.1 * Math.pow(Math.max(Rmm, 0.05), -0.21);
+    const nb = DBIN.length - 1;
+    const posFlux = (mu, sg) => { const z = mu / sg; return [Math.max(0, mu * Phi(z) + sg * phi(z)), Phi(z)]; };
+    const aU = airC.length();
     for (let k = 0; k < n; k++) {
       const w = this.win[k];
       w.g[0] = gC.dot(w.T); w.g[1] = gC.dot(w.B);
@@ -550,15 +639,37 @@ export class WindshieldRain {
       const un = Math.abs(airC.dot(w.N)), U = airC.length();
       const amp = 1 + 0.35 * (U > 1 ? un / U : 0);
       w.u[0] = ut.dot(w.T) * amp * gf; w.u[1] = ut.dot(w.B) * amp * gf;
+      // lee side: the air leaves the pane; the flow over it is slowed (separated, recirculating)
+      const lee = aU > 0.5 ? ss(0.0, 0.6, airC.dot(w.N) / aU) : 0;
+      if (lee > 0) { const f = 1 - 0.6 * lee; w.u[0] *= f; w.u[1] *= f; }
       w.uS = Math.hypot(w.u[0], w.u[1]);
-      w.flux = Math.max(0, -rainC.dot(w.N)) * (rain > 0.005 ? 1 : 0);
-      // residue: trail droplets evaporate (minutes) or are blown off (> ~45 m/s along the glass); the film
-      // drains in seconds; the mist of tiny droplets survives up to higher speed
+      const Ny = w.N.dot(upC);
+      const sigN = (sigH * Math.sqrt(Math.max(0, 1 - Ny * Ny)) + 0.35 * sigH * Math.abs(Ny) + 0.1) * (1 + 0.6 * lee);
+      const dN = driftC.dot(w.N);
+      w.flux = 0;
+      let Emist = 0;
+      for (let b = 0; b < nb; b++) {
+        const D0 = DBIN[b], D1 = DBIN[b + 1], D = 0.5 * (D0 + D1);
+        const shel = lee * (0.65 - 0.3 * ss(0.7, 4, D));        // small drops follow the lee flow more
+        const [E, P] = posFlux(-(dN * (1 - shel) - vTerm(D) * Ny), sigN);
+        if (b === 3) Emist = E;
+        // drops per second on the pane; the count is divided by VIS^2 so the drawn (VIS x larger) drops
+        // cover the glass as fast as the physical ones would
+        const nD = N0_MP * (Math.exp(-lamMP * D0) - Math.exp(-lamMP * D1)) / lamMP;
+        w.rate[b] = rain > 0.005 ? nD * E * w.area / (VIS * VIS) : 0;
+        w.vn[b] = E / Math.max(P, 1e-3);                         // mean normal impact speed
+        w.flux += w.rate[b];
+      }
+      // residue: trail droplets evaporate (minutes) or are blown off (> ~45 m/s along the glass); the wet
+      // tracks drain / dry in tens of seconds parked and are stripped by the airflow in flight; the mist
+      // of tiny droplets survives up to higher speed
       const blowR = 9 * ss(30, 70, w.uS), blowB = 5 * ss(45, 110, w.uS);
+      w.tauT = 1 / (1 / 12 + 3 * ss(8, 60, w.uS));
       w.keep[0] = Math.exp(-dt * (1 / 300 + blowR));
-      w.keep[1] = Math.exp(-dt * (0.35 + w.uS / 25));
+      w.keep[1] = Math.exp(-dt / w.tauT);
       w.keep[2] = Math.exp(-dt * (1 / 90 + blowB + 0.25 * ss(2, 12, w.uS)));
-      w.mistAdd = dt * w.flux * rain * 0.006;
+      // drizzle drops and impact spray feed the mist (scaled with the rain on the pane)
+      w.mistAdd = rain > 0.005 ? dt * Emist * rain * 0.006 : 0;
     }
     // first use (or after a reset) in rain: the glass has been out in it already -- run the drops for
     // ~15 s of the current conditions (CPU only) so the cockpit does not open on dry windows
@@ -568,6 +679,8 @@ export class WindshieldRain {
         for (let k = 0; k < 150; k++) this._step(0.1, rain, false);
         for (let s = 0; s < this.n; s++) { this.vx[s] *= 0.2; this.vy[s] *= 0.2; }
         this.stampN = 0; this.eraseN = 0;
+        // the rivulets of the warm-up are not on the GPU: start without tracks
+        for (const w of this.win) w.trT.fill(-1e9);
       }
     }
     if (dt > 0) {
@@ -623,36 +736,53 @@ export class WindshieldRain {
   _step(h, rain, last) {
     const W = this.win, dens = this.dens;
     const { dw, dx, dy, vx: VX, vy: VY, dr, dead, act, stk } = this;
+    this.clock += h;
     // ---- impacts (against the grid of the previous step)
+    const nb = DBIN.length - 1;
     for (let k = 0; k < W.length; k++) {
       const w = W[k];
       if (w.flux <= 0) continue;
-      // drops large enough to track (the rest goes into the mist): number density ~ rain^1.5, rate capped
-      const lam = Math.min(w.flux * w.area * 250 * Math.pow(rain, 1.5), 6000 * w.area / 0.5) * h;
-      const cnt = poisson(lam);
-      const hard = ss(10, 120, w.flux);          // fast impacts splash into smaller pieces
-      for (let c = 0; c < cnt; c++) {
-        let x = 0, y = 0, ok = false;
-        for (let t = 0; t < 6 && !ok; t++) {
-          x = w.x0 + Math.random() * (w.x1 - w.x0); y = w.y0 + Math.random() * (w.y1 - w.y0);
-          ok = this._inside(w, x, y, 0.001);
-        }
-        if (!ok) continue;
-        const u = Math.random();
-        const r = (0.00045 + 0.0016 * Math.pow(u, 2.4)) * (1 - 0.45 * hard) * VIS;
-        // landing on a drop: the water joins it (that is how beads grow between the runs)
-        const j = this._hit(k, x, y, r);
-        if (j >= 0) {
-          dr[j] = Math.min(RMAX, Math.cbrt(dr[j] * dr[j] * dr[j] + r * r * r));
-          act[j] = 1;
-        } else if (w.cnt < w.cap) { this._add(k, x, y, r); w.cnt++; }
-        else this._droplet(k, x, y, r * 0.6);
-        // splash: a crown of tiny droplets around fast impacts
-        if (hard > 0.05) {
-          const ns = 1 + Math.floor(hard * 4 * Math.random());
-          for (let s = 0; s < ns; s++) {
-            const a = Math.random() * 6.2832, d = r * (1.6 + Math.random() * 2.5);
-            this._droplet(k, x + Math.cos(a) * d, y + Math.sin(a) * d, r * (0.18 + 0.2 * Math.random()));
+      const capS = Math.min(1, (6000 * w.area / 0.5) / w.flux);      // rate cap (fast flight in heavy rain)
+      for (let b = 0; b < nb; b++) {
+        const cnt = poisson(w.rate[b] * capS * h);
+        if (!cnt) continue;
+        const vn = w.vn[b];
+        const hard = ss(10, 120, vn);            // very fast impacts shatter the drop into smaller pieces
+        for (let c = 0; c < cnt; c++) {
+          let x = 0, y = 0, ok = false;
+          for (let t = 0; t < 6 && !ok; t++) {
+            x = w.x0 + Math.random() * (w.x1 - w.x0); y = w.y0 + Math.random() * (w.y1 - w.y0);
+            ok = this._inside(w, x, y, 0.001);
+          }
+          if (!ok) continue;
+          const D = DBIN[b] + Math.random() * (DBIN[b + 1] - DBIN[b]);
+          // splash of the impact on wet glass (K = We^1/2 Re^1/4 of the normal impact): parked, the big
+          // drops (~6-9 m/s) already throw a crown of droplets; in flight every impact does
+          const Dm = D * 0.001, vi = vn * (0.75 + 0.5 * Math.random());
+          const K = Math.sqrt(RHO_W * vi * vi * Dm / 0.072) * Math.pow(vi * Dm / 1.0e-6, 0.25);
+          const spl = Math.max(ss(130, 650, K), hard);
+          const r = capR(D) * Math.cbrt(1 - 0.35 * spl) * (1 - 0.45 * hard) * VIS;
+          // the splat spreads over ~1.5x the final bead: water landing on or next to a drop joins it, and the
+          // merged bead jumps toward the impact (that is how beads grow between the runs)
+          const j = this._hit(k, x, y, r * (1 + 0.6 * spl));
+          if (j >= 0) {
+            const Vj = dr[j] * dr[j] * dr[j], Vr = r * r * r, Vt = Vj + Vr;
+            const nx = (dx[j] * Vj + x * Vr) / Vt, ny = (dy[j] * Vj + y * Vr) / Vt;
+            if (this._inside(w, nx, ny, 0)) { dx[j] = nx; dy[j] = ny; }
+            dr[j] = Math.min(RMAX, Math.cbrt(Vt));
+            stk[j] = Math.min(stk[j], this._sticky(k, dx[j], dy[j]));      // the contact line re-forms
+            act[j] = 1;
+          } else if (w.cnt < w.cap) { this._add(k, x, y, r); w.cnt++; }
+          else this._droplet(k, x, y, r * 0.6);
+          // the splat sweeps up the fine droplets under it (shattering high-speed impacts spray instead)
+          if (hard < 0.5) this._erase(k, x, y, x, y, r * this.dens * (1.2 + 0.7 * spl));
+          // crown splash: satellite droplets thrown around the impact
+          if (spl > 0.02) {
+            const ns = Math.floor(spl * (2 + 5 * Math.random()) + Math.random() * 0.7);
+            for (let s = 0; s < ns; s++) {
+              const a = Math.random() * 6.2832, d = r * (1.5 + Math.random() * (1.5 + 2.5 * spl));
+              this._droplet(k, x + Math.cos(a) * d, y + Math.sin(a) * d, r * (0.1 + 0.22 * Math.random()));
+            }
           }
         }
       }
@@ -678,16 +808,19 @@ export class WindshieldRain {
       // pinning: patchy glass; moving drops slip a little easier (receding contact line already wet)
       if (sp === 0 && fd < KR * r * stk[i] && r <= w.rb) continue;     // pinned (the common case)
       const x = dx[i], y = dy[i];
-      const st = sp > 0 ? (stk[i] = sticky(wi, x, y)) : stk[i];
+      // a moving drop is held by its advancing contact line (the receding one is on glass it has wetted)
+      const st = sp > 0 ? (stk[i] = this._sticky(wi, x + vx / sp * r * 0.9, y + vy / sp * r * 0.9)) : stk[i];
       const fr = KR * r * st * (sp > 0.004 ? 0.72 : 1);
       let tx = 0, ty = 0;
       if (fd > fr) {
-        // drops drift toward cleaner glass: the pinning gradient steers them across the driving force
+        // drops drift toward cleaner glass and into the wet tracks of earlier drops: the pinning gradient
+        // ahead of the drop steers it across the driving force
         const e = 0.0012;
-        const gxs = (sticky(wi, x + e, y) - sticky(wi, x - e, y)) / (2 * e);
-        const gys = (sticky(wi, x, y + e) - sticky(wi, x, y - e)) / (2 * e);
         const dx0 = fx / fd, dy0 = fy / fd;
-        const lat = -(gxs * -dy0 + gys * dx0) * 0.0035;
+        const qx = x + dx0 * r * 0.9, qy = y + dy0 * r * 0.9;
+        const gxs = (this._sticky(wi, qx + e, qy) - this._sticky(wi, qx - e, qy)) / (2 * e);
+        const gys = (this._sticky(wi, qx, qy + e) - this._sticky(wi, qx, qy - e)) / (2 * e);
+        const lat = clamp(-(gxs * -dy0 + gys * dx0) * 0.0035, -0.8, 0.8);
         let dxn = dx0 - dy0 * lat, dyn = dy0 + dx0 * lat;
         const dl = Math.sqrt(dxn * dxn + dyn * dyn); dxn /= dl; dyn /= dl;
         const vt = Math.min(VMAX, (fd - fr) / (KV * r));
@@ -703,7 +836,12 @@ export class WindshieldRain {
         // sweep the residue in the path, leave a wet trail, shed tiny droplets behind
         const spn = Math.sqrt(vx * vx + vy * vy);
         this._erase(wi, x, y, nx, ny, r * dens * 0.95);
-        if (last || moved > r) this._stamp(wi, this.px[i], this.py[i], nx, ny, r * dens * 0.75, clamp(0.35 + r / VIS * 120, 0.4, 0.95), 0, 1);
+        this._markTrack(w, x, y, nx, ny, r * 0.6);
+        // the wet track: a rivulet ~0.6 of the drop wide, thinner behind fast drops (water height, mm)
+        if (last || moved > r) {
+          const hr = clamp(0.03 + 18 * r, 0.05, 0.28) / (1 + 0.8 * spn);
+          this._stamp(wi, this.px[i], this.py[i], nx, ny, r * dens * 0.6, hr, 0, 1);
+        }
         this.trail[i] += moved;
         const spacing = r * (2.0 + 3.0 * this.seed[i]) * (1 + spn * 2.5);
         let shed = 0;
@@ -824,7 +962,7 @@ export class WindshieldRain {
   }
 
   /** remove all water (e.g. on a new episode) */
-  clear() { this.n = 0; this._grid(); this._needClear = true; this._warm = false; this.prevVel = null; this.acc.set(0, 0, 0); }
+  clear() { this.n = 0; this._grid(); this._needClear = true; for (const w of this.win) w.trT.fill(-1e9); this._warm = false; this.prevVel = null; this.acc.set(0, 0, 0); }
 
   stats() { return { drops: this.n, stamps: this.stampN, erase: this.eraseN, active: this.active }; }
 }
