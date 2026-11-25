@@ -35,9 +35,81 @@ const COL = {
 };
 const RANGES = [5, 10, 20, 40, 80, 160];
 
+// ------------------------------------------------------------------ stroke font
+// Avionics symbol generators do not use typefaces: every character is a short list of vectors that
+// the display generator strokes with the same pen as the symbology (the orbiter's MCDS was a stroke
+// writer; EFIS / MEDS character sets keep the same look).  Glyphs live on an 8 x 12 grid (y up from
+// the baseline), are drawn condensed (0.6 horizontal scale) with round caps and joins, upper case
+// only (lower case is drawn as small capitals).  Pen width follows the weight; 700 is the normal
+// display weight.  `▲ ▼` are filled.
+const GLYPH_SRC = {
+  '0': '2,0 6,0 8,2 8,10 6,12 2,12 0,10 0,2 2,0', '1': '1.5,9.5 4,12 4,0;1.5,0 6.5,0',
+  '2': '0,10 2,12 6,12 8,10 8,8 0,1 0,0 8,0', '3': '0,10 2,12 6,12 8,10 8,8 6,6 3,6;6,6 8,4 8,2 6,0 2,0 0,2',
+  '4': '6,0 6,12 0,4 0,3 8,3', '5': '8,12 1,12 0,7 2,8 6,8 8,6 8,2 6,0 2,0 0,2',
+  '6': '7,12 4,12 1,9 0,6 0,2 2,0 6,0 8,2 8,5 6,7 2,7 0,5', '7': '0,12 8,12 8,11 3,0',
+  '8': '2,6 0,8 0,10 2,12 6,12 8,10 8,8 6,6 2,6 0,4 0,2 2,0 6,0 8,2 8,4 6,6', '9': '8,7 6,5 2,5 0,7 0,10 2,12 6,12 8,10 8,6 7,3 4,0 1,0',
+  A: '0,0 0,8 4,12 8,8 8,0;0,5 8,5', B: '0,0 0,12 6,12 8,10 8,8 6,6 0,6;6,6 8,4 8,2 6,0 0,0', C: '8,10 6,12 2,12 0,10 0,2 2,0 6,0 8,2',
+  D: '0,0 0,12 5,12 8,9 8,3 5,0 0,0', E: '8,12 0,12 0,0 8,0;0,6 5.5,6', F: '8,12 0,12 0,0;0,6 5.5,6',
+  G: '8,10 6,12 2,12 0,10 0,2 2,0 6,0 8,2 8,6 4.5,6', H: '0,0 0,12;8,0 8,12;0,6 8,6', I: '4,0 4,12;2,12 6,12;2,0 6,0',
+  J: '8,12 8,2 6,0 2,0 0,2 0,4', K: '0,0 0,12;8,12 0,4;2.7,6.7 8,0', L: '0,12 0,0 8,0', M: '0,0 0,12 4,6 8,12 8,0',
+  N: '0,0 0,12 8,0 8,12', O: '2,0 6,0 8,2 8,10 6,12 2,12 0,10 0,2 2,0', P: '0,0 0,12 6,12 8,10 8,8 6,6 0,6',
+  Q: '2,0 6,0 8,2 8,10 6,12 2,12 0,10 0,2 2,0;5,3 8.5,-0.5', R: '0,0 0,12 6,12 8,10 8,8 6,6 0,6;4,6 8,0',
+  S: '8,10 6,12 2,12 0,10 0,8 2,6 6,6 8,4 8,2 6,0 2,0 0,2', T: '0,12 8,12;4,12 4,0', U: '0,12 0,2 2,0 6,0 8,2 8,12',
+  V: '0,12 4,0 8,12', W: '0,12 1.5,0 4,7 6.5,0 8,12', X: '0,0 8,12;0,12 8,0', Y: '0,12 4,6 8,12;4,6 4,0', Z: '0,12 8,12 0,0 8,0',
+  '.': ['1,0 2,0 2,1 1,1 1,0', 3], ':': ['1,1 2,1 2,2 1,2 1,1;1,7 2,7 2,8 1,8 1,7', 3], ',': ['2,1 2,0 0.5,-2', 3],
+  "'": ['1,12 1,9', 2], '-': '1,6 7,6', '_': '0,-1.5 8,-1.5', '+': '0,6 8,6;4,2 4,10', '=': '0,4 8,4;0,8 8,8',
+  '/': '0,0 8,12', '|': ['1,-1 1,13', 2], '(': ['4,12 2,10 2,2 4,0', 5], ')': ['1,12 3,10 3,2 1,0', 5],
+  '[': ['4,12 1,12 1,0 4,0', 5], ']': ['1,12 4,12 4,0 1,0', 5], '<': '8,12 0,6 8,0', '>': '0,12 8,6 0,0',
+  '*': '4,2 4,10;0.5,8 7.5,4;0.5,4 7.5,8', '?': '0,10 2,12 6,12 8,10 8,8 4,5 4,3;4,0.6 4,0', '!': ['1,12 1,3;1,0.6 1,0', 2],
+  '%': '0,12 2.5,12 2.5,9 0,9 0,12;5.5,3 8,3 8,0 5.5,0 5.5,3;8,12 0,0', '&': '8,0 1,9 1,11 2,12 4,12 5,11 5,9 0,4 0,2 2,0 5,0 8,4',
+  '#': '2,0 3,12;5,0 6,12;0,4 8,4;0,8 8,8', '°': ['1,12 3,12 4,11 4,9 3,8 1,8 0,9 0,11 1,12', 5], '×': '1,3 7,9;1,9 7,3',
+  'Δ': '0,0 4,12 8,0 0,0', 'α': '8,8 5,1 3,0 1,0 0,2 0,6 2,8 4,8 6,4 8,0', 'β': '0,-3 0,10 2,12 5,12 7,10 7,8 5,6 2,6;5,6 8,4 8,2 6,0 2,0 0,2',
+  '↑': '4,0 4,12;1,9 4,12 7,9', '↓': '4,12 4,0;1,3 4,0 7,3', '→': '0,6 8,6;5,9 8,6 5,3', '←': '8,6 0,6;3,9 0,6 3,3',
+  'Ḣ': '0,0 0,12;8,0 8,12;0,6 8,6;3.5,14.5 4.5,14.5 4.5,15.5 3.5,15.5 3.5,14.5', '▲': ['0,0 14,0 7,10 0,0', 14, true], '▼': ['0,11 14,11 7,1 0,11', 14, true],
+};
+const GLYPH = {};
+for (const [k, v] of Object.entries(GLYPH_SRC)) {
+  const [src, w, fill] = Array.isArray(v) ? v : [v, 8, false];
+  GLYPH[k] = { w, fill, s: src.split(';').map((st) => st.trim().split(/\s+/).map((p) => p.split(',').map(Number))) };
+}
+const SF_X = 0.6, SF_GAP = 3.0;                   // horizontal condensation, inter-character gap (grid units)
+function sfGlyph(ch) {
+  const gl = GLYPH[ch]; if (gl) return [gl, 1];
+  const up = GLYPH[ch.toUpperCase()]; if (up) return [up, 0.8];       // lower case: small capitals
+  return [null, 1];
+}
+/** advance width (px) of a string in the stroke font at `size` (nominal em, cap height 0.72 em) */
+function textW(s, size) {
+  const u = size * 0.72 / 12; let w = 0; s = String(s);
+  for (const ch of s) { const [gl, k] = sfGlyph(ch); w += ((gl ? gl.w * k : 8) * SF_X + SF_GAP) * u; }
+  return Math.max(0, w - SF_GAP * u);
+}
+/** stroke-font text; halo: black outline under the characters (labels drawn over map symbology) */
+function strokeText(g, s, x, y, size, color, align = 'left', weight = '700', base = 'alphabetic', halo = 0) {
+  s = String(s); if (!s) return;
+  const capH = size * 0.72, u = capH / 12, W = textW(s, size);
+  let x0 = align === 'center' ? x - W / 2 : align === 'right' ? x - W : x;
+  if (base === 'middle') y += capH / 2; else if (base === 'top' || base === 'hanging') y += capH;
+  const lw = String(weight) === '700' ? Math.max(1, capH * 0.145) : Math.max(0.85, capH * 0.11);
+  const path = new Path2D(), fills = new Path2D(); let anyFill = false;
+  for (const ch of s) {
+    const [gl, k] = sfGlyph(ch);
+    if (gl) {
+      const P = gl.fill ? (anyFill = true, fills) : path;
+      for (const st of gl.s) st.forEach(([px, py], i) => P[i ? 'lineTo' : 'moveTo'](x0 + px * k * SF_X * u, y - py * k * u));
+    }
+    x0 += ((gl ? gl.w * k : 8) * SF_X + SF_GAP) * u;
+  }
+  g.save(); g.lineCap = 'round'; g.lineJoin = 'round'; g.setLineDash([]);
+  if (halo) { g.strokeStyle = '#000'; g.lineWidth = lw + halo; g.stroke(path); if (anyFill) { g.fillStyle = '#000'; g.fill(fills); g.stroke(fills); } }
+  g.strokeStyle = color; g.lineWidth = lw; g.stroke(path);
+  if (anyFill) { g.fillStyle = color; g.fill(fills); g.stroke(fills); }
+  g.restore();
+}
+
 // ------------------------------------------------------------------ small canvas helpers
 function T(g, s, x, y, size = 12, color = COL.white, align = 'left', weight = '', font = SANS, base = 'alphabetic') {
-  g.font = `${weight} ${size}px ${font}`; g.fillStyle = color; g.textAlign = align; g.textBaseline = base; g.fillText(s, x, y);
+  strokeText(g, s, x, y, size, color, align, weight === '' ? '400' : weight, base);
 }
 function line(g, x0, y0, x1, y1) { g.beginPath(); g.moveTo(x0, y0); g.lineTo(x1, y1); g.stroke(); }
 function tri(g, x, y, s, dir, fill, stroke = null) {
@@ -179,13 +251,13 @@ class Dps {
   }
   draw(g) {
     const cw = 512 / 51, rh = 512 / 26.4;
-    g.font = `${(rh * 0.82).toFixed(1)}px ${MONO}`; g.textAlign = 'center'; g.textBaseline = 'alphabetic';
+    const fs = rh * 0.82;
     for (let r = 0; r < 26; r++) for (let c = 0; c < 51; c++) {
       const e = this.cells[r][c]; if (!e) continue;
       const x = (c + 0.5) * cw, y = (r + 0.86) * rh + 3;
       if (e[1] === 2) { g.fillStyle = COL.dps; g.fillRect(c * cw, r * rh + 3, cw + 0.3, rh); g.fillStyle = '#000'; }
       else g.fillStyle = e[1] === 1 ? COL.dpsHi : e[1] === 3 ? COL.dpsDim : COL.dps;
-      if (e[0] !== ' ') g.fillText(e[0], x, y);
+      if (e[0] !== ' ') strokeText(g, e[0], x, y, fs, g.fillStyle, 'center', e[1] === 1 ? '700' : '400');
     }
   }
   static cell(c, r) { return [(c + 0.5) * 512 / 51, (r + 0.5) * 512 / 26.4 + 3]; }
@@ -194,7 +266,7 @@ class Dps {
 // =========================================================================================== pages
 const PAGES = {
   PFD: { title: 'A/E PFD', hz: 12.5, draw: drawPFD },
-  HSIT: { title: 'HSIT', hz: 5, draw: drawHSIT },
+  HSIT: { title: 'HSIT', hz: 6.25, draw: drawHSIT },
   SPI: { title: 'SPI', hz: 12.5, draw: drawSPI },
   HZS: { title: 'HORIZ SIT', hz: 1, draw: drawHorizSit, dps: true },
   VSIT: { title: 'VERT SIT', hz: 1, draw: drawVertSit, dps: true },
@@ -203,28 +275,37 @@ const PAGES = {
 };
 
 // ------------------------------------------------------------------ edge-key legends (bottom of every display)
+// MEDS menu area as flown (USA005512 fig. 3-7): cyan rule, cyan menu title under it, each legend in a
+// cyan box above its bezel key, the UP key as an up-arrow outline.  A selected page / function shows
+// a double box; a pressed key is reverse video until the IDP has processed it.
 function drawKeyLegends(g, w) {
   const m = MENUS[w.st.menu] || MENUS.MAIN;
-  const y0 = 474;
-  g.strokeStyle = '#8b8d8f'; g.lineWidth = 1;
-  g.font = `11px ${SANS}`;
-  const tw = g.measureText(m.title).width + 14;
-  line(g, 6, y0, 256 - tw / 2, y0); line(g, 256 + tw / 2, y0, 506, y0);
-  T(g, m.title, 256, y0 + 4, 11, COL.cyan, 'center');
-  const cw = 512 / 6;
+  const y0 = 470;
+  g.fillStyle = '#000'; g.fillRect(0, y0, 512, 512 - y0);
+  g.strokeStyle = COL.cyan; g.lineWidth = 1; line(g, 4, y0 + 0.5, 508, y0 + 0.5);
+  T(g, m.title, 256, y0 + 11, 10.5, COL.cyan, 'center', '700');
+  const cw = 512 / 6, bw = 70, bh = 25, by = 485;
   m.keys.forEach((k, i) => {
     if (!k) return;
     const lab = typeof k.l === 'function' ? k.l(w) : k.l;
-    const x = (i + 0.5) * cw;
+    const x = Math.round((i + 0.5) * cw);
     const sel = (k.page && k.page === w.st.page) || (k.on && k.on(w));
     const flash = w.keyFlash[i] && performance.now() - w.keyFlash[i] < 140;
     const lines = lab.split('\n');
-    const bw = 58, bh = 28, by = 480;
-    if (flash) { g.fillStyle = COL.white; g.fillRect(x - bw / 2, by, bw, bh); }
-    else if (sel) { g.strokeStyle = COL.white; g.lineWidth = 1.2; g.strokeRect(x - bw / 2 + 0.5, by + 0.5, bw - 1, bh - 1); }
-    const col = flash ? '#000' : COL.white;
-    if (lines.length === 1) T(g, lines[0], x, by + 19, 12, col, 'center', '700');
-    else { T(g, lines[0], x, by + 12, 11, col, 'center', '700'); T(g, lines[1], x, by + 25, 11, col, 'center', '700'); }
+    g.strokeStyle = COL.cyan; g.lineWidth = 1.2;
+    if (k.up) {
+      const path = () => { g.beginPath(); g.moveTo(x, by); g.lineTo(x + 24, by + 12); g.lineTo(x + 12, by + 12); g.lineTo(x + 12, by + bh); g.lineTo(x - 12, by + bh); g.lineTo(x - 12, by + 12); g.lineTo(x - 24, by + 12); g.closePath(); };
+      path(); if (flash) { g.fillStyle = COL.cyan; g.fill(); } g.stroke();
+      T(g, 'UP', x, by + 21, 10.5, flash ? '#000' : COL.cyan, 'center', '700');
+      return;
+    }
+    const x0 = x - bw / 2 + 0.5, y1 = by + 0.5;
+    if (flash) { g.fillStyle = COL.cyan; g.fillRect(x0 - 0.5, by, bw, bh); }
+    g.strokeRect(x0, y1, bw - 1, bh - 1);
+    if (sel && !flash) g.strokeRect(x0 + 2.5, y1 + 2.5, bw - 6, bh - 6);
+    const col = flash ? '#000' : COL.cyan;
+    if (lines.length === 1) T(g, lines[0], x, by + 17, 11, col, 'center', '700');
+    else { T(g, lines[0], x, by + 11, 10, col, 'center', '700'); T(g, lines[1], x, by + 21.5, 10, col, 'center', '700'); }
   });
 }
 
@@ -260,7 +341,7 @@ function drawPFD(g, w, d) {
   if (m1 || m2) {
     T(g, m1, 214, 19, 14, COL.white, 'right', '700');
     const flash = performance.now() - w.modeT < 5000;
-    g.font = `700 14px ${SANS}`; const mw = g.measureText(m2).width;
+    const mw = textW(m2, 14);
     T(g, m2, 222, 19, 14, crashed ? COL.red : COL.white, 'left', '700');
     if (flash && Math.floor((performance.now() - w.modeT) / 500) % 2 === 0) { g.strokeStyle = COL.white; g.lineWidth = 1.2; g.strokeRect(218.5, 5.5, mw + 8, 18); }
   }
@@ -671,147 +752,437 @@ function drawGSI(g, x, cy, gnc, valid) {
 }
 
 // =========================================================================================== HSIT (moving map)
+//
+// Graphic horizontal situation for TAEM and approach / landing.  Symbology follows the orbiter's own
+// displays: the SPEC 50 HORIZ SIT graphic (orbiter fixed at the bottom pointing up, 20 / 40 / 60 s
+// constant-bank predictor circles, HAC circle, touchdown circle joined to the HAC exit, Nz next to
+// the orbiter, top scale = time to HAC intercept -> HAC radial error -> runway crosstrack, right
+// scale = altitude error ±5K / ±1K fly-to) and the MEDS A/E PFD HSI in TAEM (H bug to the HAC
+// tangency, C bug to the HAC centre, runway range via the HAC, HAC-C range, ΔAZ becoming HTA at
+// HAC intercept).  Sources: DPS Dictionary (HORIZ SIT), Entry/TAEM/Approach workbook USA005512,
+// STS 83-0020 displays & controls FSSR, CSI 21002, FAA AC 25-11B.
+//
+// Colour philosophy (NASA orbiter cockpit-upgrade colour table + AC 25-11B): light grey static
+// labels, white scales and dynamic data, magenta targets / guidance, light green selected items,
+// cyan missing data ('M') and edge-key legends, dark grey inactive elements, yellow caution, red
+// warning.  DPS status characters follow the value: ↑ ↓ software limit, H L off scale, M missing.
+//
+// Display-processor model - the MDU sees what the GPC puts on the display bus, not the simulator:
+//   * the GPC samples the navigation state twice a second (2.08 Hz, 480 ms) and the sample reaches
+//     the screen 160 ms later (bus + IDP processing): the picture moves in steps and lags;
+//   * slow cycle 960 ms (1.04 Hz): target waypoint, bearings, ΔAZ / HTA, ranges, time to go,
+//     wind, energy, the message list - and every digital readout;
+//   * a range / orientation change makes the IDP rebuild the map: the map area stays blank until
+//     the next data cycle plus the transform time (more vectors at larger ranges), the range label
+//     flashes meanwhile; entering the page draws the static format first;
+//   * no new data for 3 s: big X over the display (the GPC stopped updating it).
+// Blinking is 1.56 Hz (2 IDP frames on / 2 off, inside AC 25-11B's 0.8 - 4 Hz).  New messages come
+// up in reverse video and blink for 5 s, then stay steady while the condition lasts; a changed
+// guidance mode is boxed for 10 s.
+const HS_BUS = 480, HS_LAT = 160, HS_SLOW = 960, HS_BLINK = 320;
+const HC = { lbl: '#b4b8bc', dat: '#f4f4f2', dim: '#5c6064', sel: '#86ff9e', caut: '#ffe04a' };
+const NZ_LIM = 1.8;                                          // TAEM normal-acceleration limit (g)
+
+/** text with a black halo, for labels drawn over map symbology */
+function TH(g, s, x, y, size, color, align = 'left', weight = '700') {
+  strokeText(g, s, x, y, size, color, align, weight, 'alphabetic', 3);
+}
+/** right-aligned readout ending at x with an optional DPS status character after it */
+function RO(g, x, y, val, status = '', col = HC.dat, size = 15) {
+  T(g, val, x, y, size, col, 'right', '700');
+  if (status) T(g, status, x + 2, y, size - 2, status === 'M' || status === '?' ? COL.cyan : HC.caut, 'left', '700');
+}
+/** boxed readout (MEDS style), right aligned inside a box of width bw ending at x */
+function BRO(g, x, y, bw, val, col = HC.dat, status = '') {
+  g.strokeStyle = HC.lbl; g.lineWidth = 1; g.strokeRect(Math.round(x - bw) + 0.5, y - 15.5, bw, 20);
+  T(g, val, x - 4, y, 15, col, 'right', '700');
+  if (status) T(g, status, x + 3, y, 13, status === 'M' ? COL.cyan : HC.caut, 'left', '700');
+}
+/** HAC exit: where the HAC touches the extended centreline of the landing runway */
+function hacExit(hac, rw) {
+  if (!hac) return null;
+  const c = hac.center, u = rw.u, s = (c[0] - rw.c[0]) * u[0] + (c[1] - rw.c[1]) * u[1];
+  return [rw.c[0] + u[0] * s, rw.c[1] + u[1] * s];
+}
+const polyLen = (P) => { let s = 0; for (let i = 1; i < (P ? P.length : 0); i++) s += Math.hypot(P[i][0] - P[i - 1][0], P[i][1] - P[i - 1][1]); return s; };
+
+/** slow-cycle navigation computations (sent by the GPC once per second) */
+function hsNav(D, prev) {
+  const st = D.st, a = st?.air, gnc = st?.gnc;
+  if (!a || D.link === 'offline') return null;
+  const pos = st.pos, rw = runwayInfo(D.runway, gnc, pos), plan = D.plan, hac = plan && plan.hac;
+  const ph = gnc?.phase || '', sub = gnc?.sub || '';
+  const al = isAL(gnc), gnd = /TOUCH|ROLL|STOP|CRASH/.test(ph);
+  const onHac = !al && !!hac && sub === 'HAC', prf = !al && sub === 'PRF';
+  const exit = hac ? hacExit(hac, rw) : null;
+  const wp1 = hac && !al && !onHac && !prf ? hacTangent(pos, hac) : null;
+  // touchdown point (WP2): 1000 ft past the threshold
+  const sg = rw.end === '33' ? 1 : -1, td = [rw.thr[0] + sg * rw.u[0] * 1000 / FT, rw.thr[1] + sg * rw.u[1] * 1000 / FT];
+  const trk = a.track ?? a.psi, gs = Math.hypot(st.vel[0], st.vel[1]);
+  // range to the touchdown point via the HAC: remaining plan + approach, else straight / tangent + arc + final
+  let rngTd = NaN;
+  if (gnc && fin(gnc.range_to_go) && gnc.range_to_go > 0 && plan) rngTd = gnc.range_to_go + polyLen(plan.approach) + 1000 / FT;
+  else rngTd = Math.hypot(td[0] - pos[0], td[1] - pos[1]);
+  // HAC turn angle to go (deg, in the turn direction) from WP1 - or from the vehicle once on the HAC - to the exit
+  let hta = NaN;
+  if (hac && exit && (wp1 || onHac)) {
+    const from = brgTo(hac.center, onHac ? pos : wp1), to = brgTo(hac.center, exit);
+    hta = wrap360((to - from) * (hac.dir > 0 ? 1 : -1));
+    if (onHac && prev && fin(prev.hta) && prev.hta < 30 && hta > 330) hta = 0;
+  }
+  // lateral deviation for the top scale: before the HAC time to intercept; on the HAC radial error;
+  // prefinal and A/L runway crosstrack (ft, + right of the course)
+  const dyRw = (rw.end === '33' ? 1 : -1) * (st.rwy?.cross ?? NaN) * FT;
+  let top = null;
+  if (!gnd) {
+    if (wp1) top = { mode: 'THAC', t: Math.hypot(wp1[0] - pos[0], wp1[1] - pos[1]) / Math.max(gs, 30), right: hac.dir > 0 };
+    else if (onHac) { const rad = (Math.hypot(pos[0] - hac.center[0], pos[1] - hac.center[1]) - hac.radius) * FT; top = { mode: 'HACR', dev: hac.dir > 0 ? -rad : rad, fs: 5000 }; }
+    else if (prf || al) top = { mode: 'XTRK', dev: dyRw, fs: 2500 };
+  }
+  // wind at the vehicle (air data); landing-runway components of the surface wind (tail +, cross + from the left)
+  const wnd = a.wind || [0, 0, 0], c = rw.crs * D2R;
+  const sfc = st.env && fin(st.env.wind) && fin(st.env.dir) ? [-st.env.wind * Math.sin(st.env.dir * D2R), -st.env.wind * Math.cos(st.env.dir * D2R)] : wnd;
+  const tail = sfc[0] * Math.sin(c) + sfc[1] * Math.cos(c), xw = sfc[0] * Math.cos(c) - sfc[1] * Math.sin(c);
+  const appr = al || prf || a.alt * FT < 12000;                 // landing-wind limits matter from A/L scaling on
+  const bH = hac && !al ? (wp1 ? brgTo(pos, wp1) : null) : null;
+  const tgt = wp1 ? 'WP1' : onHac ? 'HAC' : `${rw.name}${rw.end}`;
+  return {
+    rw, td, exit, wp1, al, gnd, onHac, prf, hta, top, tgt,
+    daz: wrap180(brgTo(pos, wp1 || td) - trk),
+    rngTd, rngC: hac && !al ? Math.hypot(hac.center[0] - pos[0], hac.center[1] - pos[1]) : NaN,
+    bH, bC: hac && !al && !gnd ? brgTo(pos, hac.center) : null, bR: al || !hac ? brgTo(pos, td) : null,
+    ttg: gnc && fin(gnc.time_to_go) && gnc.time_to_go > 0 ? gnc.time_to_go : NaN,
+    windFrom: wrap360(Math.atan2(-wnd[0], -wnd[1]) * R2D), ws: Math.hypot(wnd[0], wnd[1]), tail, xw,
+    dyRw, de: gnc && fin(gnc.energy_err) ? gnc.energy_err * FT : NaN, hasGnc: !!gnc,
+    gs: gs * KT, tas: a.tas * KT, keas: a.keas, mach: a.mach, h: a.alt * FT, agl: (a.agl_gear ?? a.agl ?? a.alt) * FT, hdot: a.vs * FT, trk: wrap360(trk),
+    sbA: st.surf ? st.surf.speedbrake / 98.6 * 100 : NaN, sbC: ((st.surf_cmd?.speedbrake ?? st.cmd?.speedbrake ?? NaN) / 98.6) * 100,
+    appr, msgs: hsMessages(D, gnc, plan, { xw, tail, gnd, appr }),
+  };
+}
+
+/** message list, highest priority first: [id, text, level]  (2 warning, 1 caution, 0 advisory) */
+function hsMessages(D, gnc, plan, x) {
+  const st = D.st, m = [];
+  if (gnc && gnc.terrain_conflict && !x.gnd) m.push(['terr', 'TERRAIN', 2]);
+  if (gnc && gnc.reachable === false && !x.gnd) m.push(['nrg', gnc.energy_high ? 'ENERGY HIGH' : gnc.energy === 'turn' ? 'TURN LIMIT' : 'ENERGY LOW', 1]);
+  if (D.link === 'local') m.push(['prev', 'GPC OFF - NAV PREVIEW', 1]);
+  if (!gnc && D.link !== 'local') m.push(['nog', 'GUID DATA M', 1]);
+  if (gnc && gnc.degraded && !x.gnd) m.push(['degr', 'GUID DEGRADED', 1]);
+  if (plan && plan.fallback && !x.gnd) m.push(['fbk', 'PLAN FALLBACK', 1]);
+  if (!x.gnd && x.appr && Math.abs(x.xw) * KT > 15) m.push(['xw', `XWIND ${Math.round(Math.abs(x.xw) * KT)} KT`, 1]);
+  if (!x.gnd && x.appr && x.tail * KT > 10) m.push(['tw', `TAILWIND ${Math.round(x.tail * KT)} KT`, 1]);
+  if (plan && plan.prev && st && fin(plan.prev.t) && st.t - plan.prev.t < 20)
+    m.push([`sw${plan.id}`, `HAC SWITCH ${plan.prev.hac ? (plan.prev.hac.dir > 0 ? 'R' : 'L') : '-'} → ${plan.hac ? (plan.hac.dir > 0 ? 'R' : 'L') : '-'}`, 1]);
+  if (gnc && gnc.scp && gnc.scp.pending && !x.gnd) m.push(['scp', 'REPLAN', 0]);
+  if (st && st.paused) m.push(['hold', 'SIM HOLD', 0]);
+  return m;
+}
+
+function hsState(w) {
+  return (w.hs ||= { bus: -1, q: [], cur: null, nav: null, slow: -1, seen: {}, msgs: [], fma: {}, planId: null, newPlanT: -1e9, entryT: w.nowT, rxT: w.nowT, lastSt: null });
+}
+/** display bus: GPC sample every 480 ms, delivered 160 ms later; slow-cycle computations every 960 ms */
+function hsBus(hs, d, now) {
+  if (d.st !== hs.lastSt) { hs.lastSt = d.st; hs.rxT = now; }
+  const k = Math.floor(now / HS_BUS);
+  if (k !== hs.bus) {
+    hs.bus = k;
+    hs.q.push({ at: k * HS_BUS + HS_LAT, D: { st: d.st, plan: d.plan, planPts: d.planPts, trail: d.trail, trailN: d.trail ? d.trail.length : 0, runway: d.runway, link: d.link, rxT: hs.rxT } });
+  }
+  while (hs.q.length && hs.q[0].at <= now) {
+    hs.cur = hs.q.shift().D;
+    const s = Math.floor(now / HS_SLOW);
+    if (s !== hs.slow) {
+      hs.slow = s;
+      hs.nav = hsNav(hs.cur, hs.nav);
+      const p = hs.cur.plan;
+      if (p && p.id !== hs.planId) { if (hs.planId !== null) hs.newPlanT = now; hs.planId = p.id; }
+      const msgs = hs.nav ? hs.nav.msgs.slice() : [];
+      if (now - hs.newPlanT < 6000 && hs.nav && !hs.nav.gnd) msgs.push([`np${hs.planId}`, `NEW PLAN ${hs.planId}`, 0]);
+      const seen = {};
+      for (const mm of msgs) seen[mm[0]] = hs.seen[mm[0]] ?? now;
+      hs.seen = seen; hs.msgs = msgs;
+    }
+  }
+}
+
 function drawHSIT(g, w, d) {
-  const st = d.st, a = st?.air, gnc = st?.gnc, valid = !!a && d.link !== 'offline';
+  const now = w.nowT, hs = hsState(w);
+  hsBus(hs, d, now);
+  const D = hs.cur, st = D?.st, a = st?.air, gnc = st?.gnc;
+  const valid = !!a && D.link !== 'offline';
+  const nav = valid ? hs.nav : null;
   const R = RANGES[w.st.rng], headUp = !w.st.sw.orient;
-  const ox = 256, oy = headUp ? 318 : 246, ppn = (headUp ? 250 : 200) / R;
-  const pos = valid ? st.pos : [0, 0, 0];
-  const rot = headUp && valid ? (a.psi ?? a.track) : 0;
+  const blink = Math.floor(now / HS_BLINK) % 2 === 0;
+  const ready = hs.cur && now - hs.entryT >= HS_BUS + HS_LAT;
+  const rebuilding = now - (w.mapT ?? -1e9) < HS_BUS + HS_LAT + R * 2.5;
+  const mapOn = valid && ready && !rebuilding;
+  // ------------------------------------------------ geometry
+  const ox = 256, oy = headUp ? 360 : 258, RA = headUp ? 272 : 176, ppn = RA / R, ARC = 52;
+  const hdg = valid ? wrap360(a.psi ?? a.track) : 0, trk = valid ? wrap360(a.track ?? a.psi) : 0;
+  const rot = headUp ? hdg : 0, pos = valid ? st.pos : [0, 0, 0];
   const cr = Math.cos(rot * D2R), sr = Math.sin(rot * D2R);
   const S = (e, n) => { const de = (e - pos[0]) * NM, dn = (n - pos[1]) * NM; return [ox + (de * cr - dn * sr) * ppn, oy - (de * sr + dn * cr) * ppn]; };
-  const rw = runwayInfo(d.runway, gnc, valid ? pos : null);
-  g.save(); g.beginPath(); g.rect(0, 0, 512, 470); g.clip();
-  // range rings + compass ring
-  g.strokeStyle = '#5d6063'; g.lineWidth = 1;
-  g.setLineDash([4, 6]); g.beginPath(); g.arc(ox, oy, R / 2 * ppn, 0, Math.PI * 2); g.stroke(); g.setLineDash([]);
-  g.strokeStyle = '#8a8c8e'; g.beginPath(); g.arc(ox, oy, R * ppn, 0, Math.PI * 2); g.stroke();
-  const rr = R * ppn;
-  g.strokeStyle = COL.white;
-  for (let b = 0; b < 360; b += 5) {
-    const an = (b - rot) * D2R, L = b % 10 === 0 ? 8 : 4;
-    g.lineWidth = b % 30 === 0 ? 1.5 : 1;
-    line(g, ox + Math.sin(an) * rr, oy - Math.cos(an) * rr, ox + Math.sin(an) * (rr - L), oy - Math.cos(an) * (rr - L));
-    if (b % 30 === 0) T(g, CARD[b / 10], ox + Math.sin(an) * (rr - 17), oy - Math.cos(an) * (rr - 17) + 4, 11.5, COL.white, 'center', '700');
-  }
-  T(g, `${R}`, ox - rr * 0.707 - 4, oy - rr * 0.707 - 2, 11, COL.gray, 'right');
-  T(g, `${R / 2}`, ox - rr * 0.354 - 4, oy - rr * 0.354 - 2, 11, COL.gray, 'right');
-  // runway, extended centrelines with 1 NM ticks
-  const ext = 10 / NM;
-  g.strokeStyle = '#8d8f91'; g.lineWidth = 1; g.setLineDash([6, 5]);
-  for (const [t, sgn] of [[rw.thr33, -1], [rw.thr15, 1]]) {
-    const e = [t[0] + sgn * rw.u[0] * ext, t[1] + sgn * rw.u[1] * ext];
-    const A = S(t[0], t[1]), B = S(e[0], e[1]); line(g, A[0], A[1], B[0], B[1]);
-  }
-  g.setLineDash([]);
-  for (const [t, sgn] of [[rw.thr33, -1], [rw.thr15, 1]]) for (let k = 2; k <= 10; k += 2) {
-    const q = [t[0] + sgn * rw.u[0] * k / NM, t[1] + sgn * rw.u[1] * k / NM];
-    const [px, py] = S(q[0], q[1]); g.fillStyle = '#8d8f91'; g.fillRect(px - 1.5, py - 1.5, 3, 3);
-  }
-  {
-    const A = S(rw.thr33[0], rw.thr33[1]), B = S(rw.thr15[0], rw.thr15[1]);
-    g.strokeStyle = '#000'; g.lineWidth = 7; line(g, A[0], A[1], B[0], B[1]);
-    g.strokeStyle = COL.white; g.lineWidth = Math.max(3.5, 91 * NM * ppn); line(g, A[0], A[1], B[0], B[1]);
-    const lab = (P, txt, sel) => { T(g, txt, P[0] + 9, P[1] + 4, 12, sel ? COL.green : COL.gray, 'left', '700'); };
-    lab(A, '33', rw.end === '33'); lab(B, '15', rw.end === '15');
-  }
-  // plan, HAC, approach, MPC
-  if (w.st.plan && d.planPts && d.planPts.length > 1) {
-    g.strokeStyle = d.plan && d.plan.fallback ? COL.amber : COL.cyan; g.lineWidth = 1.6;
-    g.beginPath(); d.planPts.forEach((q, i) => { const [x, y] = S(q[0], q[1]); i ? g.lineTo(x, y) : g.moveTo(x, y); }); g.stroke();
-  }
-  if (w.st.plan && d.plan && d.plan.prev) {
-    // approach abandoned by a HAC switch
-    const pv = d.plan.prev; g.strokeStyle = COL.gray; g.lineWidth = 1.2; g.setLineDash([4, 4]);
-    if (pv.track && pv.track.length > 1) { g.beginPath(); pv.track.forEach((q, i) => { const [x, y] = S(q[0], q[1]); i ? g.lineTo(x, y) : g.moveTo(x, y); }); g.stroke(); }
-    if (pv.hac) {
-      const [hx, hy] = S(pv.hac.center[0], pv.hac.center[1]);
-      g.beginPath(); g.arc(hx, hy, pv.hac.radius * NM * ppn, 0, Math.PI * 2); g.stroke();
-      T(g, `OLD HAC ${pv.hac.dir > 0 ? 'R' : 'L'}`, hx + 8, hy - 6, 10, COL.gray, 'left', '700');
-    }
-    g.setLineDash([]);
-  }
-  if (w.st.plan && d.plan) {
-    const hac = d.plan.hac;
-    if (hac) {
-      const [hx, hy] = S(hac.center[0], hac.center[1]);
-      g.strokeStyle = COL.mag; g.lineWidth = 1.5; g.setLineDash([5, 4]); g.beginPath(); g.arc(hx, hy, hac.radius * NM * ppn, 0, Math.PI * 2); g.stroke(); g.setLineDash([]);
-      g.lineWidth = 1.2; line(g, hx - 5, hy, hx + 5, hy); line(g, hx, hy - 5, hx, hy + 5);
-      T(g, `HAC ${hac.dir > 0 ? 'R' : 'L'}`, hx + 8, hy - 6, 11, COL.mag, 'left', '700');
-      const tp = valid ? hacTangent(pos, hac) : null;
-      if (tp && !isAL(gnc)) { const [tx, ty] = S(tp[0], tp[1]); g.strokeStyle = COL.mag; g.lineWidth = 1.4; g.strokeRect(tx - 4, ty - 4, 8, 8); T(g, 'WP1', tx + 7, ty + 12, 10.5, COL.mag); }
-    }
-    if (d.plan.approach && d.plan.approach.length > 1) {
-      g.strokeStyle = COL.amber; g.lineWidth = 2; g.beginPath();
-      d.plan.approach.forEach((q, i) => { const [x, y] = S(q[0], q[1]); i ? g.lineTo(x, y) : g.moveTo(x, y); }); g.stroke();
-    }
-    if (d.plan.ali) { const [x, y] = S(d.plan.ali[0], d.plan.ali[1]); g.fillStyle = COL.amber; g.beginPath(); g.moveTo(x, y - 6); g.lineTo(x + 6, y); g.lineTo(x, y + 6); g.lineTo(x - 6, y); g.closePath(); g.fill(); T(g, 'ALI', x + 8, y - 6, 10.5, COL.amber); }
-  }
-  if (w.st.plan && d.mpc && d.mpc.length > 1) {
-    g.strokeStyle = COL.green; g.lineWidth = 3; g.beginPath();
-    d.mpc.forEach((q, i) => { const [x, y] = S(q[0], q[1]); i ? g.lineTo(x, y) : g.moveTo(x, y); }); g.stroke();
-  }
-  if (w.st.trail && d.trail && d.trail.length) {
-    g.fillStyle = 'rgba(240,240,238,0.75)';
-    const n = d.trail.length;
-    for (let i = n - 1, k = 0; i >= 0 && k < 400; i -= 2, k++) { const [x, y] = S(d.trail[i][0], d.trail[i][1]); g.fillRect(x - 1, y - 1, 2, 2); }
-  }
-  // turn predictor (30 / 60 / 90 s) from ground speed, track and bank
-  if (valid) {
-    const gs = Math.hypot(st.vel[0], st.vel[1]), tas = Math.max(a.tas || gs, 40);
-    const om = 9.81 * Math.tan(clamp((a.bank ?? 0) * D2R, -1.3, 1.3)) / tas;
-    let e = pos[0], n = pos[1], psi = (a.track ?? a.psi) * D2R;
-    g.strokeStyle = COL.white; g.lineWidth = 1.6; g.setLineDash([2, 4]); g.beginPath(); g.moveTo(...S(e, n));
-    const ticks = [];
-    for (let t = 1; t <= 90; t++) { psi += om; e += gs * Math.sin(psi); n += gs * Math.cos(psi); g.lineTo(...S(e, n)); if (t % 30 === 0) ticks.push(S(e, n)); }
+  const plan = valid && w.st.plan ? D.plan : null, hac = plan && plan.hac;
+
+  // ------------------------------------------------ map (clipped to the compass circle)
+  g.save();
+  g.beginPath(); g.arc(ox, oy, RA - 1, 0, Math.PI * 2); g.clip();
+  g.beginPath(); g.rect(0, 0, 512, 468); g.clip();
+  if (mapOn) {
+    const rw = nav ? nav.rw : runwayInfo(D.runway, gnc, pos);
+    // half-range ring
+    g.strokeStyle = HC.lbl; g.lineWidth = 1; g.setLineDash([5, 7]); g.beginPath();
+    if (headUp) g.arc(ox, oy, RA / 2, -Math.PI / 2 - ARC * D2R, -Math.PI / 2 + ARC * D2R); else g.arc(ox, oy, RA / 2, 0, Math.PI * 2);
     g.stroke(); g.setLineDash([]);
-    g.fillStyle = COL.white; ticks.forEach(([x, y]) => { g.beginPath(); g.arc(x, y, 2.4, 0, Math.PI * 2); g.fill(); });
+    // runway to scale (at least 3 px wide), extended centreline of the landing end with 1 NM / 5 NM ticks
+    {
+      const A = S(...rw.thr33), B = S(...rw.thr15), Lp = Math.hypot(B[0] - A[0], B[1] - A[1]) || 1;
+      const ux = (B[0] - A[0]) / Lp, uy = (B[1] - A[1]) / Lp, hw = Math.max(1.5, 91 * NM * ppn / 2);
+      g.fillStyle = '#000'; g.strokeStyle = HC.dat; g.lineWidth = 1.2;
+      g.beginPath(); g.moveTo(A[0] - uy * hw, A[1] + ux * hw); g.lineTo(B[0] - uy * hw, B[1] + ux * hw); g.lineTo(B[0] + uy * hw, B[1] - ux * hw); g.lineTo(A[0] + uy * hw, A[1] - ux * hw); g.closePath(); g.fill(); g.stroke();
+      const sg = rw.end === '33' ? -1 : 1, T0 = S(...rw.thr), ext = 10;
+      const E = S(rw.thr[0] + sg * rw.u[0] * ext / NM, rw.thr[1] + sg * rw.u[1] * ext / NM);
+      const el = Math.hypot(E[0] - T0[0], E[1] - T0[1]) || 1, ex = (E[0] - T0[0]) / el, ey = (E[1] - T0[1]) / el;
+      g.strokeStyle = HC.lbl; g.lineWidth = 1; g.setLineDash([7, 5]); line(g, T0[0], T0[1], E[0], E[1]); g.setLineDash([]);
+      if (ppn >= 5) for (let k = 1; k <= ext; k++) {
+        const px = T0[0] + ex * k * ppn, py = T0[1] + ey * k * ppn, L = k % 5 === 0 ? 7 : 4;
+        line(g, px - ey * L, py + ex * L, px + ey * L, py - ex * L);
+      }
+      // touchdown point (small circle) and the straight-in final from the HAC exit
+      const [tx, ty] = S(...nav?.td ?? rw.thr);
+      if (nav && nav.exit && hac && !nav.al) { const [hx, hy] = S(...nav.exit); g.strokeStyle = COL.mag; g.lineWidth = 1.4; line(g, hx, hy, tx, ty); }
+      g.strokeStyle = HC.dat; g.lineWidth = 1.4; g.fillStyle = '#000'; g.beginPath(); g.arc(tx, ty, 3.5, 0, Math.PI * 2); g.fill(); g.stroke();
+      TH(g, rw.end, T0[0] + ex * 16 + 7, T0[1] + ey * 16 + 4, 12, HC.sel);
+    }
+    // abandoned approach after a HAC switch: inactive (dark grey, dashed), for one minute
+    if (plan && plan.prev && plan.prev.hac && (!fin(plan.prev.t) || st.t - plan.prev.t < 60)) {
+      const pv = plan.prev, [hx, hy] = S(...pv.hac.center);
+      g.strokeStyle = HC.dim; g.lineWidth = 1.2; g.setLineDash([4, 5]);
+      g.beginPath(); g.arc(hx, hy, pv.hac.radius * NM * ppn, 0, Math.PI * 2); g.stroke(); g.setLineDash([]);
+      TH(g, `PREV HAC ${pv.hac.dir > 0 ? 'R' : 'L'}`, hx, hy + 4, 10.5, HC.dim, 'center');
+    }
+    // SCP plan from the vehicle to the A/L interface (magenta, amber if the fallback reference)
+    if (plan && D.planPts && D.planPts.length > 1 && !(nav && nav.al)) {
+      const P = D.planPts;
+      let k0 = 0, best = Infinity;
+      for (let i = 0; i < P.length; i++) { const q = (P[i][0] - pos[0]) ** 2 + (P[i][1] - pos[1]) ** 2; if (q < best) { best = q; k0 = i; } }
+      g.strokeStyle = plan.fallback ? COL.amber : COL.mag; g.lineWidth = 1.2; g.setLineDash([2, 4]);
+      g.beginPath(); g.moveTo(...S(P[k0][0], P[k0][1]));
+      for (let i = k0 + 1; i < P.length; i++) g.lineTo(...S(P[i][0], P[i][1]));
+      g.stroke(); g.setLineDash([]);
+    }
+    // HAC (magenta), centre cross, turn-direction arrowheads, WP1 tangency
+    if (hac && !(nav && nav.al)) {
+      const [hx, hy] = S(...hac.center), hr = hac.radius * NM * ppn;
+      g.strokeStyle = COL.mag; g.lineWidth = 1.6; g.beginPath(); g.arc(hx, hy, hr, 0, Math.PI * 2); g.stroke();
+      g.lineWidth = 1.2; line(g, hx - 4, hy, hx + 4, hy); line(g, hx, hy - 4, hx, hy + 4);
+      if (hr > 18) for (const k of [0, 1, 2, 3]) {
+        const an = k * Math.PI / 2 + Math.PI / 4, px = hx + Math.cos(an) * hr, py = hy + Math.sin(an) * hr;
+        const dir = hac.dir > 0 ? 1 : -1, tx = -Math.sin(an) * dir, ty = Math.cos(an) * dir;
+        g.fillStyle = COL.mag; g.beginPath(); g.moveTo(px + tx * 6, py + ty * 6);
+        g.lineTo(px - tx * 2 + Math.cos(an) * 4, py - ty * 2 + Math.sin(an) * 4); g.lineTo(px - tx * 2 - Math.cos(an) * 4, py - ty * 2 - Math.sin(an) * 4); g.closePath(); g.fill();
+      }
+      { const dx = hx - ox, dy = hy - oy, dl = Math.hypot(dx, dy) || 1;     // label on the far side from the orbiter
+        TH(g, `HAC ${hac.dir > 0 ? 'R' : 'L'}`, hx + dx / dl * 28, hy + dy / dl * 16 + 4, 10.5, COL.mag, 'center'); }
+      if (nav && nav.wp1) {
+        const [x, y] = S(...nav.wp1);
+        g.strokeStyle = COL.mag; g.fillStyle = '#000'; g.beginPath(); g.moveTo(x, y - 6); g.lineTo(x + 6, y); g.lineTo(x, y + 6); g.lineTo(x - 6, y); g.closePath(); g.fill(); g.lineWidth = 1.6; g.stroke();
+        TH(g, 'WP1', x + 9, y + 4, 11, COL.mag);
+      }
+    }
+    // history: dark grey dots every ~300 m
+    if (w.st.trail && D.trail && D.trailN) {
+      g.fillStyle = HC.dim;
+      for (let i = D.trailN - 1, k = 0; i >= 0 && k < 300; i -= 2, k++) { const [x, y] = S(D.trail[i][0], D.trail[i][1]); g.fillRect(x - 1, y - 1, 2, 2); }
+    }
+    // predictor circles: constant-bank ground path at 20 / 40 / 60 s (turn rate g·tanφ / Vg)
+    if (!(nav && nav.gnd)) {
+      const gs = Math.max(Math.hypot(st.vel[0], st.vel[1]), 30);
+      const om = 9.80665 * Math.tan(clamp((a.bank ?? 0) * D2R, -1.3, 1.3)) / gs;
+      let e = pos[0], n = pos[1], psi = trk * D2R;
+      g.strokeStyle = HC.dat; g.lineWidth = 1.5; g.fillStyle = '#000';
+      for (let t = 1; t <= 60; t++) {
+        psi += om; e += gs * Math.sin(psi); n += gs * Math.cos(psi);
+        if (t % 20 === 0) { const [x, y] = S(e, n); g.beginPath(); g.arc(x, y, 3.8, 0, Math.PI * 2); g.fill(); g.stroke(); }
+      }
+    }
   }
   g.restore();
-  // own ship
-  if (valid) orbiterSymbol(g, ox, oy, 1.45, COL.yellow, headUp ? 0 : (a.psi ?? a.track) * D2R);
-  else offFlag(g, ox, oy);
-  // heading / track box
-  dbox(g, 226, 6, 60, 22);
-  T(g, valid ? pad(w.hold('hsitHdg', Math.round(wrap360(a.psi ?? a.track)) % 360), 3) : '---', 256, 23, 16, COL.white, 'center', '700');
-  if (headUp) tri(g, 256, 40, 8, 'down', COL.white);
-  T(g, headUp ? 'HDG UP' : 'N UP', 296, 22, 11, COL.cyan);
-  T(g, `RNG ${R} NM`, 296, 36, 11, COL.cyan);
-  // data blocks
-  const lft = [], rgt = [], bl = [];
-  if (valid) {
-    const gsk = Math.hypot(st.vel[0], st.vel[1]) * KT;
-    lft.push(['GS', `${Math.round(gsk)}`], ['TAS', `${Math.round(a.tas * KT)}`], ['M', a.mach.toFixed(2)], ['KEAS', `${Math.round(a.keas)}`]);
-    const dthr = Math.hypot(pos[0] - rw.thr[0], pos[1] - rw.thr[1]);
-    rgt.push(['RWY', `${rw.end} ${rw.name}`], ['RNG', `${(dthr * NM).toFixed(1)}`], ['BRG', pad(Math.round(brgTo(pos, rw.thr)) % 360, 3)]);
-    if (gnc && fin(gnc.time_to_go) && gnc.time_to_go > 0) rgt.push(['TTG', mmss(gnc.time_to_go)]);
-    if (gnc && fin(gnc.energy_err)) rgt.push(['ΔE', `${gnc.energy_err >= 0 ? '+' : ''}${Math.round(gnc.energy_err * FT)}`]);
-    bl.push(['H', fmtFtK(a.alt * FT)], ['Ḣ', `${Math.round(a.vs * FT)}`], ['TRK', pad(Math.round(wrap360(a.track)) % 360, 3)]);
-  }
-  const mask = (x, y, n, wd) => { if (n) { g.fillStyle = 'rgba(0,0,0,0.82)'; g.fillRect(x, y, wd, n * 16 + 6); } };
-  const hL = w.hold('hsitL', lft), hR = w.hold('hsitR', rgt), hB = w.hold('hsitB', bl);
-  mask(4, 48, hL.length, 86); mask(406, 48, hR.length, 102); mask(4, 406, hB.length, 86);
-  hL.forEach(([k, v], i) => { T(g, k, 8, 62 + i * 16, 12, COL.gray); T(g, v, 86, 62 + i * 16, 13, COL.white, 'right'); });
-  hR.forEach(([k, v], i) => { T(g, k, 410, 62 + i * 16, 12, COL.gray); T(g, v, 504, 62 + i * 16, 13, k === 'RWY' ? COL.green : COL.white, 'right'); });
-  hB.forEach(([k, v], i) => { T(g, k, 8, 420 + i * 16, 12, COL.gray); T(g, v, 86, 420 + i * 16, 13, COL.white, 'right'); });
-  // wind arrow (where the air goes)
-  if (valid && a.wind) {
-    const we = a.wind[0], wn = a.wind[1], ws = Math.hypot(we, wn);
-    const from = wrap360(Math.atan2(-we, -wn) * R2D);
-    const cx = 470, cy = 430;
-    g.fillStyle = 'rgba(0,0,0,0.82)'; g.fillRect(440, 388, 70, 80);
-    T(g, 'WIND', 504, 400, 11, COL.gray, 'right');
-    T(g, `${pad(Math.round(from) % 360, 3)}/${Math.round(ws * KT)}`, 504, 462, 12, COL.white, 'right');
-    if (ws > 0.3) {
-      g.save(); g.translate(cx, cy); g.rotate((from + 180 - rot) * D2R);
-      g.strokeStyle = COL.cyan; g.fillStyle = COL.cyan; g.lineWidth = 2;
-      line(g, 0, 14, 0, -10); g.beginPath(); g.moveTo(0, -16); g.lineTo(-5, -7); g.lineTo(5, -7); g.closePath(); g.fill();
+
+  // ------------------------------------------------ compass (arc in HDG UP, full rose in N UP)
+  g.strokeStyle = HC.dat; g.lineWidth = 1.4; g.beginPath();
+  if (headUp) g.arc(ox, oy, RA, -Math.PI / 2 - ARC * D2R, -Math.PI / 2 + ARC * D2R); else g.arc(ox, oy, RA, 0, Math.PI * 2);
+  g.stroke();
+  for (let b = 0; b < 360; b += 5) {
+    const rel = wrap180(b - rot);
+    if (headUp && Math.abs(rel) > ARC) continue;
+    const an = rel * D2R, maj = b % 10 === 0, L = maj ? 9 : 5;
+    g.lineWidth = maj ? 1.4 : 1;
+    line(g, ox + Math.sin(an) * RA, oy - Math.cos(an) * RA, ox + Math.sin(an) * (RA - L), oy - Math.cos(an) * (RA - L));
+    if (b % 30 === 0 || (headUp && maj)) {
+      const k = b / 10, lab = k % 9 === 0 ? 'NESW'[k / 9] : `${k}`;
+      g.save(); g.translate(ox, oy); g.rotate(an);
+      T(g, lab, 0, -RA + 23, b % 30 === 0 ? 14 : 11.5, HC.dat, 'center', '700');
       g.restore();
     }
   }
-  // guidance mode
-  const [m1, m2] = guidMode(gnc);
-  if (m1 || m2) T(g, `${m1} ${m2}`.trim(), 256, 462, 12, COL.green, 'center', '700');
-  if (d.link === 'local') T(g, 'NAV: PREVIEW', 256, 446, 11, COL.amber, 'center', '700');
+  // bearing bugs outside the compass (H: HAC tangency, green; C: HAC centre, white; R: touchdown, green)
+  const bug = (b, lab, col) => {
+    let rel = wrap180(b - rot); const peg = headUp && Math.abs(rel) > ARC; if (peg) rel = Math.sign(rel) * ARC;
+    g.save(); g.translate(ox, oy); g.rotate(rel * D2R); g.translate(0, -RA - 2);
+    g.beginPath(); g.moveTo(0, 0); g.lineTo(-6.5, -6); g.lineTo(-6.5, -16); g.lineTo(6.5, -16); g.lineTo(6.5, -6); g.closePath();
+    g.fillStyle = peg ? '#000' : col; g.fill(); g.strokeStyle = peg ? col : '#000'; g.lineWidth = 1.2; g.stroke();
+    g.translate(0, -9.5); g.rotate(-rel * D2R); T(g, lab, 0, 4, 10, peg ? col : '#000', 'center', '700');
+    g.restore();
+  };
+  if (nav && ready) {
+    if (nav.bC !== null && !nav.al) bug(nav.bC, 'C', HC.dat);
+    if (nav.bH !== null) bug(nav.bH, 'H', COL.green);
+    if (nav.bR !== null && !nav.gnd) bug(nav.bR, 'R', COL.green);
+  }
+  if (valid && ready) {
+    // track pointer: hollow diamond inside the scale
+    const tr = wrap180(trk - rot);
+    if (!headUp || Math.abs(tr) <= ARC) {
+      g.save(); g.translate(ox, oy); g.rotate(tr * D2R);
+      g.strokeStyle = HC.dat; g.lineWidth = 1.5; g.beginPath(); g.moveTo(0, -RA + 1); g.lineTo(4.5, -RA + 9); g.lineTo(0, -RA + 17); g.lineTo(-4.5, -RA + 9); g.closePath(); g.stroke();
+      g.restore();
+    }
+  }
+  // heading readout + lubber line (HDG UP); in N UP the orbiter symbol shows heading
+  {
+    const by = headUp ? oy - RA - 46 : 44, bh = 22;
+    if (headUp) { g.strokeStyle = HC.dat; g.lineWidth = 2.2; line(g, ox, by + bh, ox, oy - RA + 13); }
+    dbox(g, 229, by, 54, bh, valid ? HC.dat : COL.amber, 1.3);
+    if (valid && ready) T(g, pad(Math.round(hdg) % 360 || 360, 3), 256, by + 18, 18, HC.dat, 'center', '700');
+    else if (!valid && D) T(g, 'HDG', 256, by + 17, 14, COL.amber, 'center', '700');
+    T(g, headUp ? 'HDG UP' : 'N UP', 222, by + 16, 11, COL.cyan, 'right', '700');
+    // range: on the half-range ring (blinks while the IDP rebuilds the map)
+    const [lx, ly] = headUp ? [ox - Math.sin((ARC - 4) * D2R) * RA / 2, oy - Math.cos((ARC - 4) * D2R) * RA / 2] : [ox - RA * 0.354, oy - RA * 0.354];
+    if (!rebuilding || blink) TH(g, `${R / 2}`, lx - 3, ly + 4, 12, rebuilding ? COL.cyan : HC.lbl, 'right');
+    T(g, `${R} NM`, 290, by + 16, 11, COL.cyan, 'left', '700');
+  }
+  // orbiter (fixed, pointing up in HDG UP) with Nz beside it; both blink above the Nz limit
+  if (valid && ready) {
+    const nz = a.nz, over = fin(nz) && nz > NZ_LIM;
+    if (!over || blink) {
+      orbiterSymbol(g, ox, oy, 1.05, HC.dat, headUp ? 0 : hdg * D2R);
+      if (fin(nz) && !(nav && nav.gnd)) TH(g, nz.toFixed(1), ox - 15, oy + 6, 12, over ? HC.caut : HC.dat, 'right');
+    }
+  }
+  if (!valid && D) { dbox(g, 218, oy - 50, 76, 28, COL.amber, 1.6); T(g, 'MAP', 256, oy - 29, 19, COL.amber, 'center', '700'); }
+
+  // ------------------------------------------------ top scale: time to HAC intercept / HAC radial error / crosstrack
+  if (nav && nav.top && ready) {
+    const x0 = 150, x1 = 350, y = 14, tp = nav.top;
+    g.strokeStyle = HC.dat; g.lineWidth = 1.3;
+    if (tp.mode === 'THAC') {
+      // 0 .. 3 (x10 s); zero on the side of the turn; ▽ from 20 s, blinking until 10 s
+      const X = (s) => (tp.right ? x1 - (s / 30) * (x1 - x0) : x0 + (s / 30) * (x1 - x0));
+      line(g, x0, y, x1, y);
+      for (let s = 0; s <= 3; s++) { line(g, X(s * 10), y - 5, X(s * 10), y + 5); T(g, `${s}`, X(s * 10), y + 17, 11, HC.lbl, 'center', '700'); }
+      T(g, 'T HAC', X(25), y + 17, 10, HC.lbl, 'center', '700');          // between the 2 and 3 marks
+      if (tp.t <= 20 && (tp.t <= 10 || blink)) tri(g, X(Math.max(tp.t, 0)), y - 2, 9, 'down', HC.dat, '#000');
+    } else {
+      const X = (v) => (x0 + x1) / 2 + clamp(v / tp.fs, -1, 1) * (x1 - x0) / 2;
+      line(g, x0, y, x1, y);
+      for (const f of [-1, -0.5, 0, 0.5, 1]) line(g, X(f * tp.fs), y - (f === 0 ? 7 : 4), X(f * tp.fs), y + (f === 0 ? 7 : 4));
+      const lab = tp.fs >= 5000 ? '5K' : '2.5K';
+      T(g, lab, x0, y + 17, 10, HC.lbl, 'center', '700'); T(g, lab, x1, y + 17, 10, HC.lbl, 'center', '700');
+      T(g, tp.mode === 'HACR' ? 'ΔR HAC' : 'Y RWY', (x0 + x1) / 2, y + 20, 10, HC.lbl, 'center', '700');
+      if (fin(tp.dev)) {
+        const pinned = Math.abs(tp.dev) > tp.fs;
+        if (!pinned || blink) orbiterSymbol(g, X(tp.dev), y + 1, 0.62, pinned ? HC.caut : HC.dat);
+      }
+    }
+  }
+
+  // ------------------------------------------------ right scale: altitude error (fly-to)
+  if (nav && !nav.gnd && ready && gnc && fin(gnc.h_err)) {
+    const x = 490, cy = headUp ? 250 : 258, half = 62, fs = (nav.al || nav.prf) ? 1000 : 5000;
+    g.fillStyle = '#000'; g.fillRect(x - 16, cy - half - 24, 34, 2 * half + 48);
+    g.strokeStyle = HC.dat; g.lineWidth = 1.3; line(g, x, cy - half, x, cy + half);
+    for (const f of [-1, -0.5, 0, 0.5, 1]) line(g, x - (f === 0 ? 8 : 5), cy + f * half, x, cy + f * half);
+    const lab = fs === 1000 ? '1K' : '5K';
+    T(g, lab, x - 2, cy - half - 8, 10, HC.lbl, 'center', '700'); T(g, lab, x - 2, cy + half + 16, 10, HC.lbl, 'center', '700');
+    const herr = gnc.h_err * FT, v = -herr / fs, pinned = Math.abs(v) > 1, py = cy + clamp(v, -1, 1) * half;
+    if (!pinned || blink) tri(g, x + 1, py, 11, 'left', pinned ? HC.caut : COL.green, '#000');
+  }
+
+  // ------------------------------------------------ data blocks
+  const LBL = (s, x, y) => T(g, s, x, y, 11, HC.lbl, 'left', '700');
+  if (nav && ready) {
+    // top left: ground speed, true airspeed, KEAS, Mach; wind (from / kt) with arrow; runway wind components
+    LBL('GS', 6, 18); RO(g, 104, 18, `${Math.round(nav.gs)}`);
+    LBL('TAS', 6, 35); RO(g, 104, 35, `${Math.round(nav.tas)}`);
+    LBL('KEAS', 6, 52); RO(g, 104, 52, `${Math.round(nav.keas)}`);
+    LBL('M', 6, 69); RO(g, 104, 69, nav.mach.toFixed(2).replace(/^0/, ''));
+    const ws = nav.ws * KT;
+    if (ws < 2) RO(g, 104, 90, 'CALM');
+    else {
+      RO(g, 104, 90, `${pad(Math.round(nav.windFrom) % 360 || 360, 3)}/${Math.round(ws)}`);
+      g.save(); g.translate(16, 92); g.rotate((nav.windFrom + 180 - rot) * D2R);
+      g.strokeStyle = HC.dat; g.fillStyle = HC.dat; g.lineWidth = 1.8; line(g, 0, 10, 0, -5);
+      g.beginPath(); g.moveTo(0, -11); g.lineTo(-4, -4); g.lineTo(4, -4); g.closePath(); g.fill(); g.restore();
+    }
+    const hw = -nav.tail * KT, xw = nav.xw * KT;                 // surface wind on the landing runway
+    LBL(`SFC ${hw >= 0 ? 'HW' : 'TW'}`, 6, 110); RO(g, 104, 110, `${Math.round(Math.abs(hw))}`, nav.appr && hw < -10 ? '↑' : '', HC.dat, 14);
+    LBL('SFC XW', 6, 127); RO(g, 104, 127, `${Math.round(Math.abs(xw))}${Math.round(Math.abs(xw)) ? (xw > 0 ? 'L' : 'R') : ''}`, nav.appr && Math.abs(xw) > 15 ? '↑' : '', HC.dat, 14);
+
+    // top right (MEDS HSI readouts): runway + range to touchdown via the HAC, HAC centre range, ΔAZ -> HTA, time to go
+    const rx = 492;
+    T(g, `${nav.rw.name}${nav.rw.end}`, rx - 108, 18, 12, HC.sel, 'left', '700'); BRO(g, rx, 18, 52, (nav.rngTd * NM).toFixed(1));
+    if (fin(nav.rngC)) { LBL('HAC-C', rx - 108, 41); BRO(g, rx, 41, 52, (nav.rngC * NM).toFixed(1)); }
+    if (fin(nav.hta) && nav.onHac) { LBL('HTA', rx - 108, 64); BRO(g, rx, 64, 52, `${Math.round(nav.hta)}°`); }
+    else if (!nav.al && !nav.gnd) { LBL('ΔAZ', rx - 108, 64); BRO(g, rx, 64, 52, `${Math.round(Math.abs(nav.daz))}°`, HC.dat, Math.abs(nav.daz) > 30 && nav.wp1 ? '↑' : ''); }
+    else if (fin(nav.dyRw)) { LBL('ΔY', rx - 108, 64); BRO(g, rx, 64, 52, `${Math.abs(Math.round(nav.dyRw))}${Math.abs(nav.dyRw) < 1 ? '' : nav.dyRw > 0 ? 'R' : 'L'}`, HC.dat, Math.abs(nav.dyRw) > 1000 ? '↑' : ''); }
+    if (fin(nav.hta) && !nav.onHac) { LBL('HTA', rx - 108, 85); RO(g, rx - 2, 85, `${Math.round(nav.hta)}°`); }
+    if (fin(nav.ttg) && !nav.gnd) { LBL('TTG', rx - 108, 102); RO(g, rx - 2, 102, mmss(nav.ttg)); }
+
+    // bottom left: altitude (K format above 10 000 ft), altitude rate, ground track
+    const blk = (x, y, wd, h) => { g.fillStyle = '#000'; g.fillRect(x, y, wd, h); };
+    blk(0, 400, 118, 68); blk(394, 400, 118, 68);
+    LBL('H', 6, 418); RO(g, 100, 418, fmtFtK(nav.h));
+    LBL('Ḣ', 6, 436); RO(g, 100, 436, `${nav.hdot >= 0 ? '+' : ''}${Math.round(nav.hdot)}`, nav.agl < 100 && nav.hdot < -9.6 && !nav.gnd ? '↓' : '');   // touchdown sink limit
+    LBL('TRK', 6, 454); RO(g, 100, 454, pad(Math.round(nav.trk) % 360 || 360, 3));
+    // bottom right: energy error (corridor +8000 / -4000 ft), speedbrake actual / command
+    LBL('ΔE', 400, 418);
+    if (!nav.hasGnc) RO(g, 492, 418, '', 'M');
+    else if (fin(nav.de) && !nav.gnd) RO(g, 492, 418, `${nav.de >= 0 ? '+' : ''}${Math.round(nav.de)}`, nav.de > 8000 ? '↑' : nav.de < -4000 ? '↓' : '');
+    LBL('SB', 400, 436); if (fin(nav.sbA)) RO(g, 492, 436, `${Math.round(clamp(nav.sbA, 0, 100))}`);
+    LBL('SB CMD', 400, 454); if (fin(nav.sbC)) RO(g, 492, 454, `${Math.round(clamp(nav.sbC, 0, 100))}`, '', COL.mag);
+  }
+
+  // ------------------------------------------------ guidance mode (bottom centre, boxed 10 s after a change)
+  if (valid && ready) {
+    const [m1, m2] = guidMode(gnc), css = (st.mode || 'AUTO') === 'MANUAL';
+    const cells = [[m1 || '', 'ph', 212], [m2 || '', 'sub', 270], [css ? 'CSS' : 'AUTO', 'ctl', 326]];
+    for (const [s, k, x] of cells) {
+      if (!s) continue;
+      if (hs.fma[k]?.s !== s) hs.fma[k] = { s, t: hs.fma[k] ? now : -1e9 };
+      const col = s === 'CRASH' ? COL.red : k === 'ctl' ? (css ? HC.caut : HC.lbl) : COL.green;
+      TH(g, s, x, 458, 14, col, 'center');
+      if (now - hs.fma[k].t < 10000) { const tw = Math.round(textW(s, 14) + 10); g.strokeStyle = HC.dat; g.lineWidth = 1.2; g.strokeRect(Math.round(x - tw / 2) + 0.5, 443.5, tw, 19); }
+    }
+  }
+  // ------------------------------------------------ messages (two highest priority above the mode line)
+  if (D && hs.msgs.length && ready) {
+    const shown = hs.msgs.slice(0, 2);
+    shown.forEach(([id, s, lv], i) => {
+      const col = lv === 2 ? COL.red : lv === 1 ? HC.caut : HC.dat, y = 432 - (shown.length - 1 - i) * 19;
+      const isNew = now - (hs.seen[id] ?? now) < 5000;
+      const tw = Math.round(textW(s, 13) + 10);
+      if (isNew && blink) { g.fillStyle = col; g.fillRect(256 - tw / 2, y - 13, tw, 17); T(g, s, 256, y, 13, '#000', 'center', '700'); }
+      else TH(g, s, 256, y, 13, col, 'center');
+    });
+    if (hs.msgs.length > 2) TH(g, `+${hs.msgs.length - 2}`, 256 + 80, 432, 11, HC.dat, 'left');
+  }
+  // ------------------------------------------------ no display updates for 3 s: big X
+  if (D && now - hs.rxT > 3000) {
+    g.strokeStyle = COL.red; g.lineWidth = 2.5; line(g, 16, 16, 496, 452); line(g, 496, 16, 16, 452);
+    dbox(g, 404, 440, 102, 24, COL.mag, 1.2); T(g, 'POLL FAIL', 455, 457, 13, COL.mag, 'center', '700');
+  }
   drawKeyLegends(g, w);
 }
 
@@ -1230,7 +1601,7 @@ class MduWindow {
   _tgGet(c) { return c === 'pwr' ? (this.st.power ? 0 : 1) : this.st.sw[c] ?? 0; }
   _tgSet(c, v) {
     if (c === 'pwr') this.setPower(v === 0);
-    else { this.st.sw[c] = v; if (c === 'att' && v === 2) this.attRef = null; this.dirty = true; }
+    else { this.st.sw[c] = v; if (c === 'att' && v === 2) this.attRef = null; if (c === 'orient') this.mapT = performance.now(); this.dirty = true; }
     this._syncUi(); this.m.save();
   }
 
@@ -1258,7 +1629,7 @@ class MduWindow {
     const put = (f) => {
       if (c === 'rng') {
         const i = clamp(Math.round(f * (detents - 1)), 0, detents - 1);
-        if (i !== this.st.rng) { this.st.rng = i; this.m.clicks.play('detent'); this.dirty = true; }
+        if (i !== this.st.rng) { this.st.rng = i; this.mapT = performance.now(); this.m.clicks.play('detent'); this.dirty = true; }
       } else {
         const nf = clamp(f, 0, 1);
         if (Math.floor(nf * 20) !== Math.floor(this.st.brt * 20)) this.m.clicks.play('detent');
@@ -1351,10 +1722,11 @@ class MduWindow {
     if (!k) return;
     if (k.up) { this.st.menu = m.up || 'MAIN'; }
     else if (k.menu && !k.page) this.st.menu = k.menu;
-    if (k.page) { this.st.page = k.page; if (k.menu) this.st.menu = k.menu; this.lastDraw = 0; }
+    if (k.page) { if (k.page !== this.st.page) this.hs = null; this.st.page = k.page; if (k.menu) this.st.menu = k.menu; this.lastDraw = 0; }
     if (k.act === 'rngUp') this.st.rng = clamp(this.st.rng + 1, 0, RANGES.length - 1);
     if (k.act === 'rngDn') this.st.rng = clamp(this.st.rng - 1, 0, RANGES.length - 1);
     if (k.act === 'orient') this.st.sw.orient = this.st.sw.orient ? 0 : 1;
+    if (/rng|orient/.test(k.act || '')) this.mapT = performance.now();      // IDP rebuilds the map
     if (k.act === 'plan') this.st.plan = !this.st.plan;
     if (k.act === 'trail') this.st.trail = !this.st.trail;
     if (k.act === 'msgrst') this.m.faultAck = true;
