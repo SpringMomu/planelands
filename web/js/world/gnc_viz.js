@@ -53,8 +53,22 @@ export class GncViz {
   _replace(key, obj) {
     const old = this.objs[key];
     if (old) { this.group.remove(old); old.traverse((o) => { if (o.geometry && o.geometry.dispose) o.geometry.dispose(); }); }
-    if (obj) { obj.frustumCulled = false; obj.renderOrder = 5; this.group.add(obj); }
+    if (obj) {
+      obj.frustumCulled = false; obj.renderOrder = 5;
+      // apply the display toggle before the object enters the scene: a replaced overlay (new MPC
+      // prediction ~2.5 Hz, re-plan) must not show for a frame while its toggle is off
+      obj.visible = this._visFor(key);
+      this.group.add(obj);
+    }
     this.objs[key] = obj;
+  }
+
+  _visFor(key) {
+    const v = this.visible;
+    if (key === 'mpc') return v.mpc;
+    if (key === 'plan' || key === 'curtain' || key === 'hac') return v.plan;
+    if (key === 'appr' || key === 'gates' || key === 'ali' || key === 'aim') return v.approach;
+    return true;
   }
 
   _line(pointsThree, mat, colors) {
@@ -183,10 +197,7 @@ export class GncViz {
     this._applyVis();
   }
   _applyVis() {
-    const o = this.objs, v = this.visible;
-    for (const k of ['plan', 'curtain', 'hac']) if (o[k]) o[k].visible = v.plan;
-    if (o.mpc) o.mpc.visible = v.mpc;
-    for (const k of ['appr', 'gates', 'ali', 'aim']) if (o[k]) o[k].visible = v.approach;
+    for (const [k, o] of Object.entries(this.objs)) if (o) o.visible = this._visFor(k);
   }
 
   update(width, height) {
