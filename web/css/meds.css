@@ -195,5 +195,6 @@
 .meds-dock button kbd { font-family: var(--mono); color: var(--dim); margin-right: 5px; font-size: 10px; }
 .meds-dock button.on { background: rgba(108, 240, 160, 0.14); border-color: rgba(108, 240, 160, 0.55); }
 
-body.ui-hidden .mdu-win, body.ui-hidden .meds-dock { display: none; }
+/* H (hide UI) keeps the MDU windows: they are instruments, not UI chrome; F / N still toggle them */
+body.ui-hidden .meds-dock { display: none; }
 #toasts { z-index: 60; }
