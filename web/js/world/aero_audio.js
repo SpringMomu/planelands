@@ -9,7 +9,7 @@
 import { AeroAcoustics, NB, FC } from './aeroacoustics.js';
 import { SpectralNoise } from './aero_synth.js';
 
-const FS_DB = -16;                         // dBFS (rms) of 1 Pa
+const FS_DB = -26;                         // dBFS (rms) of 1 Pa
 const GAIN = Math.pow(10, FS_DB / 20);
 
 export class AeroAudio {
@@ -22,6 +22,7 @@ export class AeroAudio {
     this.spl = 0;                          // overall level at the listener (dB re 20 uPa), for display / debugging
     this.delay = 0;
     this._dir = new Float32Array(NB); this._wl = new Float32Array(NB); this._dif = new Float32Array(NB);
+    this._sent = 0;
   }
 
   /** start the worklet on the audio context (after the user gesture that unlocked it) */
@@ -33,7 +34,7 @@ export class AeroAudio {
       try {
         const synth = new SpectralNoise(ctx.sampleRate);
         synth.message({ bands: Float64Array.from(FC) });
-        const sp = ctx.createScriptProcessor(2048, 1, 2);
+        const sp = ctx.createScriptProcessor(16384, 1, 2);      // large: rides out main-thread stalls
         sp.onaudioprocess = (e) => synth.render(e.outputBuffer.getChannelData(0), e.outputBuffer.getChannelData(1));
         sp.connect(dest);
         this.node = { port: { postMessage: (m) => synth.message(m) }, sp };
@@ -69,6 +70,10 @@ export class AeroAudio {
     });
     this.spl = o.spl; this.delay = o.delay;
     if (!this.node) return;
+    // the synthesiser takes a new spectrum every 43 ms: send at about that rate, not every frame
+    const now = performance.now();
+    if (now - this._sent < 40) return;
+    this._sent = now;
     const on = this.enabled && !L.mute;
     for (let i = 0; i < NB; i++) {
       this._dir[i] = on ? o.dir[i] : 0; this._dif[i] = on ? o.dif[i] : 0; this._wl[i] = o.wl[i];

@@ -181,7 +181,7 @@ async function main() {
   const rig = new CameraRig(camera, canvas, terrain, airport);
   // MEDS glass-cockpit windows (A/E PFD, HSIT nav display, SPI, DPS pages): F / N or the dock buttons
   const meds = new Meds({ dock: $('#camerabar') });
-  // 3D flight deck for the cockpit view (built on first use, parented to the orbiter)
+  // 3D flight deck for the cockpit view (built at the end of loading, parented to the orbiter)
   const cockpit = new Cockpit({ U, meds });
   resize();
   addEventListener('resize', resize);
@@ -472,6 +472,11 @@ async function main() {
   let windOff = new THREE.Vector2();
   let frame = 0;
 
+  // the flight deck is built while loading and its shaders compiled in the background, so the first
+  // switch to the cockpit view does not stall the page (geometry, baked textures, ~20 shader programs)
+  ld('构建座舱…', 0.97); await nextFrame();
+  cockpit.build();
+  if (renderer.compileAsync) renderer.compileAsync(cockpit.scene, camera).catch((e) => console.warn('cockpit shader pre-compile', e));
   ld('就绪', 1);
   setTimeout(() => $('#loading').classList.add('done'), 250);
 
