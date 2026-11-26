@@ -14,6 +14,8 @@
 //   edges fray into wisps as they dilute
 // * fine particles: strong forward scattering (bright against the sun), dense cores self-shadow and
 //   look grey, thin parts slightly blue-white; lit by sun, sky and the runway below
+// * the same puffs carry the dust ground off where the airframe scrapes the runway (sparks.js): silica
+//   tile fibres, concrete and aluminium fines, grey-beige, barely buoyant
 import * as THREE from 'three';
 import { makeRT } from '../render/pass.js';
 
@@ -68,8 +70,10 @@ float hgp(float c, float g){ float g2 = g * g; return (1.0 - g2) / (12.566 * pow
 void main(){
   float r2 = dot(vQ, vQ);
   if (r2 > 1.0) discard;
+  float dust = step(1.5, vSeed);                          // seed + 2: abrasion dust instead of rubber smoke
+  float seed = vSeed - 2.0 * dust;
   // billowing structure: domain-warped fbm turning over slowly, plus rounded "cauliflower" lobes
-  vec2 p = vQR * 1.5 + vSeed * 31.7;
+  vec2 p = vQR * 1.5 + seed * 31.7;
   vec2 warp = vec2(fbm(p + vec2(0.0, vAge * 0.35)), fbm(p + vec2(5.2, -vAge * 0.28)));
   float n = fbm(p + warp * 1.4 + vec2(vAge * 0.12, vAge * 0.45));
   float lobes = 1.0 - abs(2.0 * fbm(p * 2.2 + warp * 0.8 - vAge * 0.2) - 1.0);
@@ -98,6 +102,7 @@ void main(){
   vec3 gnd = uGround * (0.5 - 0.5 * upn);
   // thin smoke slightly blue-white, dense core grey (some soot)
   vec3 alb = mix(vec3(0.86, 0.88, 0.93), vec3(0.62, 0.62, 0.63), smoothstep(0.3, 1.4, tau));
+  alb = mix(alb, mix(vec3(0.50, 0.47, 0.43), vec3(0.34, 0.32, 0.30), smoothstep(0.3, 1.4, tau)), dust);
   vec3 col = alb * (sun + sky + gnd);
   outColor = vec4(col * a, a);
 }`;
@@ -191,6 +196,28 @@ export class TireSmoke {
     P.heat[k] = (0.6 + r() * 0.6) * (1.1 - 0.5 * u);
     P.rot[k] = r() * 6.283; P.rotv[k] = gauss() * 0.35;
     P.seed[k] = r();
+  }
+
+  /**
+   * a puff of abrasion dust where the airframe grinds on the runway (three world position, velocity m/s)
+   * @param {number} a0 initial column density (0..1)
+   */
+  dust(px, py, pz, vx, vy, vz, a0) {
+    if (this.n >= MAX) return;
+    const P = this.p, k = this.n++;
+    const r = Math.random;
+    P.x[k] = px + gauss() * 0.15; P.y[k] = py + 0.1 + r() * 0.2; P.z[k] = pz + gauss() * 0.15;
+    P.vx[k] = vx; P.vy[k] = vy; P.vz[k] = vz;
+    P.tx[k] = gauss() * 0.6; P.ty[k] = gauss() * 0.3; P.tz[k] = gauss() * 0.6;
+    P.age[k] = 0;
+    P.life[k] = 3.5 + r() * 3.5;
+    P.s0[k] = 0.35 + r() * 0.3;
+    P.k[k] = 7 * (0.7 + r() * 0.6);
+    P.a0[k] = a0 * (0.6 + 0.4 * r());
+    P.heat[k] = 0.15 + r() * 0.25;                // friction-heated, but mineral dust is heavy
+    P.rot[k] = r() * 6.283; P.rotv[k] = gauss() * 0.35;
+    P.seed[k] = 2 + r() * 0.999;
+    this.active = true;
   }
 
   /**

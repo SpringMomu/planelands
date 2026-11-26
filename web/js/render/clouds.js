@@ -84,7 +84,9 @@ void main(){
     // through a thick layer do not slice the clouds into visible layers
     float baseStep = seg / float(N);
     float lightStep = uCloudThick * 0.045;
-    float t = t0 + clamp(baseStep, 25.0, 140.0) * jitter;
+    // jittered start, never past the segment: a short segment (camera inside the layer looking at
+    // the cockpit ~1 m away) would otherwise get a single 25 m step on a few % of pixels -> white dots
+    float t = t0 + min(clamp(baseStep, 25.0, 140.0), seg) * jitter;
     int zeroRun = 0;
     bool backed = false;
     int budget = N * 2 + 32;
@@ -104,6 +106,9 @@ void main(){
         dens *= 1.0 - smoothstep(uMaxDist * 0.55, uMaxDist, t);
       }
       if (dens > 0.002){
+        // integrate only what is left of the segment; the first sample also covers the jitter
+        // offset [t0, t], so the integrated length is exact (no 0..step noise on near hits)
+        float stI = min(st, t1 - t) + (i == 0 ? t - t0 : 0.0);
         float sigma = dens * uCloudExt;
         float od = 0.0; float ls = lightStep; float lt = ls * 0.5;
         for (int j = 0; j < 8; j++){
@@ -128,7 +133,7 @@ void main(){
         // lightning inside / near the cloud lights it from within (scattered, softened by the cloud depth)
         vec3 Lf = flashLightOcc(p);         // through the cloud between the flash and p
         vec3 S = (Ls + amb + Lf) * sigma;
-        float Ts = exp(-sigma * st);
+        float Ts = exp(-sigma * stI);
         cCol += cT * (S - S * Ts) / sigma;
         float dT = cT * (1.0 - Ts);
         dAcc += dT * t; wAcc += dT;

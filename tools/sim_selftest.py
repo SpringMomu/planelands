@@ -268,6 +268,87 @@ def test_reduced_model():
     return ok
 
 
+def test_wet():
+    """Same landing on a dry, wet and flooded runway: the wet tyre friction (14 CFR 25.109) and
+    dynamic hydroplaning in standing water must lengthen the rollout, flooding the most."""
+    from sim.gear import tyre_friction
+    print("\n=== wet runway: tyre friction, hydroplaning, rollout ===")
+    kt = 0.514444
+    mu_dry = tyre_friction(80.0, 0.0, 315.0)[0]
+    mu_wet = tyre_friction(100 * kt, 1.0e-3, 315.0)[0]
+    mu_hp, lift = tyre_friction(170 * kt, 3.0e-3, 315.0)
+    print(f"  friction: dry {mu_dry:.2f}, 1 mm at 100 kt {mu_wet:.2f}, 3 mm at 170 kt {mu_hp:.3f} "
+          f"({lift * 100:.0f} % of the load on the water)")
+    ok = mu_dry > 0.8 and 0.15 < mu_wet < 0.3 and mu_hp < 0.05
+    dist = {}
+    for mm in (0.0, 1.0, 3.0):
+        sim = Simulator(seed=5, verbose=False, guidance="hold_glide", spawn="any")
+        sim.handle({"type": "surface", "water_mm": mm})
+        sim.reset(init=approach_state(sim.terrain, sim.tables, height_agl=30.0, V=115.0, gamma_deg=-2.0))
+        sim.drain_events()
+        run(sim, 150.0, log_dt=1.0)
+        ev = [e["text"] for e in sim.drain_events()]
+        hyd = any(t.startswith("hydroplaning:") for t in ev)
+        d = sim.stop_info["past_thr"] if sim.stop_info else float("nan")
+        dist[mm] = d
+        print(f"  {mm:.0f} mm water: {sim.status}, stops {d:.0f} m past the threshold"
+              + (", hydroplaning reported" if hyd else ""))
+        ok = ok and sim.status == "STOPPED" and hyd == (mm >= 3.0)
+    ok = ok and dist[0.0] < dist[1.0] < dist[3.0]
+    print("  wet runway:", "PASS" if ok else "CHECK")
+    return ok
+
+
+def test_envelope():
+    """PFD envelope warnings (sim/envelope.py): the stall comes from the wing's flow (past its lift
+    maximum), the overspeed from the equivalent airspeed, so the two are independent."""
+    print("\n=== envelope warnings: STALL (wing flow) / OVERSPEED (EAS) ===")
+    KT = 1.0 / 0.514444
+    sim = Simulator(seed=7, verbose=False, guidance="hold_glide", spawn="any")
+    any_w = lambda rec, k: any(r[1]["warn"][k] for r in rec)        # noqa: E731
+    # 1. normal glide: quiet
+    sim.reset(init=make_state(sim, 8000.0, 0.7))
+    rec = run(sim, 10.0)
+    quiet = not (any_w(rec, "stall") or any_w(rec, "overspeed") or any_w(rec, "stall_caution"))
+    m1 = min(min(r[1]["warn"]["margin_l"], r[1]["warn"]["margin_r"]) for r in rec if r[1]["warn"]["valid"])
+    print(f"  glide M0.7: no warnings {quiet}, smallest stall margin {m1:.1f} deg")
+    # 2. manual full aft stick (no alpha protection in manual flight): the wing is pulled past its
+    #    lift maximum - above the 1-g stall speed
+    sim.reset(init=make_state(sim, 3000.0, 0.45))
+    sim.set_mode("MANUAL")
+    sim.set_control({"pitch": 1.0})
+    rec = run(sim, 14.0, log_dt=0.04)
+    on = next((r[1] for r in rec if r[1]["warn"]["stall"]), None)
+    caut_first = any(r[1]["warn"]["stall_caution"] for r in rec[:rec.index(next(r for r in rec if r[1]["warn"]["stall"]))]) if on else False
+    if on:
+        w = on["warn"]
+        print(f"  full aft stick: STALL at alpha {on['air']['alpha']:.1f} deg, {on['air']['keas']:.0f} KEAS "
+              f"(1-g stall speed {w['vs1g']:.0f}, at {w['n']:.1f} g {w['vs']:.0f}), caution before: {caut_first}")
+    stall_ok = on is not None and on["air"]["keas"] > on["warn"]["vs1g"] + 5.0 and caut_first
+    sim.set_control({"pitch": 0.0})
+    # 3. overspeed and stall at once: 360 KEAS at alpha 29 deg (an accelerated stall at ~7 g; placed
+    #    directly - in free flight the FCS pitch-rate limit bleeds the speed before alpha gets there)
+    T, p, rho, a, mu = atmosphere(3000.0)
+    V = 360.0 / KT / math.sqrt(rho / 1.225)
+    R = attitude_from_flight(0.0, 0.0, math.radians(29.0))
+    sim.reset(init=InitialState(pos=np.array([30000.0, 0.0, 3000.0]), vel=np.array([0.0, V, 0.0]),
+                                quat=R_to_quat(R), omega=np.zeros(3), alpha_deg=29.0, de_deg=0.0, bf_deg=0.0,
+                                desc="test state: 360 KEAS, alpha 29 deg"))
+    sim.set_mode("MANUAL")
+    sim.drain_events()
+    rec = run(sim, 0.2, log_dt=0.04)
+    w = rec[-1][1]["warn"]
+    texts = [e["text"] for e in sim.drain_events()]
+    both = w["stall"] and w["overspeed"] and any(t.startswith("STALL") for t in texts) \
+        and any(t.startswith("OVERSPEED") for t in texts)
+    print(f"  360 KEAS, alpha 29 deg: STALL {w['stall']} + OVERSPEED {w['overspeed']} (stall speed at "
+          f"{w['n']:.1f} g: {w['vs']:.0f} KEAS, VMO {w['vmo']:.0f})")
+    sim.set_mode("AUTO")
+    ok = quiet and stall_ok and both
+    print("  envelope:", "PASS" if ok else "CHECK")
+    return ok
+
+
 def test_rtf():
     print("\n=== real-time factor ===")
     sim = Simulator(seed=11, verbose=False, guidance="hold_glide", spawn="any")
@@ -284,7 +365,7 @@ def test_rtf():
 
 
 if __name__ == "__main__":
-    which = sys.argv[1:] or ["fcs", "spawns", "manual", "landing", "turbulence", "reduced", "rtf"]
+    which = sys.argv[1:] or ["fcs", "spawns", "manual", "landing", "wet", "turbulence", "reduced", "envelope", "rtf"]
     res = {}
     if "fcs" in which:
         res["fcs"] = test_fcs()
@@ -294,10 +375,14 @@ if __name__ == "__main__":
         res["manual"] = test_manual()
     if "landing" in which:
         res["landing"] = test_landing()
+    if "wet" in which:
+        res["wet"] = test_wet()
     if "turbulence" in which:
         res["turbulence"] = test_turbulence()
     if "reduced" in which:
         res["reduced"] = test_reduced_model()
+    if "envelope" in which:
+        res["envelope"] = test_envelope()
     if "rtf" in which:
         test_rtf()
     print("\nRESULTS:", res)

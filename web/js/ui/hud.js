@@ -355,6 +355,14 @@ export class Hud {
     set('rng', extra && isFinite(extra.range) ? (extra.range / 1000).toFixed(1) : '—');
     set('t', fmt(s.t, 1)); set('status', s.status || '—'); set('mode', s.mode || '—'); set('guid', s.guidance || '—');
     set('gear', s.gear ? (s.gear.pos > 0.98 ? '放下' : s.gear.pos < 0.02 ? '收起' : `${Math.round(s.gear.pos * 100)}%`) : '—');
+    // wet runway: water film the simulator brakes on, available friction of the main tyres on the ground
+    const g = s.gear;
+    set('water', s.env && isFinite(s.env.water_mm) ? s.env.water_mm.toFixed(1) : '—');
+    const mains = g && g.mu ? [1, 2].filter((i) => g.wow && g.wow[i]) : [];
+    if (mains.length) {
+      const mu = Math.min(...mains.map((i) => g.mu[i])), hp = Math.max(...mains.map((i) => g.hydro?.[i] || 0));
+      set('tyremu', `${mu.toFixed(2)}${hp > 0.5 ? ' 滑水' : ''}`);
+    } else set('tyremu', '—');
     const e = Math.max(0, (a.alt || 0) + (a.tas || 0) ** 2 / (2 * 9.81));
     set('energy', (e / 1000).toFixed(1));
   }

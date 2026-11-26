@@ -67,6 +67,8 @@
     <div><label>距跑道</label><span><b data-f="rng">—</b> km</span></div>
     <div><label>能量高度</label><span><b data-f="energy">—</b> km</span></div>
     <div><label>起落架</label><span><b data-f="gear">—</b></span></div>
+    <div><label>跑道积水</label><span><b data-f="water">—</b> mm</span></div>
+    <div><label>轮胎摩擦</label><span><b data-f="tyremu">—</b></span></div>
   </div>
   <h3>制导 <span class="dim">GNC · SCP + MPC</span></h3>
   <div class="phases" id="phases">
@@ -109,6 +111,8 @@
     <div class="row"><label>时间倍率</label><input type="range" id="ts" min="0" max="5" step="1" value="1"><output id="ts-o">1×</output></div>
     <div class="row seg" id="mode-seg"><label>控制模式</label>
       <button data-mode="AUTO" class="on">自动 AUTO</button><button data-mode="MANUAL">手动 CSS</button></div>
+    <div id="adjust-panel"></div>
+    <h3 class="subh">环境与显示</h3>
     <div class="row"><label>风速</label><input type="range" id="wind" min="0" max="30" step="0.5" value="6"><output id="wind-o">6 m/s</output></div>
     <div class="row"><label>风向（来向）</label><input type="range" id="winddir" min="0" max="359" step="1" value="120"><output id="winddir-o">120°</output></div>
     <div class="row"><label>湍流强度</label><input type="range" id="turb" min="0" max="1" step="0.05" value="0.15"><output id="turb-o">0.15</output></div>

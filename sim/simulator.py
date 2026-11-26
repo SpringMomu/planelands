@@ -8,7 +8,8 @@ import numpy as np
 
 from .aero import AeroModel
 from .atmosphere import RHO0, atmosphere, gravity
-from .dynamics import Context, RigidBody, R_to_euler_ned, quat_to_R
+from .envelope import EnvelopeMonitor
+from .dynamics import Context, RigidBody, R_to_euler_ned, R_to_quat, euler_ned_to_R, quat_to_R
 from .fcs import Actuators, FcsInput, FlightControl, wrap
 from .gear import LandingGear
 from .geometry import CH_BF, CH_LI, CH_LO, CH_RI, CH_RO, CH_RUD, CH_SB, CTRL_NAMES, build_geometry
@@ -27,7 +28,9 @@ R2D = 180.0 / math.pi
 DT = 0.01            # physics macro step
 SUBSTEPS = 4         # near the ground
 FCS_DT = 0.02
+ENV_DT = 0.04        # envelope (overspeed / stall) monitor, 25 Hz like the GPC flight-control cycle
 KT = 1.0 / 0.514444
+WING_DESTROYED = 1.2    # m of crush + wear: the outer wing box (tip chord ~3.5 m, ~0.4 m deep) is gone
 
 
 class Simulator:
@@ -44,6 +47,7 @@ class Simulator:
         self.gear = LandingGear(self.geo)
         self.body = RigidBody(self.geo, self.aero, self.gear, self.terrain)
         self.fcs = FlightControl(self.geo, self.body)
+        self.envelope = EnvelopeMonitor(self.aero, self.tables, self.geo.mass, self.geo.S)
         self.act = Actuators(self.geo)
         self.ctx = Context()
         self.wind = WindModel(seed)
@@ -134,9 +138,13 @@ class Simulator:
         self.steer = 0.0
         self.touchdown = None
         self.stop_info = None
-        self.tail_scrape_reported = False
+        self.hydro_on = False       # hydroplaning reported (re-armed when the tyres grip again)
+        self.scrape_last = {}       # region -> sim time of its last structural contact
+        self.damage_reported = {}   # region -> damage depth already reported
         self.nose_td_reported = False
         self._fcs_acc = 0.0
+        self._env_acc = 0.0
+        self.envelope.reset()
         self._gd_acc = 1e9
         self.gcmd = GuidanceCommand(alpha_deg=init.alpha_deg, gear_down=init.gear_down)
         self.man_alpha = init.alpha_deg * D2R
@@ -196,6 +204,91 @@ class Simulator:
         else:
             out["summary"] = note or "not reachable"
         return out
+
+    # ------------------------------------------------------------------ in-flight edit
+    def adjust(self, spec: dict) -> bool:
+        """Change the airborne state in place: airspeed, air-relative heading / flight-path angle
+        (the direction of the velocity through the air) and altitude, each optional.
+
+        spec: speed + speed_unit (mach | keas | tas m/s), heading_deg or d_heading_deg,
+        gamma_deg, alt (m MSL) or d_alt (m).  The attitude turns with the velocity, so angle of
+        attack, sideslip, bank and body rates stay what they were, an altitude change alone keeps the
+        equivalent airspeed; the time keeps running and the
+        guidance plans afresh from the new state.  Clamped like a custom spawn (>= 150 m above the
+        terrain, 75 m/s .. Mach 3); returns False when the vehicle is not in free flight."""
+        if self.status != "FLIGHT" or any(self.gear.wow) or self.chute_state > 0.0:
+            self.event("warn", "adjust: only possible in free flight")
+            return False
+        x = self.x
+        R = quat_to_R(x[6:10])
+        pos = x[0:3].copy()
+
+        def wind_at(p):                                   # mean wind (no gusts) at a position
+            agl_ = p[2] - self.terrain.height(p[0], p[1])
+            w = np.array(self.wind.steady(agl_), dtype=float)
+            w[2] += self.wind.vertical(agl_)
+            return w
+
+        v_air = x[3:6] - wind_at(pos)
+        V = float(np.linalg.norm(v_air))
+        if V < 1.0:
+            return False
+        psi0 = math.atan2(v_air[0], v_air[1])
+        gam0 = math.asin(max(-1.0, min(1.0, v_air[2] / V)))
+        warn = []
+        # altitude
+        moved = False
+        if spec.get("alt") is not None or spec.get("d_alt") is not None:
+            alt = float(spec["alt"]) if spec.get("alt") is not None else pos[2] + float(spec["d_alt"])
+            hg = float(self.terrain.height(pos[0], pos[1]))
+            if alt - hg < 150.0:
+                alt = hg + 150.0
+                warn.append(f"altitude raised to {alt:.0f} m (150 m above the terrain)")
+            if alt > 40000.0:
+                alt = 40000.0
+                warn.append("altitude limited to 40 km")
+            moved = abs(alt - pos[2]) > 0.5
+            pos[2] = alt
+        rho_old = atmosphere(x[2])[2]
+        T, p, rho, a, mu = atmosphere(pos[2])
+        # speed: an altitude change alone keeps the equivalent airspeed (dynamic pressure), so the
+        # vehicle stays on its trimmed angle of attack instead of stalling high up / overspeeding low
+        V *= math.sqrt(rho_old / rho)
+        if spec.get("speed") is not None:
+            unit = str(spec.get("speed_unit", "tas")).lower()
+            s = float(spec["speed"])
+            V = s * a if unit == "mach" else s / KT * math.sqrt(RHO0 / rho) if unit == "keas" else s
+        Vmin, Vmax = 75.0, 3.0 * a
+        if not Vmin <= V <= Vmax:
+            V = float(np.clip(V, Vmin, Vmax))
+            warn.append(f"speed clamped to {V:.0f} m/s")
+        # direction through the air
+        psi = psi0
+        if spec.get("heading_deg") is not None:
+            psi = math.radians(float(spec["heading_deg"]))
+        elif spec.get("d_heading_deg") is not None:
+            psi = psi0 + math.radians(float(spec["d_heading_deg"]))
+        gam = gam0 if spec.get("gamma_deg") is None else math.radians(float(np.clip(float(spec["gamma_deg"]), -45.0, 30.0)))
+        # rotate the body with the wind axes: R_new = W_new W_old^T R (alpha, beta, bank kept)
+        Wo = euler_ned_to_R(psi0, gam0, 0.0)
+        Wn = euler_ned_to_R(psi, gam, 0.0)
+        Rn = Wn @ Wo.T @ R
+        v_dir = np.array([math.cos(gam) * math.sin(psi), math.cos(gam) * math.cos(psi), math.sin(gam)])
+        self.x[0:3] = pos
+        self.x[3:6] = V * v_dir + wind_at(pos)
+        self.x[6:10] = R_to_quat(Rn)
+        self.obs = self.observe()
+        self._gd_acc = 1e9                                # guidance runs on the next step
+        if moved:
+            self.episode += 1                             # a jump: the clients start a fresh trail
+        self.guidance.reset(self.snapshot())
+        for w in warn:
+            self.event("warn", f"adjust: {w}")
+        o = self.obs
+        self.event("info", f"adjust: alt {pos[2] / 1000:.2f} km, Mach {o['mach']:.2f}, "
+                           f"{o['eas'] * KT:.0f} KEAS, heading {math.degrees(psi) % 360.0:.0f} deg, "
+                           f"gamma {math.degrees(gam):.1f} deg - replanning")
+        return True
 
     # ------------------------------------------------------------------ observation
     def observe(self, F_aero=None):
@@ -308,7 +401,8 @@ class Simulator:
             self.chute_cmd = g.chute
         else:
             m = self.manual
-            self.man_alpha = float(np.clip(self.man_alpha + m["pitch"] * 5.0 * D2R * dt, -2.0 * D2R, 28.0 * D2R))
+            # no alpha protection in manual flight: the pilot can pull the wing past its lift maximum
+            self.man_alpha = float(np.clip(self.man_alpha + m["pitch"] * 5.0 * D2R * dt, -2.0 * D2R, 40.0 * D2R))
             self.man_mu = float(np.clip(wrap(self.man_mu + m["roll"] * 15.0 * D2R * dt), -80 * D2R, 80 * D2R))
             cmd = dict(alpha=self.man_alpha, bank=self.man_mu, beta=m["yaw"] * 4.0 * D2R,
                        sb=m["speedbrake"] * self.geo.limits["speedbrake"][1],
@@ -326,9 +420,9 @@ class Simulator:
     def _fcs_step(self):
         o = self.obs
         cmd = self._commands(FCS_DT)
-        # envelope protection: alpha command limited to the control-margin ceiling (trimmable
-        # with roll / yaw authority left), for every guidance law and for manual flight
-        if not any(self.gear.wow):
+        # AUTO: the guidance alpha command is limited to the control-margin ceiling (trimmable with
+        # roll / yaw authority left), for every guidance law.  Manual flight is not limited.
+        if not any(self.gear.wow) and self.mode == "AUTO":
             a_lim = math.radians(float(self._spawn_pm.alpha_max(o["mach"])) + 1.5)
             cmd["alpha"] = min(cmd["alpha"], a_lim)
         self.steer = float(np.clip(cmd.get("steer", 0.0), -10 * D2R, 10 * D2R))
@@ -377,9 +471,10 @@ class Simulator:
 
     # ------------------------------------------------------------------ physics step
     def step(self):
-        """Advance one macro step DT."""
-        if self.status == "CRASHED":
-            return
+        """Advance one macro step DT.  After a crash the plant keeps going (the wreck slides, tumbles
+        and comes to rest on its structural contacts); guidance and flight control are off, the
+        surfaces stay where they were."""
+        crashed = self.status == "CRASHED"
         dt = DT
         # guidance (AUTO)
         self._gd_acc += dt
@@ -392,7 +487,8 @@ class Simulator:
         self._fcs_acc += dt
         if self._fcs_acc >= FCS_DT - 1e-9:
             self._fcs_acc = 0.0
-            self._fcs_step()
+            if not crashed:
+                self._fcs_step()
         self.wind.step(dt, self.obs["V"], self.obs["agl"])
         self.ctx.gust_b = self.wind.gust_body
         self.gear.animate(dt)
@@ -402,6 +498,8 @@ class Simulator:
         self.ctx.brakes = self.brakes
         self.ctx.steer = self.steer
         R = self.obs["R"]
+        o = self.obs
+        self.gear.upper_on = crashed or abs(o["phi"]) > math.radians(40.0) or abs(o["theta"]) > math.radians(40.0)
         near = self.gear.any_near_ground(self.x[0:3], R, self.terrain.height, margin=6.0) or any(self.gear.wow)
         if near:
             h = dt / SUBSTEPS
@@ -411,6 +509,7 @@ class Simulator:
                 self.ctx.frozen_aero = (res.F[0], res.M[0])
                 self.ctx.gear_active = True
                 self.x, Fb, Mb = self.body.rk4(self.x, h, self.ctx)
+                self.gear.accumulate(h)
                 self.ctx.frozen_aero = None
         else:
             self.ctx.ctrl = self.act.step(dt).copy()
@@ -437,8 +536,25 @@ class Simulator:
             return
         self.obs = self.observe()
         self._status_logic()
+        self._env_acc += dt
+        if self._env_acc >= ENV_DT - 1e-9:
+            self._envelope_step(self._env_acc)
+            self._env_acc = 0.0
+
+    def _envelope_step(self, dt):
+        """Overspeed / stall monitor (sim/envelope.py) on the current state and surface positions."""
+        if self.status == "CRASHED":
+            return
+        o = self.obs
+        on_ground = any(self.gear.wow) or self.status in ("ROLLOUT", "STOPPED")
+        lift = (self.last_aero or {}).get("lift", self.geo.mass * o["g"])
+        for level, text in self.envelope.update(self.t, dt, o, self.x[10:13], self.act.pos, self.gear.pos,
+                                                on_ground, lift):
+            self.event(level, text)
 
     def _status_logic(self):
+        if self.status == "CRASHED":
+            return
         o = self.obs
         wow = self.gear.wow
         vz = self.x[5]
@@ -454,21 +570,17 @@ class Simulator:
                        + (f"{d_thr:.0f} m past RWY{end} threshold, {cross:+.1f} m off centreline"
                           if on_rwy else "OFF RUNWAY"))
                 if -vz > 6.0:
-                    self._crash(f"gear collapse: sink rate {-vz:.1f} m/s")
+                    self._crash(f"gear collapse: sink rate {-vz:.1f} m/s", gear_failed=True)
                     return
                 self.event("warn" if (-vz > 3.0 or not on_rwy) else "info", txt)
                 self.status = "ROLLOUT"
             elif wow[0]:
                 self._crash("nose gear first contact")
                 return
-        if self.gear.struct_contact.any():
-            names = [n for n, c in zip(self.gear.struct_names, self.gear.struct_contact) if c]
-            if self.gear.struct_sink > 3.0 or not self.gear.locked or any(n in names for n in ("wingtip_l", "wingtip_r", "nose")):
-                self._crash("ground impact: " + ", ".join(names) + f" (sink {self.gear.struct_sink:.1f} m/s)")
-                return
-            if not self.tail_scrape_reported:
-                self.tail_scrape_reported = True
-                self.event("warn", "tail scrape: " + ", ".join(names))
+        if self.gear.struct_contact.any() and self._structure_logic():
+            return
+        if self.status in ("ROLLOUT", "STOPPED"):
+            self._hydro_logic(o)
         if self.status == "ROLLOUT":
             if wow[0] and not self.nose_td_reported:
                 self.nose_td_reported = True
@@ -479,6 +591,71 @@ class Simulator:
                 self.stop_info = dict(rwy=end, past_thr=d, cross_rwy=cross,
                                       on_runway=bool(self.terrain.on_runway(self.x[0], self.x[1])))
                 self.event("info", f"wheels stop: {d:.0f} m from RWY{end} threshold, {cross:+.1f} m off centreline")
+
+    def _hydro_logic(self, o):
+        """Report the main gear hydroplaning (most of the load on the water wedge) and its end."""
+        g = self.gear
+        hp = max(g.hydro[1] if g.wow[1] else 0.0, g.hydro[2] if g.wow[2] else 0.0)
+        if not self.hydro_on and hp > 0.5:
+            self.hydro_on = True
+            mu = min(g.mu[1], g.mu[2])
+            self.event("warn", f"hydroplaning: main gear at {o['gs'] * KT:.0f} KGS on {g.water * 1000:.1f} mm of water - "
+                               f"tyre friction {mu:.2f} (dry {0.85:.2f}), braking and steering lost")
+        elif self.hydro_on and hp < 0.2:
+            self.hydro_on = False
+            self.event("info", f"hydroplaning over at {o['gs'] * KT:.0f} KGS - tyre friction "
+                               f"{min(g.mu[1], g.mu[2]):.2f}")
+
+    def _structure_logic(self):
+        """Structural ground contact: a scrape (sparks, damage) or the end of the flight.  Returns True
+        after a crash.
+
+        Rigid structure (body-flap / tail, nozzles, belly) is judged by the impact speed as before;
+        a wing tip by what the contact did to it (gear.py: the outer wing bends, crushes above its
+        crush strength and is ground away while sliding): a scraped or crumpled tip is damage the
+        vehicle rolls out with, the end comes when the outer wing is destroyed (crush + wear deeper
+        than the tip box) or the vehicle rolls over onto it.  A hard tip impact does not break the
+        wing by itself: it crushes the tip (gear.py), which counts toward the destroyed depth."""
+        g = self.gear
+        hit = np.flatnonzero(g.struct_contact)
+        names = [g.struct_names[i] for i in hit]
+        regions = sorted({g.struct_region[i] for i in hit})
+        sink = {}                                   # impact (vertical) speed per region
+        for i in hit:
+            r = g.struct_region[i]
+            sink[r] = max(sink.get(r, 0.0), -float(g._c_v[i, 2]))
+        rigid = max((v for r, v in sink.items() if not r.startswith("wing")), default=None)
+        if not g.locked or "nose" in regions or (rigid is not None and rigid > 3.0):
+            self._crash("ground impact: " + ", ".join(names) + f" (sink {g.struct_sink:.1f} m/s)")
+            return True
+        for r in regions:
+            if r.startswith("wing"):
+                d = g.damage_depth(r)
+                side = "left" if r == "wing_l" else "right"
+                if d > WING_DESTROYED:
+                    self._crash(f"{side} wing destroyed: tip crushed / ground away {d:.2f} m")
+                    return True
+        if abs(self.obs["phi"]) > math.radians(50.0):
+            self._crash(f"rolled over onto the wing (bank {self.obs['phi'] * R2D:.0f} deg)")
+            return True
+        # report each scrape once per contact episode (re-armed after 1.5 s clear of the ground)
+        for r in regions:
+            if self.t - self.scrape_last.get(r, -1e9) > 1.5:
+                gs = self.obs["gs"] * KT
+                if r.startswith("wing"):
+                    self.event("warn", f"{'left' if r == 'wing_l' else 'right'} wing tip scrape at {gs:.0f} KGS "
+                                       f"(sink {sink[r]:.1f} m/s)")
+                else:
+                    self.event("warn", f"tail scrape: {r} at {gs:.0f} KGS (sink {sink[r]:.1f} m/s)")
+            self.scrape_last[r] = self.t
+            d = g.damage_depth(r)
+            if d - self.damage_reported.get(r, 0.0) >= (0.05 if r not in self.damage_reported else 0.25):
+                self.damage_reported[r] = d
+                what = {"wing_l": "left wing tip", "wing_r": "right wing tip", "tail": "body flap",
+                        "upper": "upper fuselage", "fin": "vertical tail",
+                        "nozzle": "engine nozzle", "belly": "belly"}.get(r, r)
+                self.event("warn", f"structural damage: {what} crushed / worn {d * 100:.0f} cm")
+        return False
 
     def _landing_frame(self, o, end=None):
         """Runway end in use (by ground track unless given), distance past its threshold and
@@ -492,10 +669,17 @@ class Simulator:
             return end, o["along"] + L2, o["cross"]
         return end, L2 - o["along"], -o["cross"]
 
-    def _crash(self, why):
+    def _crash(self, why, gear_failed=False):
+        """End of the flight.  The state is NOT frozen: the physics continues with the flight control
+        off (surfaces held where they are, no brakes / steering); a collapsed gear carries no load."""
         self.status = "CRASHED"
-        self.x[3:6] = 0.0
-        self.x[10:13] = 0.0
+        self.act.cmd = self.act.pos.copy()
+        self.brakes = 0.0
+        self.steer = 0.0
+        if gear_failed:
+            self.gear.pos = 0.0
+            self.gear.cmd_down = False
+        self.envelope.reset()
         self.event("error", "CRASH - " + why)
 
     def advance(self, sim_dt, max_wall=0.25):
@@ -581,14 +765,21 @@ class Simulator:
             "cmd": {"alpha": cmd_alpha, "bank": cmd_bank, "speedbrake": cmd_sb,
                     "p": self.fcs.omega_cmd[0] * R2D, "q": self.fcs.omega_cmd[1] * R2D, "r": self.fcs.omega_cmd[2] * R2D},
             "gear": {"pos": self.gear.pos, "down_cmd": bool(self.gear.cmd_down), "wow": [bool(w) for w in self.gear.wow],
-                     "compress": [float(c) for c in self.gear.compress]},
+                     "compress": [float(c) for c in self.gear.compress], "load": [float(v) for v in self.gear.load],
+                     # available tyre friction and the share of the load on the water (hydroplaning)
+                     "mu": [float(v) for v in self.gear.mu], "hydro": [float(v) for v in self.gear.hydro]},
+            # structural ground contacts since the previous state message (sparks / dust on the display)
+            "scrape": self.gear.drain_scrape(),
             "chute": self.chute_state, "chute_jettisoned": self.chute_jettisoned, "brakes": self.brakes,
             "steer": self.steer * R2D,
             "rwy": {"along": o["along"], "cross": o["cross"],
                     "dist_thr33": float(np.linalg.norm(rw - thr33)), "dist_thr15": float(np.linalg.norm(rw - thr15))},
             "gnc": self._gnc_telemetry(),
+            # envelope warnings (sim/envelope.py): overspeed, stall, stall margin, low-speed band
+            "warn": self.envelope.out,
             "env": {"wind": self.wind.speed, "dir": self.wind.dir_from, "turb": self.wind.intensity,
-                    "draft": self.wind.vertical(o["agl"]), "storm": self.wind._st, "auto": self.wind.auto},
+                    "draft": self.wind.vertical(o["agl"]), "storm": self.wind._st, "auto": self.wind.auto,
+                    "water_mm": self.gear.water * 1000.0},
         }
 
     def _gnc_telemetry(self):
@@ -652,6 +843,8 @@ class Simulator:
                 self.events.append({"type": "spawn_check", "id": msg.get("id"), "warnings": warn,
                                     "pos": [float(v) for v in init.pos], "agl": float(init.pos[2] - hg),
                                     "alpha": float(init.alpha_deg), "desc": init.desc, **r})
+            elif a == "adjust":
+                self.adjust(msg.get("spec") or {})
             elif a == "pause":
                 self.paused = True
             elif a == "resume":
@@ -679,3 +872,6 @@ class Simulator:
         elif t == "storm":
             self.wind.set_storm(turb=float(msg.get("turb", 0.0)), gust=float(msg.get("gust", 0.0)),
                                 draft=float(msg.get("draft", 0.0)))
+        elif t == "surface":
+            # water film on the runway (from the ground wetness on the display): tyre friction
+            self.gear.water = float(np.clip(float(msg.get("water_mm", 0.0)), 0.0, 20.0)) / 1000.0

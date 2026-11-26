@@ -334,7 +334,8 @@ class AeroModel:
         return dict(Fx=Fx, Fy=Fy, Fz=Fz, cpl=cpl, ax=ax, ay=self.qc[1], az=self.qc[2],
                     fx0=ffm * ux, fy0=ffm * uy, fz0=ffm * uz,
                     sbx=sbm * ux[ri], sby=sbm * uy[ri], sbz=sbm * uz[ri],
-                    a_perp=a_perp, qp=qp, cN=cN, xapp=xapp, eta_v=eta_v)
+                    a_perp=a_perp, qp=qp, cN=cN, xapp=xapp, eta_v=eta_v,
+                    ae=ae, fst=fst, cN_att=cN_att, qS=qS)
 
     # ------------------------------------------------------------------ evaluate
     def evaluate(self, v_air, omega, rho, a_snd, mu, h_cg, up_b, ctrl,

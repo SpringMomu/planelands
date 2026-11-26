@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { loadAssets, dataURL } from './core/assets.js';
 import { SimLink } from './core/net.js';
 import { LocalSim } from './core/local_sim.js';
-import { enuToThree, threeToEnu, bodyQuatToThree, curvatureDrop } from './core/frames.js';
+import { enuToThree, threeToEnu, bodyQuatToThree, curvatureDrop, frdToLocal } from './core/frames.js';
 import { Atmosphere, sunDirection, sunTransmittanceCPU } from './render/atmosphere.js';
 import { Terrain } from './render/terrain.js';
 import { Clouds } from './render/clouds.js';
@@ -13,6 +13,9 @@ import { patchStandard } from './world/materials.js';
 import { Trail, ForceVectors } from './world/overlays.js';
 import { DragChute } from './world/chute.js';
 import { TireSmoke } from './world/smoke.js';
+import { Sparks, dustShare } from './world/sparks.js';
+import { TireSpray, waterDepth } from './world/spray.js';
+import { WakeField } from './world/wake.js';
 import { zhEvent } from './ui/i18n.js';
 import { Weather } from './world/weather.js';
 import { AeroAudio } from './world/aero_audio.js';
@@ -20,6 +23,7 @@ import { GncViz } from './world/gnc_viz.js';
 import { CameraRig, CAMERA_MODES, CAMERA_LABELS } from './ui/cameras.js';
 import { Hud } from './ui/hud.js';
 import { SpawnPanel } from './ui/spawn.js';
+import { AdjustPanel } from './ui/adjust.js';
 import { Meds } from './ui/meds.js';
 import { Cockpit } from './world/cockpit.js';
 
@@ -122,6 +126,10 @@ async function main() {
   const chute = new DragChute(geometry, U);
   scene.add(chute.group);
   const smoke = new TireSmoke();
+  // sparks + dust where the airframe scrapes the runway, spray from the tyres on a wet runway; the air
+  // they move in (wind, wake, wing-tip vortices)
+  const sparks = new Sparks(), spray = new TireSpray(), wake = new WakeField();
+  const scrapeQ = [];                // structural contacts from the simulator, emitted at their render time
   const weather = new Weather({ U, weatherData: A.weatherData, scene });
   // airflow sound of the gliding orbiter, computed from the flight state (aeroacoustics.js)
   const aero = new AeroAudio(geometry);
@@ -142,6 +150,10 @@ async function main() {
   sun.shadow.normalBias = 0.03;
   sun.shadow.camera.near = 1; sun.shadow.camera.far = 4000;
   scene.add(sun); scene.add(sun.target);
+  // light of the spark shower (luminous intensity / colour from sparks.js); always present so that
+  // the materials are compiled once with it
+  const sparkLight = new THREE.PointLight(0xffb070, 0, 0, 2);
+  scene.add(sparkLight);
 
   ld('编译着色器…', 0.86); await nextFrame();
   const clouds = new Clouds(renderer, U, A);
@@ -168,6 +180,8 @@ async function main() {
     clouds.setSize(w, h);
     post.setSize(w, h);
     smoke.setSize(w, h);
+    sparks.setSize(w, h);
+    spray.setSize(w, h);
     weather.rain.setSize(w, h);
     weather.lightning.setResolution(w, h);
     camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
@@ -211,6 +225,7 @@ async function main() {
       }
       toast(local ? '浏览器内 Python 仿真已就绪（6-DOF 气动 + 飞控 + SCP/MPC 制导）' : '已连接 Python 仿真后端（6-DOF 气动 + 飞控）', 'info');
       sendEnv(true);
+      surfSent = -1;
       setTimeout(() => spawnPanel?.requestCheck(), 50);
     },
     onAero: (m) => { if (settings.showForces) forces.update(m.f); lastAero = m; },
@@ -218,10 +233,14 @@ async function main() {
     // every raw state (also while the tab is hidden): trail / map track / vertical-situation history
     onState: (m) => {
       trail.pushRaw(m.t, m.pos, Math.hypot(m.vel[0], m.vel[1], m.vel[2]));
+      if (m.scrape && m.scrape.length) { scrapeQ.push({ t: m.t, ep: m._ep, list: m.scrape }); if (scrapeQ.length > 600) scrapeQ.shift(); }
       hud.pushTrail(m.pos);
       hud.pushProfile(m);
     },
-    onEpisode: () => { trail.clear(); hud.clearTrail(); smoke.clear(); chute.reset(); shuttle.setChuteDoor(false); prevWow = null; meds.resetAlarms(); },
+    onEpisode: () => {
+      trail.clear(); hud.clearTrail(); smoke.clear(); sparks.clear(); spray.clear(); scrapeQ.length = 0;
+      aero.reset(); chute.reset(); shuttle.setChuteDoor(false); prevWow = null; meds.resetAlarms();
+    },
     onMpc: (m) => { lastMpc = m.pred; gncViz.setMpc(m.pred); },
     onEvent: (m) => { toast(zhEvent(m.text), m.level || 'info', m.level === 'error' ? 8000 : 5000); meds.event(m); },
     onStatus: (s, info) => {
@@ -247,6 +266,8 @@ async function main() {
   // start-position editor (own tab): place the vehicle anywhere and start from there
   const spawnPanel = new SpawnPanel({ root: $('#spawn-panel'), hud, link, world: A.world, onStart: () => clearEpisode() });
   link.onSpawnCheck = (m) => spawnPanel.onCheck(m);
+  // in-flight speed / direction / altitude edits; an altitude jump starts a fresh trail and plan display
+  const adjustPanel = new AdjustPanel({ root: $('#adjust-panel'), link, onJump: () => clearEpisode() });
 
   // ------------------------------------------------------------------ UI bindings
   const bindRange = (id, fmt, fn) => {
@@ -268,6 +289,8 @@ async function main() {
   bindRange('turb', (v) => v.toFixed(2), sendEnv);
   $('#wind-auto').addEventListener('change', () => { sendEnv(); if (!$('#wind-auto').checked) link.send({ type: 'storm', turb: 0, gust: 0, draft: 0 }); });
   let stormSendT = 0;
+  // water film on the runway for the simulator's tyre friction (sent when it changes, and now and then)
+  let surfSendT = 0, surfSent = -1;
   bindRange('cbase', (v) => `${v} m`, (v) => { U.uCloudBase.value = v; });
   bindRange('cthick', (v) => `${v} m`, (v) => { U.uCloudThick.value = v; });
   bindRange('ccov', (v) => v.toFixed(2), (v) => { U.uCloudCoverage.value = v; });
@@ -467,6 +490,22 @@ async function main() {
   const aeroAx = { f: new THREE.Vector3(), u: new THREE.Vector3(), r: new THREE.Vector3(), cr: new THREE.Vector3(), zero: new THREE.Vector3() };
   const sunRad = new THREE.Color(), ambC = new THREE.Color();
   const contacts = [];
+  const scrapeAt = new THREE.Vector3(), scrapeV = new THREE.Vector3(), rollFwd = new THREE.Vector3();
+  const sprayGears = [0, 1, 2].map(() => ({ c: null, wow: false, load: 0, spin: 1 }));
+  // light on the near-ground particles (smoke, dust, spray): the sun as far as the clouds above the
+  // vehicle let it through - cloudShadow() of glsl.js on the CPU with the cloud field's mean density -
+  // and the sky light, darker under an overcast like the composite's sky
+  const sunRadP = new THREE.Color(), ambP = new THREE.Color();
+  let partSunVis = 1;
+  function cloudSunVis(p, sd) {
+    if (sd.y < 0.01) return 1;
+    const base = U.uCloudBase.value, top = base + U.uCloudThick.value;
+    if (p.y > top) return 1;
+    const t0 = Math.max((base - p.y) / sd.y, 0), t1 = (top - p.y) / sd.y, N = 12, h = (t1 - t0) / N;
+    let od = 0;
+    for (let i = 0; i < N; i++) { const t = t0 + (i + 0.5) * h; od += weather.cloudDensityAvg(p.x + sd.x * t, p.y + sd.y * t, p.z + sd.z * t) * h; }
+    return 1 + (Math.exp(-od * 0.0018) - 1) * U.uCloudShadowStrength.value;
+  }
   const groundY = (x, z) => enuToThree(x, -z, terrain.surfaceAt(x, -z), tmpV).y;
   let prevEp = -1;
   let last = performance.now(), fpsAcc = 0, fpsN = 0, simState = null, todAnim = false;
@@ -597,6 +636,7 @@ async function main() {
             const dry = 1 - 0.85 * THREE.MathUtils.clamp(U.uWet.value, 0, 1);
             const str = Math.min(1.2, (dv / 95) ** 2) * dry * (i === 0 ? 0.6 : 1);
             if (str > 0.015) smoke.touchdown(i, str, dv);
+            if (dv > 2) spray.touchdown(i, dv);                            // the skidding tyre planes on the film
           }
           wheelV[i] = gsp;                                                 // rolling
         } else {
@@ -606,6 +646,47 @@ async function main() {
       if (prevEp !== st._ep) cockpit.rain?.clear();        // new episode: fresh, dry windows (re-wetted from the weather)
       prevWow = wow.slice(); prevEp = st._ep;
       smoke.update(sdt, { contacts: shuttle.wheelContacts(contacts), vel: vel3, wind: wind3, groundY, brakes: st.brakes || 0, gs: gsp, wow });
+
+      // air around the vehicle: wind + wake + trailing vortices of the lift still carried by the wing
+      const load = st.gear?.load || [0, 0, 0];
+      const onGnd = wow.some((x) => x);
+      const W = 99800 * 9.80665;
+      const lift = onGnd ? Math.max(0, W - load[0] - load[1] - load[2]) : W * Math.max(0, st.air?.nz ?? 1);
+      wake.set({ pos: pos3, vel: vel3, wind: wind3, lift, wingY: agl - 1.4, groundY: groundY(pos3.x, pos3.z) });
+      wake.fitGround(groundY, pos3.x, pos3.z);
+      // structural scrapes reported by the simulator, released when the render clock reaches them:
+      // sparks from the metal, dust from the tiles / concrete
+      while (scrapeQ.length && (scrapeQ[0].ep !== st._ep || scrapeQ[0].t <= st.t + 1e-6)) {
+        const rec = scrapeQ.shift();
+        if (rec.ep !== st._ep || rec.t < st.t - 0.5 || sdt <= 0) continue;
+        for (const c of rec.list) {
+          // the airframe point as drawn now, down on the runway
+          shuttle.model.localToWorld(frdToLocal(c.b, scrapeAt));
+          scrapeAt.y = groundY(scrapeAt.x, scrapeAt.z);
+          scrapeV.set(c.v[0], c.v[2], -c.v[1]);
+          sparks.emit(c, scrapeAt, scrapeV);
+          // dust: friction power over ~2 MW makes a dense cloud
+          const P = c.W / Math.max(c.dt, 1e-3);
+          const nd = Math.min(4, c.W / 25e3 * dustShare(c.region));
+          for (let k = Math.floor(nd + Math.random()); k > 0; k--) {
+            const f = 0.08 + 0.3 * Math.random();
+            smoke.dust(scrapeAt.x, scrapeAt.y, scrapeAt.z, scrapeV.x * f, 0.6 + Math.random() * 1.2, scrapeV.z * f,
+              Math.min(1, 0.3 + P / 3e6));
+          }
+        }
+      }
+      sparks.update(sdt, { wake });
+      sparkLight.intensity = sparks.light.I;
+      if (sparks.light.I > 0) { sparkLight.position.copy(sparks.light.pos); sparkLight.color.copy(sparks.light.col); }
+      // tyre spray: water film from the wetness of the ground (and the rain still falling on it)
+      rollFwd.set(1, 0, 0).applyQuaternion(quat3); rollFwd.y = 0;
+      if (rollFwd.lengthSq() < 1e-6) rollFwd.set(1, 0, 0); else rollFwd.normalize();
+      for (let i = 0; i < 3; i++) {
+        const g = sprayGears[i];
+        g.c = contacts[i]; g.wow = wow[i]; g.load = load[i]; g.spin = gsp > 1 ? wheelV[i] / gsp : 1;
+        g.hydro = st.gear?.hydro?.[i];                                    // hydroplaning from the simulator
+      }
+      spray.update(sdt, { wake, h: waterDepth(U.uWet.value, weather.rainCam), fwd: rollFwd, vel: vel3, gears: sprayGears, model: shuttle.model });
     }
 
     // ---------------- weather: rain, lightning, wet ground
@@ -617,6 +698,13 @@ async function main() {
         wind3, groundY, groundYCam: cgY, camAgl: camera.position.y - cgY, amb: light.amb, ts, inCockpit,
       });
       shuttle.setWet(weather.bodyWet, weather.flowTime);
+      // runway water film -> the simulator's tyre friction / hydroplaning
+      surfSendT += dt;
+      const water = waterDepth(U.uWet.value, weather.rainCam) * 1000;
+      if (link.connected && ((surfSendT > 0.5 && Math.abs(water - surfSent) > 0.02) || surfSendT > 5)) {
+        surfSendT = 0; surfSent = water;
+        link.send({ type: 'surface', water_mm: +water.toFixed(3) });
+      }
       // storm forcing for the flight model (a few times per second)
       stormSendT += dt;
       if (st && stormSendT > 0.25 && $('#wind-auto').checked) {
@@ -628,6 +716,7 @@ async function main() {
         const e = st.env;
         $('#wx-live').innerHTML = `当前风 <b>${e.wind.toFixed(1)}</b> m/s · 来向 <b>${e.dir.toFixed(0)}°</b> · 湍流 <b>${e.turb.toFixed(2)}</b>` +
           ` · 垂直气流 <b>${e.draft >= 0 ? '+' : ''}${e.draft.toFixed(1)}</b> m/s${e.storm > 0.05 ? ` · <span class="stormtag">风暴 ${(e.storm * 100).toFixed(0)}%</span>` : ''}` +
+          `${e.water_mm > 0.005 ? ` · 跑道水膜 <b>${e.water_mm.toFixed(1)}</b> mm` : ''}` +
           `${weather.bodyWet > 0.05 ? ` · 机身潮湿 ${(weather.bodyWet * 100).toFixed(0)}%` : ''}`;
       }
       // less history when the camera races through cloud (reprojection of near fog is approximate) or lightning flashes
@@ -667,9 +756,23 @@ async function main() {
     renderer.render(scene, camera);
     if (inCockpit) cockpit.render(renderer);
     clouds.render(camera, sceneRT.depthTexture);
-    const smokeOn = smoke.render(renderer, camera, sceneRT.depthTexture, light);
+    // near-ground particle layer: tyre smoke + dust, spray, sparks (each clears it if it draws first)
+    if (frame % 6 === 0) partSunVis = cloudSunVis(st ? pos3 : camera.position, sd);
+    sunRadP.copy(light.sunRad).multiplyScalar(partSunVis);
+    {
+      // under an overcast the sky is grey and darker (as the composite's sky)
+      const oc = U.uOvercast.value, a = light.amb, l = 0.2126 * a.r + 0.7152 * a.g + 0.0722 * a.b;
+      ambP.setRGB(a.r + (l - a.r) * oc, a.g + (l - a.g) * oc, a.b + (l - a.b) * oc).multiplyScalar(1 - 0.5 * oc);
+    }
+    const lightP = { sunDir: sd, sunRad: sunRadP, amb: ambP };
+    const camV = weather.camVel;
+    // camera auto-exposure: the shutter shortens in bright light (1/400 s in sunshine, ~1/60 s at night)
+    const shutter = THREE.MathUtils.clamp(0.0025 * exposure / 0.62, 1 / 500, 1 / 30);
+    let layerOn = smoke.render(renderer, camera, sceneRT.depthTexture, lightP);
+    layerOn = spray.render(renderer, camera, sceneRT.depthTexture, lightP, smoke.rt, !layerOn, camV, ts, shutter) || layerOn;
+    layerOn = sparks.render(renderer, camera, sceneRT.depthTexture, smoke.rt, !layerOn, camV, ts, shutter) || layerOn;
     const rainOn = weather.renderParticles(renderer, camera, sceneRT.depthTexture);
-    post.render(camera, sceneRT, clouds, exposure, smokeOn ? smoke.texture : null, rainOn && !inCockpit ? weather.rain.texture : null,
+    post.render(camera, sceneRT, clouds, exposure, layerOn ? smoke.texture : null, rainOn && !inCockpit ? weather.rain.texture : null,
       inCockpit ? (r, hdr) => cockpit.renderGlass(r, camera, sceneRT.depthTexture, hdr) : null);
 
     // ---------------- HUD / panels
@@ -689,6 +792,7 @@ async function main() {
         hud.drawSurfaces(st.surf, st.cmd);
         hud.drawProfile(st, lastPlan);
         spawnPanel.setVehicle(st);
+        adjustPanel.setVehicle(st);
         if (frame % 15 === 0) spawnPanel.draw();
         hud.drawMap(st.pos, st.air?.track ?? 0, A.world.runway, lastPlan ? { pts: gncViz.planPts, hac: lastPlan.hac, approach: lastPlan.approach, ali: lastPlan.ali, fallback: lastPlan.fallback, prev: lastPlan.prev, mpc: lastMpc } : (lastMpc ? { pts: [], mpc: lastMpc } : null));
       }
@@ -701,6 +805,7 @@ async function main() {
   loop();
   window.__planelands = {
     THREE, renderer, scene, camera, U, terrain, airport, shuttle, clouds, post, atmo, rig, link, setCam, gncViz, hud, meds, chute, smoke, trail, weather, cockpit, aero,
+    sparks, spray, wake, sparkLight,
     injectPlan(m) { lastPlan = m; gncViz.setPlan(m); }, injectMpc(p) { lastMpc = p; gncViz.setMpc(p); },
     // debug helper: free camera at runway-frame (u, v, height) looking at heading/pitch (deg)
     look(u, v, h, hdgDeg, pitchDeg) { setCam('free'); airport.toWorld(u, v, h, rig.free.pos); rig.free.yaw = -hdgDeg * Math.PI / 180; rig.free.pitch = pitchDeg * Math.PI / 180; },

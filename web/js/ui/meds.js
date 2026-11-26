@@ -6,7 +6,8 @@
 // pages modelled on the orbiter displays:
 //   A/E PFD    ascent/entry primary flight display: ADI 8-ball with rate scales and error needles,
 //              α / M-VR(KEAS) / H / Ḣ tapes, Nz accelerometer, HSI with bearing pointers and course
-//              deviation, glide-slope indicator, guidance mode annunciation
+//              deviation, glide-slope indicator, guidance mode annunciation, STALL / OVERSPEED warnings with
+//              alpha and speed limit bands (sim/envelope.py)
 //   HSIT       graphic horizontal situation (moving map): runway, HAC, SCP plan, MPC prediction, trail,
 //              turn predictor, wind, range rings
 //   SPI        surface position indicator: elevons, body flap, rudder, aileron, speedbrake act/cmd
@@ -329,6 +330,9 @@ function drawPFD(g, w, d) {
   const st = d.st, a = st?.air, valid = !!a && d.link !== 'offline';
   const gnc = st?.gnc;
   const auto = (st?.mode || 'AUTO') !== 'MANUAL';
+  // envelope warnings (sim/envelope.py): the stall is the wing's flow state (past its lift maximum),
+  // not an airspeed, so STALL and OVERSPEED are independent and can be on together
+  const wn = valid && st.warn && st.warn.valid ? st.warn : null;
   // ---------------- header
   T(g, `Pitch: ${auto ? 'Auto' : 'CSS'}`, 8, 17, 13);
   T(g, `R/Y: ${auto ? 'Auto' : 'CSS'}`, 8, 33, 13);
@@ -415,23 +419,38 @@ function drawPFD(g, w, d) {
   g.fillStyle = COL.yellow; g.beginPath(); g.arc(cx, cy, 2.2, 0, Math.PI * 2); g.fill();
   g.restore();
   if (!valid) offFlag(g, cx, cy - 34);
+  if (wn) drawEnvelopeWarnings(g, cx, cy, wn);
 
   // ---------------- tapes
   const ty = 66, th = 214;
   const alpha = w.smooth('α', valid && a.air_valid !== false ? a.alpha : NaN, 0.25);     // ADTA data invalid at low speed on the ground
+  const aSt = wn && fin(wn.alpha_stall) ? w.smooth('αst', wn.alpha_stall, 0.3) : NaN;     // alpha of the lift maximum, worse wing
+  const aBands = fin(aSt) ? [{ from: aSt - CAUTION_DEG, to: aSt, color: COL.amber }, { from: aSt, color: COL.red, pole: true }] : [];
   drawTape(g, { x: 14, y: ty, w: 42, h: th, v: alpha, ppu: th / 30, minor: 1, major: 5, label: 5, fmt: (t) => `${t}`, title: 'α', side: 'r',
-    digital: fin(alpha) ? w.hold('a', alpha).toFixed(1) : '', bugs: valid && st.cmd && fin(st.cmd.alpha) ? [st.cmd.alpha] : [] });
+    digital: fin(alpha) ? w.hold('a', alpha).toFixed(1) : '', bugs: valid && st.cmd && fin(st.cmd.alpha) ? [st.cmd.alpha] : [],
+    bands: aBands, dcol: wn && wn.stall ? COL.red : wn && wn.stall_caution ? COL.amber : null });
   const mach = w.smooth('M', valid ? a.mach : NaN, 0.3);
   if (w.keasMode === undefined) w.keasMode = false;
   if (fin(mach)) { if (w.keasMode && mach > 0.95) w.keasMode = false; else if (!w.keasMode && mach < 0.9) w.keasMode = true; }
+  // speed limits: VMO / VLE barber pole above, stall speed at the present load factor below
+  const vmo = wn && fin(wn.vmo) ? wn.vmo : NaN, vs = wn && fin(wn.vs) ? w.smooth('Vs', wn.vs, 0.4) : NaN;
+  const spdBands = (conv) => {
+    const b = [];
+    if (fin(vs) && vs > 1) { b.push({ to: conv(vs), color: COL.red, pole: true }); b.push({ from: conv(vs), to: conv(vs * 1.1), color: COL.amber }); }
+    if (fin(vmo)) b.push({ from: conv(vmo), color: COL.red, pole: true });          // drawn last: on top
+    return b;
+  };
+  const spdCol = wn && wn.overspeed ? COL.red : null;
   if (w.keasMode) {
     const ke = w.smooth('KEAS', valid ? a.keas : NaN, 0.3);
     const refK = gnc && gnc.ref && fin(gnc.ref.V) && fin(a.rho) ? gnc.ref.V * Math.sqrt(a.rho / 1.225) * KT : NaN;
     drawTape(g, { x: 62, y: ty, w: 46, h: th, v: ke, ppu: th / 110, minor: 5, major: 10, label: 20, fmt: (t) => `${t}`, title: 'KEAS', side: 'r',
-      digital: fin(ke) ? `${Math.round(w.hold('k', ke))}` : '', bugs: fin(refK) ? [refK] : [] });
+      digital: fin(ke) ? `${Math.round(w.hold('k', ke))}` : '', bugs: fin(refK) ? [refK] : [], bands: spdBands((k) => k), dcol: spdCol });
   } else {
+    // KEAS -> Mach at the present altitude (sound speed = TAS / M)
+    const kM = valid && fin(a.rho) && a.rho > 0 && fin(a.tas) && fin(a.mach) && a.mach > 0.05 ? 1 / KT / Math.sqrt(a.rho / 1.225) / (a.tas / a.mach) : NaN;
     drawTape(g, { x: 62, y: ty, w: 46, h: th, v: mach, ppu: th / 1.0, minor: 0.05, major: 0.1, label: 0.2, fmt: (t) => t.toFixed(1), title: 'M/VR', side: 'r',
-      digital: fin(mach) ? w.hold('m', mach).toFixed(2) : '' });
+      digital: fin(mach) ? w.hold('m', mach).toFixed(2) : '', bands: fin(kM) ? spdBands((k) => k * kM) : [], dcol: spdCol });
   }
   // altitude: radar altitude (R) below 5000 ft AGL
   const agl = valid ? (a.agl_gear ?? a.agl) * FT : NaN;
@@ -487,6 +506,36 @@ function drawPFD(g, w, d) {
   }
   w.hold('pfdRows', rows).forEach(([k, v, c], i) => { T(g, k, rx + 22, 336 + i * 17, 12, COL.gray); T(g, v, 504, 336 + i * 17, 13, c || COL.white, 'right'); });
   drawKeyLegends(g, w);
+}
+
+const CAUTION_DEG = 3;          // stall caution band: within 3 deg of alpha of the lift maximum (sim/envelope.py)
+/**
+ * STALL / OVERSPEED warnings over the ADI (red, boxed, flashing at 2 Hz: STALL for as long as it is
+ * on, OVERSPEED for the first 5 s, then steady); the stall caution shows the alpha margin to the
+ * lift maximum in amber.
+ */
+function drawEnvelopeWarnings(g, cx, cy, wn) {
+  const now = performance.now();
+  const box = (s, y, col, key, size = 17, always = false) => {
+    const t0 = (drawEnvelopeWarnings.on ||= {})[key] ||= now;
+    const blink = (always || now - t0 < 5000) && Math.floor((now - t0) / 250) % 2 === 1;
+    const tw = textW(s, size) + 14, bh = size + 9;
+    g.fillStyle = blink ? col : 'rgba(0,0,0,0.82)'; g.fillRect(cx - tw / 2, y - bh / 2, tw, bh);
+    g.strokeStyle = col; g.lineWidth = 2; g.strokeRect(cx - tw / 2, y - bh / 2, tw, bh);
+    T(g, s, cx, y + size * 0.36, size, blink ? '#000' : col, 'center', '700');
+  };
+  const off = (key) => { if (drawEnvelopeWarnings.on) delete drawEnvelopeWarnings.on[key]; };
+  if (wn.stall) {
+    const side = wn.stall_l && !wn.stall_r ? ' L' : wn.stall_r && !wn.stall_l ? ' R' : '';
+    box(`STALL${side}`, cy - 50, COL.red, 'stall', 17, true);
+  } else {
+    off('stall');
+    if (wn.stall_caution) {
+      const m = Math.min(wn.margin_l ?? 99, wn.margin_r ?? 99);
+      box(`α MARGIN ${Math.max(0, m).toFixed(1)}°`, cy - 50, COL.amber, 'caut', 13);
+    } else off('caut');
+  }
+  if (wn.overspeed) box('OVERSPEED', cy + 52, COL.red, 'ovsp'); else off('ovsp');
 }
 
 /** ADI 8-ball: per-pixel shaded sphere + vector markings, orthographic, pilot's view along +x body */
@@ -596,6 +645,25 @@ function drawTape(g, o) {
   g.fillStyle = gr; g.fillRect(x, y, w, h);
   g.beginPath(); g.rect(x, y, w, h); g.clip();
   if (ok) {
+    // limit bands on the scale side (value range from..to, open ends allowed): solid, or a red / black
+    // barber pole whose stripes move with the tape
+    for (const b of o.bands || []) {
+      const lo = fin(b.from) ? b.from : -1e9, hi = fin(b.to) ? b.to : 1e9;
+      const y0 = clamp(cy - (hi - o.v) * o.ppu, y, y + h), y1 = clamp(cy - (lo - o.v) * o.ppu, y, y + h);
+      if (y1 - y0 < 0.5) continue;
+      const bw = b.w || 7, bx = o.side === 'r' ? x + w - bw : x;
+      if (b.pole) {
+        g.save(); g.beginPath(); g.rect(bx, y0, bw, y1 - y0); g.clip();
+        g.fillStyle = '#000'; g.fillRect(bx, y0, bw, y1 - y0);
+        g.fillStyle = b.color;
+        const P = 10, base = cy + o.v * o.ppu;
+        for (let k = Math.floor((base - y1) / P) - 1; k <= Math.ceil((base - y0) / P) + 1; k++) {
+          const yk = base - k * P;
+          g.beginPath(); g.moveTo(bx, yk); g.lineTo(bx + bw, yk - bw); g.lineTo(bx + bw, yk - bw + P / 2); g.lineTo(bx, yk + P / 2); g.closePath(); g.fill();
+        }
+        g.restore();
+      } else { g.fillStyle = b.color; g.fillRect(bx, y0, bw, y1 - y0); }
+    }
     const half = h / 2 / o.ppu;
     const k0 = Math.ceil((o.v - half) / o.minor), k1 = Math.floor((o.v + half) / o.minor);
     const mj = Math.round(o.major / o.minor), lb = Math.round(o.label / o.minor);
@@ -633,7 +701,7 @@ function drawTape(g, o) {
   if (o.side === 'r') { g.moveTo(bx, by); g.lineTo(bx + bw - 6, by); g.lineTo(bx + bw + 2, cy); g.lineTo(bx + bw - 6, by + bh); g.lineTo(bx, by + bh); }
   else { g.moveTo(bx + bw, by); g.lineTo(bx + 6, by); g.lineTo(bx - 2, cy); g.lineTo(bx + 6, by + bh); g.lineTo(bx + bw, by + bh); }
   g.closePath(); g.fill(); g.stroke();
-  T(g, o.digital, x + w / 2 + (o.side === 'r' ? -2 : 2), cy + 5.5, 15, COL.white, 'center', '700');
+  T(g, o.digital, x + w / 2 + (o.side === 'r' ? -2 : 2), cy + 5.5, 15, o.dcol || COL.white, 'center', '700');
 }
 
 function drawDial(g, cx, cy, r, v, lo, hi, label, unit, dv = v) {
@@ -1882,14 +1950,14 @@ export class Meds {
     const txt = String(m.text || '').toUpperCase().replace(/[^A-Z0-9 .:+\-/%]/g, '').replace(/\s+/g, ' ').trim().slice(0, 36);
     this.fault = `${m.level === 'error' ? 'GNC FAIL ' : 'GNC '}${txt}`.padEnd(42).slice(0, 42) + ' ' + t;
     this.faultAck = false; this.faultT = performance.now();
-    // latched master alarm: one-off malfunctions (errors, crash, tail scrape, hard / off-runway
+    // latched master alarm: one-off malfunctions (errors, crash, tail / wing-tip scrape, structural damage, hard / off-runway
     // landing).  Energy and degraded-mode alarms are conditions, evaluated from the telemetry.
     if (Meds.isLatchedAlarm(m)) { this.latched = true; this.latchedT = performance.now(); this._syncAlarm(); }
     this.wins.forEach((w) => { w.dirty = true; });
   }
   static isLatchedAlarm(m) {
     if (m.level === 'error') return true;
-    return /tail scrape|OFF RUNWAY|non-finite|main gear touchdown/i.test(String(m.text || ''));
+    return /tail scrape|wing tip scrape|structural damage|hydroplaning:|OFF RUNWAY|non-finite|main gear touchdown/i.test(String(m.text || ''));
   }
   /**
    * Condition alarms from the GNC telemetry: the C&W light follows the condition; the master alarm
@@ -1898,6 +1966,12 @@ export class Meds {
    */
   _conditions(st) {
     const g = st && st.gnc, c = {};
+    // envelope warnings: the master alarm comes on when STALL / OVERSPEED appears
+    const wn = st && st.warn;
+    if (wn && wn.valid && !st.paused) {
+      if (wn.stall) c.stall = true;
+      if (wn.overspeed) c.overspeed = true;
+    }
     if (g && !/CRASH|STOPPED|ROLLOUT|TOUCHDOWN/.test(g.phase || '')) {
       if (g.reachable === false) c.energy = true;
       if (g.degraded) c.degraded = true;

@@ -358,6 +358,9 @@ select option { background: #10161e; }
 }
 
 /* start-position editor */
+.row.edited output { color: var(--accent); }
+.row.edited label { color: var(--accent); }
+#adjust-panel button:disabled { opacity: 0.4; cursor: not-allowed; }
 .spawn-map { display: block; width: 100%; aspect-ratio: 592 / 440; border: 1px solid var(--line); border-radius: 6px; cursor: crosshair; touch-action: none; }
 .spawn-hint { margin-top: 6px; }
 .spawn-status { padding: 7px 9px; border-radius: 6px; border: 1px solid var(--line); background: rgba(255,255,255,0.03); }
