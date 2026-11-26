@@ -10,6 +10,7 @@
 // system zoning (HRSI black / LRSI white tiles, FRSI felt, AFRSI blankets, RCC) and markings are
 // procedural (no texture files).
 import * as THREE from 'three';
+import { PAINT, PAINT_VERT_DECL, PAINT_VERT, PAINT_FRAG_DECL, PAINT_FRAG, PAINT_LIGHT } from './airflow_paint.js';
 
 const D2R = Math.PI / 180;
 const ss = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
@@ -72,11 +73,12 @@ function loft(rings, { capStart = false, capEnd = false, flip = false, attr = nu
   g.setAttribute('aMet', new THREE.Float32BufferAttribute(am, 1));
   g.setIndex(idx);
   g.computeVertexNormals();
+  g.userData.loft = { M, R: rings.length };        // ring layout (airflow.js integrates along it)
   return g;
 }
 
 // NACA-like half thickness (closed trailing edge), xi in [0,1]
-function halfThick(xi, tc) {
+export function halfThick(xi, tc) {
   xi = Math.min(1, Math.max(0, xi));
   return 5 * tc * (0.2969 * Math.sqrt(xi) - 0.1260 * xi - 0.3516 * xi * xi + 0.2843 * xi ** 3 - 0.1036 * xi ** 4);
 }
@@ -415,11 +417,12 @@ function tileMaterial(zone) {
     sh.uniforms.uDecal = decal;
     sh.uniforms.uBodyWet = WET.uBodyWet;
     sh.uniforms.uWetTime = WET.uWetTime;
+    Object.assign(sh.uniforms, PAINT);              // surface pressure paint (airflow.js)
     sh.vertexShader = sh.vertexShader
-      .replace('#include <common>', '#include <common>\nattribute float aChord;\nattribute float aMet;\nvarying vec3 vObjPos;\nvarying vec3 vObjN;\nvarying float vChord;\nvarying float vMet;')
-      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvObjPos = position; vObjN = normal; vChord = aChord; vMet = aMet;');
+      .replace('#include <common>', '#include <common>\nattribute float aChord;\nattribute float aMet;\nvarying vec3 vObjPos;\nvarying vec3 vObjN;\nvarying float vChord;\nvarying float vMet;' + PAINT_VERT_DECL)
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvObjPos = position; vObjN = normal; vChord = aChord; vMet = aMet;' + PAINT_VERT);
     sh.fragmentShader = sh.fragmentShader
-      .replace('#include <common>', '#include <common>\n' + TILE_GLSL + '\nuniform float uBodyWet;\nuniform float uWetTime;\n' + WET_GLSL)
+      .replace('#include <common>', '#include <common>\n' + TILE_GLSL + '\nuniform float uBodyWet;\nuniform float uWetTime;\n' + WET_GLSL + PAINT_FRAG_DECL)
       .replace('#include <color_fragment>', `#include <color_fragment>
 vec3 tCol; float tRough, tMetal, tBump; shuttleSurface(tCol, tRough, tMetal, tBump); markings(tCol); diffuseColor.rgb *= tCol;
 float wetBump = 0.0, wetCov = 0.0;
@@ -428,7 +431,9 @@ if (uBodyWet > 0.002){
   // soaked tiles / blankets darken, a film of water makes the skin glossy
   diffuseColor.rgb *= mix(1.0, 0.68, uBodyWet) * mix(1.0, 0.85, wetCov * uBodyWet);
   tRough = mix(tRough, 0.16, uBodyWet * (0.55 + 0.45 * wetCov));
-}`)
+}
+${PAINT_FRAG}`)
+      .replace('#include <lights_fragment_end>', '#include <lights_fragment_end>\n' + PAINT_LIGHT)
       .replace('#include <roughnessmap_fragment>', 'float roughnessFactor = tRough;')
       .replace('#include <metalnessmap_fragment>', 'float metalnessFactor = tMetal;')
       .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>
@@ -442,7 +447,7 @@ if (uBodyWet > 0.002){
           normal = normalize(abs(det) * normal - grad);
         }`);
   };
-  m.customProgramCacheKey = () => 'orbiter-tile2';
+  m.customProgramCacheKey = () => 'orbiter-tile3';
   return m;
 }
 

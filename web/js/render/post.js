@@ -22,6 +22,9 @@ uniform float uCloudsOn;
 uniform float uAPSteps;
 uniform sampler2D uSmoke;
 uniform float uSmokeOn;
+uniform sampler2D uFlow;       // airflow streamlines around the orbiter (premultiplied, airflow.js)
+uniform float uFlowOn;
+uniform float uFlowDist;       // camera -> vehicle distance: the streamlines' depth against the clouds
 uniform sampler2D uRainLayer;
 uniform float uRainOn;
 uniform mat4 uViewProj;
@@ -269,11 +272,25 @@ void main(){
   bool cirrusInFront = camAlt > uCirrusAlt;
   if (!cirrusInFront) col = col * (1.0 - cir.a) + cir.rgb;
   float clT = 1.0;
+  // airflow streamlines: under the cloud where its (transmittance-weighted mean) distance is nearer
+  // than the vehicle, over it where the cloud lies behind
+  vec4 flowUnder = vec4(0.0), flowOver = vec4(0.0);
+  if (uFlowOn > 0.5){
+    vec4 fl = texture(uFlow, uv);
+    float wUnder = 0.0;
+    if (uCloudsOn > 0.5){
+      float cd = texture(uCloudDepth, uv).r;
+      wUnder = cd > 0.0 ? smoothstep(-0.08, 0.08, (uFlowDist - cd) / max(uFlowDist, 1.0)) : 0.0;
+    }
+    flowUnder = fl * wUnder; flowOver = fl * (1.0 - wUnder);
+  }
+  col = col * (1.0 - flowUnder.a) + flowUnder.rgb;
   if (uCloudsOn > 0.5){
     vec4 cl = cloudUpsample(uv, dist);
     col = col * cl.a + cl.rgb;
     clT = cl.a;
   }
+  col = col * (1.0 - flowOver.a) + flowOver.rgb;
   // near-ground particle layer (tyre smoke): over the clouds seen from below, under them seen from above
   if (uSmokeOn > 0.5){
     vec4 sm = texture(uSmoke, uv) * (camAlt > uCloudBase ? clT : 1.0);
@@ -369,6 +386,7 @@ export class Post {
       uCamPos: { value: new THREE.Vector3() }, uCamFwd: { value: new THREE.Vector3() }, uLogFar: { value: 1 },
       uCirrus: { value: 0.6 }, uCirrusAlt: { value: 9800 }, uStars: { value: 1 }, uCloudsOn: { value: 1 },
       uAPSteps: { value: 14 }, uSmoke: { value: null }, uSmokeOn: { value: 0 }, uRainLayer: { value: null }, uRainOn: { value: 0 },
+      uFlow: { value: null }, uFlowOn: { value: 0 }, uFlowDist: { value: 1 },
       uViewProj: { value: new THREE.Matrix4() }, uRainNow: { value: 0 }, uRainTime: { value: 0 },
       uCloudExt: { value: 0.045 }, uCloudAmbient: { value: 1.0 },
     };
@@ -406,10 +424,14 @@ export class Post {
     this.fu.uRes.value.set(w, h);
   }
 
-  /** overlay(renderer, hdrTarget): extra HDR pass after the composite, before bloom (cockpit glass) */
-  render(camera, sceneRT, clouds, exposure, smoke = null, rain = null, overlay = null) {
+  /** overlay(renderer, hdrTarget): extra HDR pass after the composite, before bloom (cockpit glass);
+   *  flow: { texture, dist } airflow streamline layer and its distance from the camera, or null */
+  render(camera, sceneRT, clouds, exposure, smoke = null, rain = null, overlay = null, flow = null) {
     const r = this.renderer;
     const cu = this.cu;
+    cu.uFlow.value = flow ? flow.texture : null;
+    cu.uFlowOn.value = flow ? 1 : 0;
+    cu.uFlowDist.value = flow ? flow.dist : 1;
     cu.uSmoke.value = smoke;
     cu.uSmokeOn.value = smoke ? 1 : 0;
     cu.uRainLayer.value = rain;

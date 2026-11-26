@@ -109,6 +109,16 @@ class AeroResult:
     lift: float = 0.0
     drag: float = 0.0
     side: float = 0.0
+    # flow visualisation (detail only): bound circulation of each lifting strip [m^2/s] (Kutta-Joukowski
+    # from the strip force and its local flow) and the attached-flow fraction of its stall model
+    gam: np.ndarray | None = None
+    fst: np.ndarray | None = None
+    # per strip, the terms of its normal-force coefficient (sum = cN, based on the strip's local dynamic
+    # pressure): attached potential flow from the flow angle | from the flap deflection | Polhamus vortex
+    # lift | separated flat plate; and qp / q_inf
+    cn_parts: np.ndarray | None = None
+    qr: np.ndarray | None = None
+    etaq: np.ndarray | None = None       # dynamic-pressure ratio of fin blanketing / body-flap shielding
 
 
 class AeroModel:
@@ -335,7 +345,8 @@ class AeroModel:
                     fx0=ffm * ux, fy0=ffm * uy, fz0=ffm * uz,
                     sbx=sbm * ux[ri], sby=sbm * uy[ri], sbz=sbm * uz[ri],
                     a_perp=a_perp, qp=qp, cN=cN, xapp=xapp, eta_v=eta_v,
-                    ae=ae, fst=fst, cN_att=cN_att, qS=qS)
+                    ae=ae, fst=fst, cN_att=cN_att, qS=qS, ux=ux, uy=uy, uz=uz,
+                    a_s=a_s, dalpha=dalpha, sg=sg, kvw=self.Kv * (1.0 - 0.6 * wsup), etaq=etaq)
 
     # ------------------------------------------------------------------ evaluate
     def evaluate(self, v_air, omega, rho, a_snd, mu, h_cg, up_b, ctrl,
@@ -436,6 +447,7 @@ class AeroModel:
         munk_z = P.k_munk * np.where(B.contract < 1.0, B.contract, kup * B.is_fus + (1.0 - B.is_fus))
         Fz = -rho * U * (B.Az[a] * bvz[a] - B.Az[f] * bvz[f]) * munk_z
         Fy = -rho * U * (B.Ay[a] * bvy[a] - B.Ay[f] * bvy[f]) * munk_y
+        potential = (Fy.sum(), Fz.sum())          # Munk (potential-flow) part, for the flow visualisation
         # viscous crossflow at segment centres
         sp = self.spos
         svx = vx + (q * sp[2] - r * sp[1])
@@ -462,7 +474,7 @@ class AeroModel:
         Mx = (sp[1] * Fz - sp[2] * Fy).sum()
         My = (sp[2] * Fx - sp[0] * Fz).sum() + bpos[2] * fbase
         Mz = (sp[0] * Fy - sp[1] * Fx).sum() - bpos[1] * fbase
-        return Fsum, np.array([Mx, My, Mz]), (Fx, Fy, Fz, fbase)
+        return Fsum, np.array([Mx, My, Mz]), (Fx, Fy, Fz, fbase, potential)
 
     # ------------------------------------------------------------------ detail
     def _empty_detail(self, res):
@@ -495,7 +507,7 @@ class AeroModel:
                 ef[f0 + k, 1] += s["sby"][0, j]
                 ef[f0 + k, 2] += s["sbz"][0, j]
         b0, b1 = self.sl["body"]
-        bFx, bFy, bFz, fbase = bparts
+        bFx, bFy, bFz, fbase, bpot = bparts
         ef[b0:b1, 0] = bFx
         ef[b0:b1, 1] = bFy
         ef[b0:b1, 2] = bFz
@@ -562,3 +574,41 @@ class AeroModel:
         hinge["speedbrake"] = float(-(qloc * self.rud_area * 1.2 * math.sin(0.5 * c0[CH_SB])
                                       * 0.5 * self.cf[ri] * self.chord[ri]).sum())
         res.hinge = hinge
+
+        # bound circulation per strip: the strip force F (actual controls, without friction) is the
+        # Kutta-Joukowski force of a vortex G along its quarter-chord line l in the local flow u,
+        # F = rho G u x l  ->  least-squares G = F . (u x l) / (rho |u x l|^2)
+        Lf = self.geo.lift
+        u = np.stack([s["ux"], s["uy"], s["uz"]], 1)
+        F = np.stack([s["Fx"][0], s["Fy"][0], s["Fz"][0]], 1)
+        ul = np.cross(u, Lf.qb - Lf.qa)
+        den = rho * (ul * ul).sum(1)
+        gam = np.where(den > 1e-9, (F * ul).sum(1) / np.maximum(den, 1e-9), 0.0)
+        # the fuselage's own potential lift (Munk term, not in the strips) as bound circulation across the
+        # carry-through span - the lifting-line wing-body picture: circulation continuous across the body
+        # instead of the low carry-through strips shedding a spurious vortex at each wing root.  (The
+        # viscous crossflow force is separated flow, shown as such, not as circulation.)
+        carry = self.is_wing & (self.eff < 0.5)
+        if carry.any():
+            lc = np.array([0.0, 2.0 * float(np.abs(Lf.qb[carry, 1]).max()), 0.0])
+            ub = -np.array([V * math.cos(res.alpha) * math.cos(res.beta), V * math.sin(res.beta),
+                            V * math.sin(res.alpha) * math.cos(res.beta)])
+            ulc = np.cross(ub, lc)
+            Fb = np.array([0.0, bpot[0], bpot[1]])
+            gb = float(Fb @ ulc) / max(rho * float(ulc @ ulc), 1e-9)
+            gam = gam + np.where(carry, gb * np.sign((Lf.qb - Lf.qa) @ lc), 0.0)
+        res.gam = gam
+        res.fst = np.asarray(s["fst"][0], dtype=float)
+        # normal-force terms (what the surface pressure paint distributes over the chord)
+        fst0, ae0, da0 = s["fst"][0], s["ae"][0], s["dalpha"][0]
+        ap0 = ae0 - da0
+        pot = fst0 * s["a_s"] * np.sin(ae0) * np.cos(ae0)
+        small = np.abs(ae0) < 1e-4
+        aeg = np.where(small, 1.0, ae0)
+        cna = np.where(small, fst0 * s["a_s"] * ap0, pot * ap0 / aeg)
+        cnf = np.where(small, fst0 * s["a_s"] * da0, pot * da0 / aeg)
+        cnv = fst0 * s["kvw"] * s["sg"] * np.abs(s["sg"])
+        cns = (1.0 - fst0) * 1.25 * np.sin(ae0)
+        res.cn_parts = np.stack([cna, cnf, cnv, cns], 1)
+        res.qr = s["qp"] / max(res.qbar, 1e-9)
+        res.etaq = np.asarray(s["etaq"], dtype=float)

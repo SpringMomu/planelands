@@ -63,6 +63,8 @@ class LiftingElements:
     qc: np.ndarray = None     # quarter chord (N,3)
     hc: np.ndarray = None     # half chord
     c34: np.ndarray = None    # three-quarter chord
+    qa: np.ndarray = None     # quarter-chord line at the two strip edges (bound vortex of the flow
+    qb: np.ndarray = None     #   visualisation, web/js/world/airflow.js; not used by the force model)
     flap_pt: np.ndarray = None  # mid point of the flap portion (for overlay / hinge)
     nrm: np.ndarray = None
     es: np.ndarray = None
@@ -110,6 +112,9 @@ class BodyElements:
     base_pos: np.ndarray = None
     pod_base_area: float = 0.0
     amax: float = 0.0
+    W: np.ndarray = None      # width / height at each boundary (flow visualisation)
+    H: np.ndarray = None
+    n_fus: int = 0            # boundaries 0..n_fus-1 are the fuselage chain (nose first)
 
 
 @dataclass
@@ -132,6 +137,7 @@ class Geometry:
     limits: dict
     rates: dict
     elements: list = field(default_factory=list)       # frontend element list
+    flow: dict = field(default_factory=dict)            # flow-field geometry for the frontend
     element_slices: dict = field(default_factory=dict)  # how aero arrays map onto `elements`
 
 
@@ -178,6 +184,7 @@ def build_geometry(path: str = GEOM_PATH) -> Geometry:
                    chute_attach=np.array(ch["attach"], dtype=float), chute_cds=chute_cds,
                    limits=limits, rates=rates)
     _build_element_list(geo)
+    _build_flow_geometry(geo)
     return geo
 
 
@@ -226,8 +233,15 @@ def _build_lifting(g) -> LiftingElements:
         dqc = 0.75 * dle + 0.25 * dte
         sweep = math.atan(-dqc)          # positive = aft sweep
         tc = float(np.interp(ym, [p[0] for p in tcs], [p[1] for p in tcs]))
+        def qc_at(y):
+            if kind == "carry":
+                xl, xt, zz = le_trap(y), te_trap(y), z_root
+            else:
+                xl, xt = _interp_poly(le, y), _interp_poly(te, y)
+                zz = z_root - (y - y_root) * math.tan(gam)
+            return xl - 0.25 * (xl - xt), zz
         rows.append(dict(ya=ya, yb=yb, ym=ym, dy=dy, xle=xle, c=c, z=z, gam=Gm,
-                         sweep=sweep, tc=tc, kind=kind))
+                         sweep=sweep, tc=tc, kind=kind, qa=qc_at(ya), qb=qc_at(yb)))
 
     # carry-through (inside fuselage) 2 strips, glove 3 strips, main wing 11 strips
     for ya, yb in ((0.0, 1.3), (1.3, y_root)):
@@ -240,14 +254,15 @@ def _build_lifting(g) -> LiftingElements:
         add_strip(mw[i], mw[i + 1], "main")
 
     elev = w["elevons"]   # right side ri / ro
-    pts = {k: [] for k in ("qc", "hc", "c34", "flap", "n", "es", "ect")}
+    pts = {k: [] for k in ("qc", "hc", "c34", "flap", "n", "es", "ect", "qa", "qb")}
     arr = {k: [] for k in ("S", "chord", "tc", "sweep", "surf", "group", "eff", "Kv", "suction",
                            "a_stall", "cf", "fgroup", "rud_area", "ge", "xn")}
     fmap = []
 
     def push(qc, hc, c34, flap, n, es, ect, S, chord, tc, sweep, surf, group, eff, Kv, suc,
-             ast, cf, fm, fgroup, rud_area, ge, xn):
-        for k, v in (("qc", qc), ("hc", hc), ("c34", c34), ("flap", flap), ("n", n), ("es", es), ("ect", ect)):
+             ast, cf, fm, fgroup, rud_area, ge, xn, qa, qb):
+        for k, v in (("qc", qc), ("hc", hc), ("c34", c34), ("flap", flap), ("n", n), ("es", es), ("ect", ect),
+                     ("qa", qa), ("qb", qb)):
             pts[k].append(np.asarray(v, dtype=float))
         for k, v in (("S", S), ("chord", chord), ("tc", tc), ("sweep", sweep), ("surf", surf),
                      ("group", group), ("eff", eff), ("Kv", Kv), ("suction", suc), ("a_stall", ast),
@@ -298,7 +313,8 @@ def _build_lifting(g) -> LiftingElements:
                  flap=[flap_x, y, z], n=n, es=es, ect=ect, S=c * r["dy"], chord=c, tc=r["tc"],
                  sweep=r["sweep"], surf=SURF_WING, group=group, eff=eff, Kv=Kv, suc=suc, ast=ast,
                  cf=cf, fm=fm, fgroup=fgroup, rud_area=0.0, ge=(kind != "carry"),
-                 xn=max(nose_x - xle, 1.0) if kind == "glove" else max(c * 0.5, 1.0))
+                 xn=max(nose_x - xle, 1.0) if kind == "glove" else max(c * 0.5, 1.0),
+                 qa=[r["qa"][0], side * r["ya"], r["qa"][1]], qb=[r["qb"][0], side * r["yb"], r["qb"][1]])
 
     # ---------------- body flap: 3 strips across the span (all-moving surface)
     bf = g["bodyflap"]
@@ -315,7 +331,8 @@ def _build_lifting(g) -> LiftingElements:
              flap=[xle - 0.5 * c, ym, z], n=[0.0, 0.0, -1.0], es=[0.0, 1.0, 0.0], ect=[-1.0, 0.0, 0.0],
              S=c * (yb - ya), chord=c, tc=bf["thickness"] / c, sweep=0.0, surf=SURF_BF,
              group=G["bodyflap"], eff=1.0, Kv=0.0, suc=0.3, ast=math.radians(24.0), cf=1.0, fm=fm,
-             fgroup=-1, rud_area=0.0, ge=False, xn=nose_x - xle)
+             fgroup=-1, rud_area=0.0, ge=False, xn=nose_x - xle,
+             qa=[xle - 0.25 * c, ya, z], qb=[xle - 0.25 * c, yb, z])
 
     # ---------------- vertical tail: 8 strips along the span
     vt = g["vtail"]
@@ -334,6 +351,12 @@ def _build_lifting(g) -> LiftingElements:
     if ect_vt[0] > 0:
         ect_vt = -ect_vt
     ect_vt = _unit(ect_vt)
+    def vt_qc(zz):
+        f = (zz - zr) / (zt - zr)
+        xl = rt["le_x"] + f * (tp["le_x"] - rt["le_x"])
+        xt = rt["te_x"] + f * (tp["te_x"] - rt["te_x"])
+        return [xl - 0.25 * (xl - xt), 0.0, zz]
+
     for i in range(nst):
         za, zb = zs[i], zs[i + 1]
         zm = 0.5 * (za + zb)
@@ -352,7 +375,7 @@ def _build_lifting(g) -> LiftingElements:
              S=c * dz, chord=c, tc=vt["t_over_c"], sweep=sweep_vt, surf=SURF_VT, group=G["vtail"],
              eff=1.0, Kv=0.5, suc=0.5, ast=math.radians(30.0), cf=cf, fm=fm,
              fgroup=G["rudder_sb"] if cov > 0 else -1, rud_area=cf * c * dz * cov, ge=False,
-             xn=max(c * 0.5, 1.0))
+             xn=max(c * 0.5, 1.0), qa=vt_qc(za), qb=vt_qc(zb))
 
     L = LiftingElements()
     L.n = len(arr["S"])
@@ -363,6 +386,8 @@ def _build_lifting(g) -> LiftingElements:
     L.nrm = np.array(pts["n"])
     L.es = np.array(pts["es"])
     L.ect = np.array(pts["ect"])
+    L.qa = np.array(pts["qa"])
+    L.qb = np.array(pts["qb"])
     L.ep = np.cross(L.nrm, L.ect)
     for k, attr, dt in (("S", "S", float), ("chord", "chord", float), ("tc", "tc", float),
                         ("sweep", "sweep", float), ("surf", "surf", int), ("group", "group", int),
@@ -447,6 +472,7 @@ def _build_body(g) -> BodyElements:
     B.base_area = float(0.80 * 0.85 * W[-1] * H[-1])
     B.base_pos = np.array([base_x, 0.0, zc[-1]])
     B.pod_base_area = 2.0 * 0.5 * pw_full * ph_full
+    B.W, B.H, B.n_fus = Wall, Hall, nseg + 1
     return B
 
 
@@ -486,6 +512,28 @@ def _build_element_list(geo: Geometry):
     sl["chute"] = (start, start + 1)
     geo.elements = els
     geo.element_slices = sl
+
+
+def _build_flow_geometry(geo: Geometry):
+    """Static geometry of the flow visualisation (web/js/world/airflow.js), body FRD about the CG.
+
+    strips : per lifting strip [ax, ay, az, bx, by, bz, chord, surf, cf, t/c] - the quarter-chord line
+             that carries the strip's bound vortex (its circulation comes with every aero message),
+             flap chord fraction and thickness ratio
+    body   : fuselage boundaries, nose first [x, y, z, W/2, H/2] - elliptic sections of the
+             slender-body crossflow
+    src    : per body segment (fuselage + OMS pods) [x, y, z, dA] - axial source of the thickness
+             flow, strength U_x * dA (dA = change of the elliptic section area over the segment)
+    """
+    L, B = geo.lift, geo.body
+    r3 = lambda v: round(float(v), 3)
+    strips = [[*(r3(v) for v in L.qa[i]), *(r3(v) for v in L.qb[i]), r3(L.chord[i]), int(L.surf[i]),
+               r3(L.cf[i]), r3(L.tc[i])] for i in range(L.n)]
+    nf = B.n_fus
+    body = [[r3(B.bx[i]), r3(B.by[i]), r3(B.bz[i]), r3(0.5 * B.W[i]), r3(0.5 * B.H[i])] for i in range(nf)]
+    area = 0.25 * math.pi * B.W * B.H
+    src = [[*(r3(v) for v in B.pos[j]), r3(area[B.aft[j]] - area[B.fore[j]])] for j in range(len(B.fore))]
+    geo.flow = {"strips": strips, "body": body, "src": src}
 
 
 if __name__ == "__main__":

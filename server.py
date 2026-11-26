@@ -6,7 +6,7 @@
 
 * static HTTP server for ./web (threaded)       -> http://localhost:8000
 * WebSocket simulation server (websockets 13)   -> ws://localhost:8765
-* real-time 6-DOF simulation loop (asyncio), state broadcast ~60 Hz, aero ~10 Hz
+* real-time 6-DOF simulation loop (asyncio), state broadcast ~60 Hz, aero ~20 Hz
 
 See sim/ for the plant (aero, 6-DOF, gear), FCS and guidance interface.
 """
@@ -34,7 +34,7 @@ WEB = os.path.join(ROOT, "web")
 sys.path.insert(0, ROOT)
 
 STATE_HZ = 60.0
-AERO_EVERY = 6          # ticks -> 10 Hz
+AERO_EVERY = 3          # ticks -> 20 Hz
 
 
 # --------------------------------------------------------------------------- HTTP

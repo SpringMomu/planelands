@@ -16,6 +16,7 @@ import { TireSmoke } from './world/smoke.js';
 import { Sparks, dustShare } from './world/sparks.js';
 import { TireSpray, waterDepth } from './world/spray.js';
 import { WakeField } from './world/wake.js';
+import { AirflowViz } from './world/airflow.js';
 import { zhEvent } from './ui/i18n.js';
 import { Weather } from './world/weather.js';
 import { AeroAudio } from './world/aero_audio.js';
@@ -83,6 +84,7 @@ async function main() {
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   renderer.autoClear = false;
+  renderer.localClippingEnabled = true;            // the cut-away wing of the airflow section view
   const caps = renderer.capabilities;
   if (!caps.isWebGL2) throw new Error('需要 WebGL2');
 
@@ -129,6 +131,9 @@ async function main() {
   // sparks + dust where the airframe scrapes the runway, spray from the tyres on a wet runway; the air
   // they move in (wind, wake, wing-tip vortices)
   const sparks = new Sparks(), spray = new TireSpray(), wake = new WakeField();
+  // airflow around the orbiter from the simulator's aero model: surface pressure paint, wing section,
+  // wake plane (airflow.js)
+  const airflow = new AirflowViz({ shuttle, geom: geometry });
   const scrapeQ = [];                // structural contacts from the simulator, emitted at their render time
   const weather = new Weather({ U, weatherData: A.weatherData, scene });
   // airflow sound of the gliding orbiter, computed from the flight state (aeroacoustics.js)
@@ -177,6 +182,7 @@ async function main() {
     const depthTexture = new THREE.DepthTexture(w, h, THREE.FloatType);
     sceneRT = new THREE.WebGLRenderTarget(w, h, { type: THREE.HalfFloatType, samples: 4, depthTexture, depthBuffer: true, stencilBuffer: false });
     clouds.scale = q.cloudScale;
+    airflow.setSize(w, h);
     clouds.setSize(w, h);
     post.setSize(w, h);
     smoke.setSize(w, h);
@@ -217,6 +223,7 @@ async function main() {
     },
     onHello: (m) => {
       if (m.elements) { elements = m.elements; forces.setElements(m.elements); }
+      if (m.flow_geo) airflow.setGeometry(m.flow_geo);
       if (m.guidance && m.guidance.available) {
         const sel = $('#guid-sel');
         const names = { scp_mpc: 'SCP + MPC', hold_glide: '占位滑翔（对比）' };
@@ -228,7 +235,7 @@ async function main() {
       surfSent = -1;
       setTimeout(() => spawnPanel?.requestCheck(), 50);
     },
-    onAero: (m) => { if (settings.showForces) forces.update(m.f); lastAero = m; },
+    onAero: (m) => { if (settings.showForces) forces.update(m.f); airflow.setAero(m.flow, m); lastAero = m; },
     onPlan: (m) => { lastPlan = m; gncViz.setPlan(m); },
     // every raw state (also while the tab is hidden): trail / map track / vertical-situation history
     onState: (m) => {
@@ -239,7 +246,7 @@ async function main() {
     },
     onEpisode: () => {
       trail.clear(); hud.clearTrail(); smoke.clear(); sparks.clear(); spray.clear(); scrapeQ.length = 0;
-      aero.reset(); chute.reset(); shuttle.setChuteDoor(false); prevWow = null; meds.resetAlarms();
+      aero.reset(); chute.reset(); shuttle.setChuteDoor(false); prevWow = null; meds.resetAlarms(); airflow.reset();
     },
     onMpc: (m) => { lastMpc = m.pred; gncViz.setMpc(m.pred); },
     onEvent: (m) => { toast(zhEvent(m.text), m.level || 'info', m.level === 'error' ? 8000 : 5000); meds.event(m); },
@@ -319,6 +326,22 @@ async function main() {
   $('#sound').addEventListener('change', (e) => weather.audio.setEnabled(e.target.checked));
   $('#btn-strike').addEventListener('click', () => weather.strikeNow(camera, groundY));
   $('#show-forces').addEventListener('change', (e) => { settings.showForces = e.target.checked; forces.group.visible = e.target.checked; });
+  const setFlow = (on) => {
+    airflow.enabled = on; $('#show-flow').checked = on;
+    $('#flow-opts').classList.toggle('off', !on);
+    $('#flow-legend').classList.toggle('on', on);
+    if (on) airflow.reset();
+    if (on && !link.connected) toast('气流可视化需要 6-DOF 仿真（本地预览模式没有气动模型）', 'warn');
+  };
+  $('#show-flow').addEventListener('change', (e) => setFlow(e.target.checked));
+  const setFlowMode = (m) => {
+    document.querySelectorAll('#flow-mode button').forEach((x) => x.classList.toggle('on', x.dataset.mode === m));
+    $('#flow-station-row').classList.toggle('off', m !== 'section');
+    airflow.setMode(m);
+  };
+  document.querySelectorAll('#flow-mode button').forEach((b) => b.addEventListener('click', () => setFlowMode(b.dataset.mode)));
+  bindRange('flow-speed', (v) => `${v} m/s`, (v) => { airflow.vis = v; });
+  bindRange('flow-station', (v) => `${Math.round(v * 100)} %`, (v) => { airflow.station = v; });
   $('#show-trail').addEventListener('change', (e) => { settings.showTrail = e.target.checked; trail.line.visible = e.target.checked; });
   bindRange('headshake', (v) => (v === 0 ? '关' : v.toFixed(2)), (v) => { rig.shake = v; });
   $('#show-hud').addEventListener('change', (e) => { settings.showHud = e.target.checked; });
@@ -420,6 +443,7 @@ async function main() {
     if (e.code === 'KeyP') link.send({ type: 'sim', action: 'toggle_pause' });
     if (e.code === 'KeyR') { link.send({ type: 'sim', action: 'reset' }); clearEpisode(); }
     if (e.code === 'KeyH') document.body.classList.toggle('ui-hidden');
+    if (e.code === 'KeyV') setFlow(!airflow.enabled);
     if (rig.mode !== 'free') {
       if (e.code === 'KeyG') { ctl.gear = !ctl.gear; toast(ctl.gear ? '起落架放下指令' : '起落架收起指令'); }
       if (e.code === 'KeyC') { ctl.chute = !ctl.chute; toast(ctl.chute ? '减速伞展开指令' : '减速伞抛离指令'); }
@@ -750,6 +774,15 @@ async function main() {
       cockpit.update({ st, dt, night, sunDir: sd, sunRad: light.sunRad, amb: light.amb, exposure, rain: weather.rainCam,
         wx: st ? { dt: dt * ts, vel: vel3, wind: wind3, fall: weather.fall } : null });
     }
+    // airflow: repaint the skin, solve the section / wake plane, cut the wing (before the scene is drawn)
+    if (st) airflow.setSurfaces(st.surf);
+    airflow.update(renderer, dt, camera, U.uSunIntensity.value);
+    shuttle.model.updateMatrixWorld(true);
+    airflow.updateClip(shuttle.model);
+    if (airflow.enabled) {
+      if (frame % 6 === 0 && $('#flow-info').textContent !== airflow.info) $('#flow-info').textContent = airflow.info;
+      if (frame % 3 === 0) airflow.drawChart($('#flow-chart'));
+    }
     renderer.setRenderTarget(sceneRT);
     renderer.setClearColor(0x000000, 1);
     renderer.clear(true, true, false);
@@ -771,9 +804,10 @@ async function main() {
     let layerOn = smoke.render(renderer, camera, sceneRT.depthTexture, lightP);
     layerOn = spray.render(renderer, camera, sceneRT.depthTexture, lightP, smoke.rt, !layerOn, camV, ts, shutter) || layerOn;
     layerOn = sparks.render(renderer, camera, sceneRT.depthTexture, smoke.rt, !layerOn, camV, ts, shutter) || layerOn;
+    const flowLayer = airflow.render(renderer, camera, sceneRT.depthTexture, shuttle.model, exposure);
     const rainOn = weather.renderParticles(renderer, camera, sceneRT.depthTexture);
     post.render(camera, sceneRT, clouds, exposure, layerOn ? smoke.texture : null, rainOn && !inCockpit ? weather.rain.texture : null,
-      inCockpit ? (r, hdr) => cockpit.renderGlass(r, camera, sceneRT.depthTexture, hdr) : null);
+      inCockpit ? (r, hdr) => cockpit.renderGlass(r, camera, sceneRT.depthTexture, hdr) : null, flowLayer);
 
     // ---------------- HUD / panels
     gncViz.update(renderer.domElement.width, renderer.domElement.height);
@@ -805,7 +839,7 @@ async function main() {
   loop();
   window.__planelands = {
     THREE, renderer, scene, camera, U, terrain, airport, shuttle, clouds, post, atmo, rig, link, setCam, gncViz, hud, meds, chute, smoke, trail, weather, cockpit, aero,
-    sparks, spray, wake, sparkLight,
+    sparks, spray, wake, sparkLight, airflow,
     injectPlan(m) { lastPlan = m; gncViz.setPlan(m); }, injectMpc(p) { lastMpc = p; gncViz.setMpc(p); },
     // debug helper: free camera at runway-frame (u, v, height) looking at heading/pitch (deg)
     look(u, v, h, hdgDeg, pitchDeg) { setCam('free'); airport.toWorld(u, v, h, rig.free.pos); rig.free.yaw = -hdgDeg * Math.PI / 180; rig.free.pitch = pitchDeg * Math.PI / 180; },

@@ -119,6 +119,16 @@
     <div class="row chk"><label><input type="checkbox" id="wind-auto" checked> 风速 / 湍流自动变化（风暴中加剧，滑块为均值）</label></div>
     <div class="note" id="wx-live">当前风 —</div>
     <div class="row chk"><label><input type="checkbox" id="show-forces"> 显示各翼面气动力矢量</label></div>
+    <div class="row chk" title="V 键切换"><label><input type="checkbox" id="show-flow"> 显示机体周围气流（V）</label></div>
+    <div id="flow-opts" class="off">
+      <div class="row seg" id="flow-mode"><label>显示</label>
+        <button data-mode="surface" class="on" title="机体表面的压力分布和表面流线">表面压力</button>
+        <button data-mode="section" title="切开靠近相机一侧的机翼，看剖面上的流动">机翼剖面</button>
+        <button data-mode="wake" title="机翼后方截面上的下洗和尾涡">尾流截面</button></div>
+      <div class="row off" id="flow-station-row" title="剖面的展向位置，按半翼展计"><label>剖面位置</label><input type="range" id="flow-station" min="0.25" max="0.9" step="0.01" value="0.45"><output id="flow-station-o">45 %</output></div>
+      <div class="row" title="流线上的点按这个速度移动；实际空速太快，看不清"><label>动画速度</label><input type="range" id="flow-speed" min="3" max="40" step="1" value="15"><output id="flow-speed-o">15 m/s</output></div>
+      <p class="note">由 sim/aero.py 的条带载荷每秒更新 20 次。剖面是该处翼型的二维势流，尾流截面是马蹄涡系的横向速度。</p>
+    </div>
     <div class="row chk"><label><input type="checkbox" id="show-trail" checked> 显示飞行轨迹</label></div>
     <div class="row chk"><label><input type="checkbox" id="show-hud"> 平视显示器 HUD（驾驶舱外也显示）</label></div>
     <div class="row" title="驾驶舱视角中头部随过载、机动、阵风湍流、抖振和跑道颠簸运动；0 关闭，1 真实，2 夸张"><label>舱内视角晃动</label><input type="range" id="headshake" min="0" max="2" step="0.05" value="1"><output id="headshake-o">1.00</output></div>
@@ -205,6 +215,12 @@
 </nav>
 
 <div id="toasts"></div>
+<div id="flow-legend" class="glass">
+  <div class="fl-bar"><span>−1.2</span><i></i><span>+0.8</span></div>
+  <div class="fl-cap"><b>低压</b><em>压力系数 Cp</em><b>高压</b></div>
+  <canvas id="flow-chart" width="436" height="92"></canvas>
+  <div id="flow-info"></div>
+</div>
 
 <script type="module" src="./js/main.js"></script>
 </body>

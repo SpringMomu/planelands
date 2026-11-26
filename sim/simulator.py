@@ -795,13 +795,18 @@ class Simulator:
                                self.act.pos, gear_pos=self.gear.pos, chute=self.chute_state, detail=True)
         self.last_detail = r
         self.last_hinge = r.hinge
+        rd = lambda a, n=3: [round(float(v), n) for v in a]
         return {"type": "aero", "t": self.t, "f": r.elem_f.tolist(), "comp": r.comp, "coef": r.coef,
                 "xcp": r.xcp, "lift": r.lift, "drag": r.drag, "side": r.side,
-                "mach": r.mach, "qbar": r.qbar}
+                "mach": r.mach, "qbar": r.qbar,
+                # flow visualisation (web/js/world/airflow.js): strip circulations + the flow they sit in
+                "flow": {"gam": rd(r.gam, 2), "fst": rd(r.fst), "va": rd(o["v_air"]), "w": rd(self.x[10:13], 4),
+                         "up": rd(o["R"][2, :], 4), "h": round(float(o["agl"]), 2), "mach": round(float(r.mach), 3),
+                         "cn": rd(r.cn_parts.ravel(), 4), "qr": rd(r.qr), "eq": rd(r.etaq)}}
 
     def hello_message(self):
         return {"type": "hello", "version": 1, "geometry": self.geo.raw, "world": self.geo.world,
-                "elements": self.geo.elements, "controls": CTRL_NAMES,
+                "elements": self.geo.elements, "flow_geo": self.geo.flow, "controls": CTRL_NAMES,
                 "guidance": {"active": self.guidance.name, "available": sorted(REGISTRY.keys())}}
 
     # ------------------------------------------------------------------ messages

@@ -91,6 +91,8 @@ button.accent { background: rgba(255, 181, 71, 0.16); border-color: rgba(255, 18
 .presets button { flex: 1 1 30%; }
 .note { margin: 10px 0 0; color: var(--dim); font-size: 11px; line-height: 1.6; }
 .note b { color: var(--accent); font-weight: 500; }
+#flow-opts.off { display: none; }
+#flow-opts { margin: 2px 0 8px 22px; }
 input[type=range] { -webkit-appearance: none; appearance: none; width: 100%; height: 3px; background: rgba(255,255,255,0.14); border-radius: 3px; outline: none; }
 input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 12px; height: 12px; border-radius: 50%; background: #fff; border: 2px solid var(--accent2); cursor: pointer; }
 input[type=range]::-moz-range-thumb { width: 10px; height: 10px; border-radius: 50%; background: #fff; border: 2px solid var(--accent2); cursor: pointer; }
@@ -369,3 +371,16 @@ select option { background: #10161e; }
 .spawn-status[data-s="warn"] { border-color: rgba(255,181,71,0.55); }
 .spawn-status[data-s="bad"] { border-color: rgba(255,93,93,0.6); }
 .spawn-status[data-s="bad"] b { color: #ff7b7b; }
+
+/* airflow visualisation: option rows and the Cp legend */
+#flow-opts .row.off { display: none; }
+#flow-legend { position: fixed; left: 50%; bottom: 74px; transform: translateX(-50%); width: min(460px, 90vw); padding: 8px 12px 9px; z-index: 4; display: none; pointer-events: none; }
+#flow-legend.on { display: block; }
+#flow-legend .fl-bar { display: flex; align-items: center; gap: 8px; font: 500 10px/1 var(--mono); color: var(--dim); }
+#flow-legend .fl-bar i { flex: 1; height: 9px; border-radius: 5px;
+  background: linear-gradient(90deg, rgb(13, 26, 158) 0%, rgb(56, 133, 242) 39%, rgb(204, 204, 204) 60%, rgb(255, 148, 31) 76%, rgb(204, 15, 10) 100%); }
+#flow-legend .fl-cap { display: flex; justify-content: space-between; margin-top: 4px; font-size: 10px; color: var(--dim); }
+#flow-legend .fl-cap b { color: var(--text); font-weight: 500; }
+#flow-legend #flow-chart { display: block; width: 100%; height: 92px; margin-top: 6px; }
+#flow-legend #flow-info { margin-top: 4px; font: 11px/1.5 var(--mono); color: var(--text); }
+body.ui-hidden #flow-legend { display: none; }
