@@ -1,0 +1,3 @@
+# planelands: daily visitor counts of the online demo -> /var/log/planelands/visits.tsv
+# install: /etc/cron.d/planelands-visits (the script: /usr/local/bin/planelands-visits)
+17 * * * * root /usr/local/bin/planelands-visits --quiet

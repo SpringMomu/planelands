@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-> 在线仿真：<http://64.83.43.106:8090>
+> 在线仿真：<https://spaceshuttle.ftmine.cn>
 >
 > 6-DOF、飞控和 SCP/MPC 制导都在浏览器里跑，不用装任何东西。
 > 用桌面版 Chrome 或 Edge（需要 WebGL2）。首次加载约 35 MB，之后走缓存。
@@ -100,6 +100,23 @@ python tools/deploy_web.py <ssh-host> [--dry-run]          # 构建并经 ssh + 
   CPU 跟不上时仿真时间会变慢，但不会丢步。
 - **与原生的差异**：Pyodide 里没有 OSQP，MPC 改用 Clarabel 解同一个 QP，结果相差小于 5e-4。
   cvxpy 默认的 COO 规范化后端在 wasm32 上会因 int64→int32 转换出错，所以改用 SciPy 后端。
+</details>
+
+<details>
+<summary>在线演示的部署（HTTPS、访问统计）</summary>
+
+- **访问路径**：`spaceshuttle.ftmine.cn` 走 Cloudflare 代理（SSL 模式 Full strict）→ 服务器 443 端口的 xray（REALITY，
+  非代理流量原样转给 `127.0.0.1:8444`，带 PROXY protocol）→ nginx。证书用 Cloudflare Origin CA 的 `*.ftmine.cn`。
+  旧地址 `http://<服务器>:8090/` 和域名的 http 都 301 跳到 `https://spaceshuttle.ftmine.cn`。
+  配置在 `deploy/nginx-planelands.conf`（装到 `/etc/nginx/sites-available/planelands.conf`）和
+  `deploy/planelands-site.conf`（装到 `/etc/nginx/snippets/`）。
+- **访客 IP**：经 Cloudflare 时 TCP 对端是 Cloudflare 节点，真实地址取 `CF-Connecting-IP`，只在对端确实是 Cloudflare 网段时才信任。
+  访问日志 `/var/log/nginx/planelands.access.log` 记录访客 IP、请求、状态、User-Agent 和国家/地区（`CF-IPCountry`）。
+- **每天的访问量**：`deploy/planelands-visits.py`（装成 `/usr/local/bin/planelands-visits`）读当前和轮转的访问日志，
+  按北京时间每天一行写进 `/var/log/planelands/visits.tsv`：访客数（不同的 IP + 浏览器）、IP 数、打开次数（页面本身的加载，
+  不算资源文件和每 5 分钟的版本检查）、主要国家/地区。爬虫、脚本和无头浏览器不计。
+  `deploy/planelands-visits.cron` 装到 `/etc/cron.d/`，每小时更新一次；nginx 日志只留 14 天，更早的天数保留在这个文件里。
+  查看：`ssh <host> planelands-visits`（默认最近 30 天，`--days N`）。
 </details>
 
 ### 操作
@@ -1408,7 +1425,7 @@ web/                   three.js r170 前端（已随仓库附带）
   js/sim/              浏览器版：Pyodide 启动、仿真 Worker、规划 Worker
 tools/                 自检、GNC 回归测试、气动报告、浏览器版构建与发布、README 插图（readme_figures.py）
 docs/figures/          README 插图（SVG，由 tools/readme_figures.py 从仿真数据生成）
-deploy/                nginx 配置示例
+deploy/                在线演示的 nginx 配置和访问统计脚本
 ```
 
 ---
