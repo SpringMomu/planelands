@@ -1,7 +1,4 @@
-// Airflow around the orbiter, drawn from the simulator's own aerodynamic model (sim/aero.py).
-//
-// The force model is a component build-up (lifting strips + slender body); the picture is made from
-// those elements with the loads they computed, on the skin and on two kinds of cut plane:
+// Airflow around the orbiter, driven by the simulator's own aerodynamic model (sim/aero.py).
 //
 // 1. Surface pressure paint (all modes).  The aero message carries, per strip, the terms of its
 //    normal-force coefficient (attached potential flow from the flow angle, from the flap deflection,
@@ -11,27 +8,25 @@
 //    normalised so that it integrates back to the model's force.  The local surface speed is the
 //    strip's inflow (free stream + rotation, as in the model) plus half the vortex-sheet strength
 //    (thickness term, Riegels leading-edge factor) and the spanwise flow induced by the spanwise
-//    gradient of the strip circulation (outboard under the tips, inboard on top); Cp = 1 - (V/U)^2.
-//    Fuselage / pods: the slender-body crossflow around the elliptic sections (the model's Munk
-//    term) plus the axial flow of its thickness sources.  Base: the model's base pressure.
-//    Surface streamlines: the surface velocity is integrated along the loft from the stagnation line
-//    (travel time + lane of each vertex), and dashes run along the lanes at the local speed; where the
-//    model's flow is separated the lanes wander and the dashes slow down.
-// 2. Wing section (mode "section"): exact 2-D potential flow (Hess-Smith source + vortex panels)
-//    around the mesh's own section at the chosen span station, elevon deflected as drawn.  Its
-//    circulation is the model's strip circulation (Kutta-Joukowski), so the effective angle of attack
-//    comes out of the solution and the difference to the geometric one is the induced downwash.
-//    Streamlines are traced on the GPU and drawn as contour lines of their upstream height (equal
-//    flux between neighbours: they crowd where the air speeds up), with pulses moving at the local
-//    speed; the outer wing on the camera side is cut away at the section.
-// 3. Wake plane (mode "wake"): a plane across the stream behind the vehicle, with the crossflow of
-//    the strips' horseshoe-vortex system (bound + trailing legs, Betz roll-up toward each half wing's
-//    vorticity centroid, ground images, Mach-cone limit) drawn as animated line-integral convolution
-//    and coloured by downwash / upwash.
+//    gradient of the strip circulation; Cp = 1 - (V/U)^2.  Fuselage / pods: the slender-body
+//    crossflow around the elliptic sections (the model's Munk term) plus the axial flow of its
+//    thickness sources.  Base: the model's base pressure.
+// 2. Wing section (mode "section"): an unsteady 2-D vortex simulation of the mesh's own section at the
+//    chosen span station, elevon deflected as drawn (airflow_section.js, stepped every frame).  Its
+//    free stream is the strip's local inflow; leading-edge shedding sets in where the model's strip
+//    stalls (its attached fraction); its angle of attack is the inflow less the downwash the model's
+//    wing implies (lifting line with the strip's 3-D lift slope; attached, the computed normal force is
+//    trimmed onto the model's).  On the GPU: the velocity of the whole solution on a
+//    grid, smoke from a rake upstream and dye from the nose carried through it, the pressure from the
+//    local speed behind; the outer wing on the camera side is cut away at the section.
+// 3. Wake (mode "wake"): the free vortex wake of all strips (airflow_wake.js): rings shed with the
+//    strips' circulation, every node moved every frame by Biot-Savart of the whole wake.
 import * as THREE from 'three';
 import { FullscreenPass, makeRT } from '../render/pass.js';
 import { PAINT } from './airflow_paint.js';
 import { halfThick } from './shuttle.js';
+import { SectionFlow } from './airflow_section.js';
+import { FreeWake } from './airflow_wake.js';
 
 const SURF_WING = 0, SURF_BF = 1, SURF_VT = 2;
 const clamp = THREE.MathUtils.clamp;
@@ -64,230 +59,110 @@ function flapShape(cf) {
 // the model's base pressure (AeroModel.base_cp)
 const baseCp = (M) => (M < 1.05 ? -0.22 - 0.23 * ss(0.6, 1.05, M) : -0.45 * (1.05 / M) ** 1.8);
 
-const COMMON = /* glsl */ `
-const float PI4 = 12.566370614;
-uniform sampler2D uStrip, uGam, uBody, uSrc;
-uniform int uNS, uNB, uNSrc;
-uniform vec3 uVa, uOm, uD;
-uniform float uU, uMach, uGroundOn, uSB, uTime;
-uniform vec4 uGround;            // world up in body axes, CG height above the ground
-
-// finite vortex segment a -> b, unit circulation (Biot-Savart, core-regularised)
-vec3 segV(vec3 p, vec3 a, vec3 b, float rc2){
-  vec3 r1 = p - a, r2 = p - b, r0 = b - a;
-  vec3 c = cross(r1, r2);
-  float den = dot(c, c) + rc2 * dot(r0, r0);
-  float l1 = max(length(r1), 1e-4), l2 = max(length(r2), 1e-4);
-  return c * (dot(r0, r1 / l1 - r2 / l2) / (PI4 * den));
-}
-// semi-infinite vortex from a along d (vortex vector +d), unit circulation
-vec3 semiV(vec3 p, vec3 a, vec3 d, float rc){
-  vec3 r = p - a;
-  vec3 c = cross(d, r);
-  float s = dot(d, r);
-  float rcs = rc + 0.015 * max(s, 0.0);              // core grows downstream (diffusion)
-  return c * ((1.0 + s / max(length(r), 1e-4)) / (PI4 * (dot(c, c) + rcs * rcs)));
-}
-// supersonic: only the inside of the element's downstream Mach cone feels it
-float machGate(vec3 r){
-  if (uMach <= 1.0) return 1.0;
-  float B = sqrt(uMach * uMach - 1.0);
-  float s = dot(r, uD);
-  return smoothstep(-0.4, 0.4, s - B * length(r - s * uD));
-}
-float segDist(vec3 p, vec3 a, vec3 b){
-  vec3 ab = b - a;
-  float t = clamp(dot(p - a, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);
-  return length(p - a - t * ab);
-}
-
-// lifting strips: horseshoe vortices (+ separated-wake tag of stalled strips)
-vec3 vortexV(vec3 p, inout float sep, bool tag){
-  vec3 v = vec3(0.0);
-  for (int i = 0; i < uNS; i++){
-    vec4 s0 = texelFetch(uStrip, ivec2(i, 0), 0);
-    vec4 s1 = texelFetch(uStrip, ivec2(i, 1), 0);
-    vec2 g = texelFetch(uGam, ivec2(i, 0), 0).xy;
-    vec3 a = s0.xyz, b = s1.xyz;
-    float c = s0.w;
-    vec3 mid = 0.5 * (a + b);
-    if (tag){
-      float off = max(1.0 - g.y, s1.w > 1.5 ? uSB : 0.0);       // surf 2 = fin (split rudder)
-      if (off > 0.03){
-        vec3 te = vec3(0.75 * c, 0.0, 0.0);
-        float s = dot(p - mid + te, uD);
-        if (s > -0.5 * c && s < 8.0 * c){
-          float w = 0.3 * c + 0.22 * max(s, 0.0);
-          float dd = segDist(p, a - te, b - te);
-          sep = max(sep, off * (1.0 - smoothstep(0.5 * w, w, dd)) * (1.0 - smoothstep(4.0 * c, 8.0 * c, s)));
-        }
-      }
-    }
-    float gate = machGate(p - mid);
-    if (abs(g.x) < 1e-3 || gate < 1e-3) continue;
-    float rc = max(0.22, 0.1 * c);
-    float rc2 = rc * rc;
-    // trailing legs run from the edges to the rolled-up wake (Ra, Rb), then on downstream
-    vec4 ra = texelFetch(uGam, ivec2(i, 1), 0), rb = texelFetch(uGam, ivec2(i, 2), 0);
-    // chordwise: flat-plate loading lumped on two panels (82 % at c/8, 18 % at 5c/8)
-    vec3 sh = vec3(0.125 * c, 0.0, 0.0);
-    vec3 a1 = a + sh, b1 = b + sh;
-    vec3 v1 = segV(p, a1, b1, rc2) + segV(p, b1, rb.xyz, rc2) - segV(p, a1, ra.xyz, rc2);
-    vec3 sh2 = vec3(-0.375 * c, 0.0, 0.0);
-    vec3 a2 = a + sh2, b2 = b + sh2;
-    vec3 v2 = segV(p, a2, b2, rc2) + segV(p, b2, rb.xyz, rc2) - segV(p, a2, ra.xyz, rc2);
-    vec3 v3 = semiV(p, rb.xyz, uD, rb.w) - semiV(p, ra.xyz, uD, ra.w);
-    v += g.x * gate * (0.818 * v1 + 0.182 * v2 + v3);
-  }
-  return v;
-}
-// axial thickness sources of fuselage and OMS pods
-vec3 srcV(vec3 p){
-  vec3 v = vec3(0.0);
-  for (int i = 0; i < uNSrc; i++){
-    vec4 s = texelFetch(uSrc, ivec2(i, 0), 0);
-    vec3 r = p - s.xyz;
-    float r2 = dot(r, r) + 0.6;
-    v += r * (uVa.x * s.w * machGate(r) / (PI4 * r2 * sqrt(r2)));
-  }
-  return v;
-}
-vec2 cmul(vec2 a, vec2 b){ return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); }
-vec2 cdiv(vec2 a, vec2 b){ return vec2(a.x * b.x + a.y * b.y, a.y * b.x - a.x * b.y) / max(dot(b, b), 1e-12); }
-vec2 csqrt(vec2 z){
-  float r = length(z);
-  float re = sqrt(max(0.5 * (r + z.x), 0.0)), im = sqrt(max(0.5 * (r - z.x), 0.0));
-  return vec2(re, z.y < 0.0 ? -im : im);
-}
-// slender-body crossflow around the local elliptic section (+ lee-side / base separation tags);
-// inside = 1 when p is inside the fuselage
-vec3 bodyV(vec3 p, inout float sep, inout float inside){
-  float x0 = texelFetch(uBody, ivec2(0, 0), 0).x;
-  if (p.x > x0) return vec3(0.0);
-  vec4 A = texelFetch(uBody, ivec2(uNB - 1, 0), 0), B = texelFetch(uBody, ivec2(uNB - 1, 1), 0);
-  float fade = 1.0, behind = 0.0;
-  if (p.x < A.x){
-    behind = A.x - p.x;
-    fade = exp(-behind / max(1.2 * B.x, 0.5));
-  } else {
-    for (int i = 0; i < uNB - 1; i++){
-      vec4 a0 = texelFetch(uBody, ivec2(i, 0), 0), a1 = texelFetch(uBody, ivec2(i + 1, 0), 0);
-      if (p.x <= a0.x && p.x >= a1.x){
-        float t = (a0.x - p.x) / max(a0.x - a1.x, 1e-4);
-        A = mix(a0, a1, t);
-        B = mix(texelFetch(uBody, ivec2(i, 1), 0), texelFetch(uBody, ivec2(i + 1, 1), 0), t);
-        break;
-      }
-    }
-  }
-  float ha = max(A.w, 0.05), hb = max(B.x, 0.05);      // semi-axes y (half width), z (half height)
-  vec3 q = vec3(p.x, A.y, A.z);
-  vec3 ua = -(uVa + cross(uOm, q));                     // air at the section
-  vec2 Vc = ua.yz;
-  vec2 zz = p.yz - A.yz;
-  float er = length(zz / vec2(ha, hb));                 // 1 on the section contour
-  if (behind == 0.0 && er < 1.0) inside = 1.0;
-  // lee-side separation at high crossflow (viscous crossflow), separated wake behind the blunt base
-  float cr = length(Vc) / max(uU, 1.0);
-  float lee = dot(zz, Vc) / max(length(zz) * length(Vc), 1e-6);
-  if (behind == 0.0)
-    sep = max(sep, smoothstep(0.25, 0.6, cr) * smoothstep(-0.2, 0.5, lee) * (1.0 - smoothstep(1.2, 2.2, er)));
-  else
-    sep = max(sep, (1.0 - smoothstep(0.9, 1.7, er)) * (1.0 - smoothstep(10.0, 30.0, behind)));
-  // potential flow past an ellipse: z = s + c^2 / (4 s) maps the circle |s| = (a + b) / 2 onto it
-  float c2 = ha * ha - hb * hb, R = 0.5 * (ha + hb);
-  vec2 rt = csqrt(cmul(zz, zz) - vec2(c2, 0.0));
-  vec2 s1 = 0.5 * (zz + rt), s2 = 0.5 * (zz - rt);
-  vec2 s = dot(s1, s1) >= dot(s2, s2) ? s1 : s2;
-  vec2 ss = cmul(s, s);
-  vec2 Ubar = vec2(Vc.x, -Vc.y);
-  vec2 w = cdiv(Ubar - R * R * cdiv(Vc, ss), vec2(1.0, 0.0) - cdiv(vec2(c2 * 0.25, 0.0), ss));
-  vec2 pert = vec2(w.x, -w.y) - Vc;
-  if (er < 1.0) pert *= er * er;                        // (inside: only to keep particles moving out)
-  return vec3(0.0, pert) * fade;
-}
-vec3 turb(vec3 p, float t){
-  vec3 q = p * 0.8;
-  return vec3(sin(q.y * 1.7 + 2.0 * sin(q.z * 2.3 + t * 3.1)) + 0.5 * sin(q.z * 3.9 - t * 5.3),
-              sin(q.z * 1.9 + 2.0 * sin(q.x * 2.1 + t * 2.7)) + 0.5 * sin(q.x * 4.3 + t * 4.9),
-              sin(q.x * 1.5 + 2.0 * sin(q.y * 2.9 + t * 3.7)) + 0.5 * sin(q.y * 3.7 - t * 6.1));
-}
-// air velocity relative to the body at p (body axes) + separation tag (w); inside -> sep < 0 flag
-vec4 flow(vec3 p, out float inside){
-  float sep = 0.0;
-  inside = 0.0;
-  vec3 u = -(uVa + cross(uOm, p));
-  u += vortexV(p, sep, true) + srcV(p) + bodyV(p, sep, inside);
-  if (uGroundOn > 0.5){
-    vec3 n = uGround.xyz;
-    vec3 pr = p - 2.0 * (uGround.w + dot(n, p)) * n;
-    float sd = 0.0;
-    vec3 ui = vortexV(pr, sd, false) + srcV(pr);
-    u += ui - 2.0 * dot(ui, n) * n;
-  }
-  if (sep > 0.02) u += sep * uU * 0.2 * turb(p, uTime);
-  return vec4(u, sep);
-}
-`;
-
 // ------------------------------------------------------------------ section: GPU passes
+// The unsteady 2-D solution (airflow_section.js) on a grid over the display domain (wind-aligned
+// rectangle in the section's chord frame): free stream + bound vortex panels + thickness source panels
+// + all free vortices; (velocity along / across the domain axes, speed)
 const SEC_VEL = /* glsl */ `
-uniform sampler2D uNodes;
-uniform int uN;
-uniform float uGam;
-uniform vec2 uVinf;
-uniform vec4 uDom;
+uniform sampler2D uPan, uVort;
+uniform int uNP, uNV;
+uniform vec2 uC, uS, uN, uVinf;
+const float TPI = 6.283185307;
 void main(){
-  vec2 P = mix(uDom.xy, uDom.zw, vUv);
+  vec2 P = uC + (vUv.x * 2.0 - 1.0) * uS + (vUv.y * 2.0 - 1.0) * uN;
   vec2 V = uVinf;
-  int crs = 0;
-  vec4 a = texelFetch(uNodes, ivec2(0, 0), 0);
-  for (int j = 0; j < uN; j++){
-    vec4 b = texelFetch(uNodes, ivec2(j + 1, 0), 0);
-    vec2 S = a.xy, E = b.xy;
-    vec2 r1 = S - P, r2 = E - P;
-    float l1 = max(length(r1), 1e-6), l2 = max(length(r2), 1e-6);
-    float beta = atan(r1.x * r2.y - r1.y * r2.x, dot(r1, r2));
-    float L = log(l1 / l2);
-    vec2 dir = (E - S) / max(length(E - S), 1e-9);
-    // panel frame: source (L, beta) / 2pi, vortex (beta, -L) / 2pi
-    vec2 vl = (a.z * vec2(L, beta) + uGam * vec2(beta, -L)) * 0.159154943;
-    V += dir * vl.x + vec2(-dir.y, dir.x) * vl.y;
-    if ((S.y > P.y) != (E.y > P.y) && S.x + (P.y - S.y) * (E.x - S.x) / (E.y - S.y) > P.x) crs++;
+  vec4 a = texelFetch(uPan, ivec2(0, 0), 0);
+  for (int j = 0; j < uNP; j++){
+    vec4 b = texelFetch(uPan, ivec2(j + 1, 0), 0);
+    vec2 d = b.xy - a.xy;
+    float L = max(length(d), 1e-6);
+    vec2 t = d / L, nn = vec2(-t.y, t.x), o = P - a.xy;
+    float xl = dot(o, t), yl = dot(o, nn);
+    float r1 = xl * xl + yl * yl, r2 = (xl - L) * (xl - L) + yl * yl;
+    float D = atan(yl, xl - L) - atan(yl, xl);
+    float Lg = log(max(r1, 1e-10) / max(r2, 1e-10));
+    float gm = a.z / L, sg = a.w;
+    V += (gm * D / TPI + sg * Lg / (2.0 * TPI)) * t + (-gm * Lg / (2.0 * TPI) + sg * D / TPI) * nn;
     a = b;
   }
-  outColor = vec4(V, length(V), float(crs & 1));
-}`;
-
-// back-trace every texel to the upstream edge: streamline label (height across the free stream) and
-// travel time (chords / U)
-const SEC_TRACE = /* glsl */ `
-uniform sampler2D uVel;
-uniform vec4 uDom;
-uniform vec2 uDir;
-uniform float uSref;
-vec4 velAt(vec2 p){ return texture(uVel, (p - uDom.xy) / (uDom.zw - uDom.xy)); }
-void main(){
-  vec2 P = mix(uDom.xy, uDom.zw, vUv);
-  vec4 c = texture(uVel, vUv);
-  if (c.w > 0.5){ outColor = vec4(0.0, 0.0, c.z, 1.0); return; }
-  vec2 p = P;
-  float tau = 0.0;
-  const float h = 0.016;
-  for (int i = 0; i < 360; i++){
-    vec4 v = velAt(p);
-    float s = length(v.xy);
-    if (s < 0.003 || v.w > 0.5) break;
-    vec2 vm = velAt(p - 0.5 * h * v.xy / s).xy;
-    float sm = max(length(vm), 0.003);
-    p -= h * vm / sm;
-    tau += h / sm;
-    if (p.x < uDom.x || p.y < uDom.y || p.x > uDom.z || p.y > uDom.w) break;
+  for (int k = 0; k < uNV; k++){
+    vec4 v = texelFetch(uVort, ivec2(k & 63, k >> 6), 0);
+    vec2 r = P - v.xy;
+    float r2 = dot(r, r);
+    V += v.z / (TPI * sqrt(r2 * r2 + v.w)) * vec2(r.y, -r.x);
   }
-  float eta = uDir.x * p.y - uDir.y * p.x;
-  outColor = vec4(eta, tau + dot(p, uDir) - uSref, c.z, 0.0);
+  outColor = vec4(dot(V, normalize(uS)), dot(V, normalize(uN)), length(V), 0.0);
 }`;
 
+// dye carried by the computed flow (semi-Lagrangian, Catmull-Rom): r = smoke from a rake upstream,
+// g = dye released round the leading edge.  The domain turns with the flow angle, so the back-traced
+// point is looked up in last frame's domain.
+const SEC_DYE = /* glsl */ `
+uniform sampler2D uDye, uVel, uCont;
+uniform vec2 uC, uS, uN, uCp, uSp, uNp, uRes;
+uniform float uDt, uTime, uRake, uInit;
+uniform int uNC;
+// signed distance to the section contour (chords; negative inside)
+float secDist(vec2 P){
+  float d = 1e9;
+  int crs = 0;
+  vec2 c0 = texelFetch(uCont, ivec2(0, 0), 0).xy;
+  for (int j = 1; j <= uNC; j++){
+    vec2 c1 = texelFetch(uCont, ivec2(j, 0), 0).xy;
+    vec2 e = c1 - c0, w = P - c0;
+    d = min(d, length(w - e * clamp(dot(w, e) / max(dot(e, e), 1e-12), 0.0, 1.0)));
+    if ((c0.y > P.y) != (c1.y > P.y) && c0.x + (P.y - c0.y) * (c1.x - c0.x) / (c1.y - c0.y) > P.x) crs++;
+    c0 = c1;
+  }
+  return (crs & 1) == 1 ? -d : d;
+}
+vec2 toUv(vec2 P, vec2 C, vec2 S, vec2 N){ vec2 o = P - C; return 0.5 + 0.5 * vec2(dot(o, S) / dot(S, S), dot(o, N) / dot(N, N)); }
+vec2 velC(vec2 uv){ vec4 v = texture(uVel, uv); return v.x * normalize(uS) + v.y * normalize(uN); }
+float hash1(float n){ return fract(sin(n) * 43758.5453); }
+float vnoise(float x){ float i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f); return mix(hash1(i), hash1(i + 1.0), f); }
+vec4 sampleCR(vec2 uv){
+  vec2 p = uv * uRes - 0.5, f = fract(p);
+  ivec2 b = ivec2(floor(p)) - 1;
+  // Catmull-Rom weights
+  vec2 t = f, t2 = t * t, t3 = t2 * t;
+  vec2 q0 = -0.5 * t3 + t2 - 0.5 * t, q1 = 1.5 * t3 - 2.5 * t2 + 1.0, q2 = -1.5 * t3 + 2.0 * t2 + 0.5 * t, q3 = 0.5 * t3 - 0.5 * t2;
+  vec4 wx = vec4(q0.x, q1.x, q2.x, q3.x), wy = vec4(q0.y, q1.y, q2.y, q3.y);
+  vec4 acc = vec4(0.0), lo = vec4(1e9), hi = vec4(-1e9);
+  ivec2 mx = ivec2(uRes) - 1;
+  for (int j = 0; j < 4; j++) for (int i = 0; i < 4; i++){
+    vec4 c = texelFetch(uDye, clamp(b + ivec2(i, j), ivec2(0), mx), 0);
+    acc += c * wx[i] * wy[j];
+    if (i >= 1 && i <= 2 && j >= 1 && j <= 2){ lo = min(lo, c); hi = max(hi, c); }
+  }
+  return clamp(acc, lo, hi);
+}
+void main(){
+  vec2 P = uC + (vUv.x * 2.0 - 1.0) * uS + (vUv.y * 2.0 - 1.0) * uN;
+  float hs = length(uS), hn = length(uN);
+  float s = (vUv.x * 2.0 - 1.0) * hs, n = (vUv.y * 2.0 - 1.0) * hn;
+  vec4 dye = vec4(0.0);
+  float q = (n + hn) / uRake, dn = abs(fract(q) - 0.5) * uRake;
+  float streak = exp(-dn * dn / 1.6e-5);
+  // each smoke tube puffs a little irregularly, as real smoke does
+  float kq = floor(q);
+  float puff = 0.45 + 0.55 * vnoise(uTime * 2.2 + kq * 13.7);
+  if (uInit > 0.5){
+    dye.r = streak * 0.8;
+  } else {
+    vec2 Pm = P - 0.5 * uDt * velC(vUv);
+    vec2 Pb = P - uDt * velC(toUv(Pm, uC, uS, uN));
+    vec2 uvp = toUv(Pb, uCp, uSp, uNp);
+    if (all(greaterThan(uvp, vec2(0.0))) && all(lessThan(uvp, vec2(1.0)))) dye = sampleCR(uvp);
+    // the rake
+    if (s > -hs + 0.02 && s < -hs + 0.05) dye.r = max(dye.r, streak * puff);
+    // dye round the nose
+    if (length(P) < 0.014) dye.g = 0.85;
+  }
+  float sd = secDist(P);
+  if (sd < 0.0) dye.rg = vec2(0.0);
+  dye.a = sd;
+  outColor = dye;
+}`;
 const PLANE_VS = /* glsl */ `
 precision highp float;
 in vec3 position;
@@ -329,89 +204,27 @@ float edgeFade(){ vec2 e = min(vUv, 1.0 - vUv); return smoothstep(0.0, 0.06, min
 `;
 
 const SEC_FS = PLANE_COMMON + /* glsl */ `
-uniform sampler2D uTrace;
-uniform float uSpacing, uPulse;          // label spacing (chords), pulse phase per unit travel time
+uniform sampler2D uDye, uVel;
 void main(){
   if (hidden()) discard;
-  vec4 T = texture(uTrace, vUv);
+  vec4 V = texture(uVel, vUv);
+  vec4 d = texture(uDye, vUv);
   float fade = edgeFade();
-  float sr = T.z;
-  vec3 fill = cpColor(1.0 - sr * sr);
-  float f = T.x / uSpacing;
-  float fw = fwidth(f);
-  float d = abs(fract(f + 0.5) - 0.5) / max(fw, 1e-5);
-  // (no lines where the label jumps within a pixel: the dividing streamline behind the trailing edge)
-  float line = (1.0 - smoothstep(0.7, 1.7, d)) * (1.0 - smoothstep(0.35, 0.7, fw));
-  // dashes carried along at the local speed: phase = (travel time - clock) / period
-  float ph = fract(T.y * uPulse - uTime / 0.45);
-  float pulse = smoothstep(0.0, 0.6, ph) * (1.0 - smoothstep(0.66, 0.74, ph));
-  // dark panel, streamlines coloured by the local pressure (blue fast / low, amber slow / high), pulses
-  vec3 lc = mix(vec3(1.0), fill * 1.25, 0.85);
-  line *= 0.25 + 0.75 * pulse;
-  vec3 col = mix(fill * 0.17, lc * (0.8 + 0.5 * pulse), line);
-  float a = mix(0.9, 0.97, line) * fade;
-  // the cut through the wing
-  float sec = smoothstep(0.3, 0.7, T.w);
-  float rim = 1.0 - smoothstep(0.0, 1.2, abs(T.w - 0.5) / max(fwidth(T.w), 1e-4));
+  // background: pressure from the local speed (vortex cores show as low-pressure spots)
+  float cp = 1.0 - V.z * V.z;
+  vec3 col = cpColor(cp) * 0.3;
+  float smoke = clamp(d.r, 0.0, 1.0), dye = clamp(d.g, 0.0, 1.0);
+  col = mix(col, vec3(0.93, 0.95, 0.97), smoke * 0.95);
+  col = mix(col, vec3(1.0, 0.55, 0.18), dye * 0.92);
+  float a = (0.55 + 0.25 * min(abs(cp), 1.0) + 0.2 * max(smoke, dye)) * fade;
+  // the cut through the wing (signed distance from the dye pass)
+  float sd = d.a, fw = max(fwidth(sd), 1e-5);
+  float sec = 1.0 - smoothstep(-0.5 * fw, 0.5 * fw, sd);
+  float rim = 1.0 - smoothstep(0.5 * fw, 1.8 * fw, abs(sd + fw));
   col = mix(col, vec3(0.05, 0.052, 0.055), sec);
-  col = mix(col, vec3(0.9), rim * 0.8);
+  col = mix(col, vec3(0.9), rim * 0.85);
   a = max(a, max(sec, rim) * fade);
   outColor = vec4(col * uGain * a, a);
-}`;
-
-// ------------------------------------------------------------------ wake plane
-const WAKE_VEL = /* glsl */ `
-uniform vec3 uPC, uPE1, uPE2;            // plane centre, half-axis vectors (body axes)
-${COMMON}
-void main(){
-  vec3 p = uPC + uPE1 * (vUv.x * 2.0 - 1.0) + uPE2 * (vUv.y * 2.0 - 1.0);
-  float sd = 0.0;
-  vec3 u = vortexV(p, sd, false);
-  if (uGroundOn > 0.5){
-    vec3 n = uGround.xyz;
-    vec3 pr = p - 2.0 * (uGround.w + dot(n, p)) * n;
-    float s2 = 0.0;
-    vec3 ui = vortexV(pr, s2, false);
-    u += ui - 2.0 * dot(ui, n) * n;
-  }
-  vec3 e1 = normalize(uPE1), e2 = normalize(uPE2);
-  vec2 c = vec2(dot(u, e1), dot(u, e2)) / max(uU, 1.0);
-  outColor = vec4(c, length(c), 0.0);
-}`;
-
-const WAKE_FS = PLANE_COMMON + /* glsl */ `
-uniform sampler2D uWake, uNoise;
-uniform vec2 uSize;                       // plane size (m)
-void main(){
-  if (hidden()) discard;
-  vec4 W = texture(uWake, vUv);
-  float mag = W.z;
-  float rate = 12.0 * mag;                 // pattern speed ~ local crossflow speed
-  // animated line-integral convolution of white noise along the crossflow
-  vec2 toUv = 1.0 / uSize;
-  float acc = 0.0, wsum = 0.0;
-  for (int dirn = -1; dirn <= 1; dirn += 2){
-    vec2 q = vUv;
-    for (int i = 0; i < 18; i++){
-      vec2 v = texture(uWake, q).xy;
-      float s = length(v);
-      if (s < 1e-4) break;
-      float sl = float(i) * 0.14 * float(dirn);              // arclength (m), signed downstream
-      float k = 0.6 + 0.4 * sin(6.2831853 * (sl / 2.4 - uTime * rate));
-      float wgt = 1.0 - float(i) / 18.0;
-      acc += texture(uNoise, q * uSize / 36.0).r * k * wgt;
-      wsum += wgt;
-      q += float(dirn) * 0.14 * v / s * toUv;
-    }
-  }
-  float lic = acc / max(wsum, 1e-4);
-  lic = clamp((lic - 0.25) * 2.6, 0.0, 1.0);
-  // colour: downwash blue, upwash amber (vertical crossflow component), white where it swirls sideways
-  float vz = W.y;
-  vec3 col = vz < 0.0 ? mix(vec3(0.9), vec3(0.25, 0.55, 1.0), smoothstep(0.0, 0.08, -vz))
-                      : mix(vec3(0.9), vec3(1.0, 0.62, 0.2), smoothstep(0.0, 0.08, vz));
-  float a = smoothstep(0.006, 0.045, mag) * edgeFade() * (0.25 + 0.75 * lic);
-  outColor = vec4(col * (0.35 + 0.9 * lic) * uGain * a, a);
 }`;
 
 export const FLOW_MODES = ['surface', 'section', 'wake'];
@@ -476,7 +289,7 @@ export class AirflowViz {
     this.span = Math.max(...this.st.filter((s) => s.surf === SURF_WING).map((s) => Math.max(Math.abs(s.qa.y), Math.abs(s.qb.y))));
     // dynamic per strip (smoothed): |G| (lift sense), cn terms, qr, fst
     const dyn = () => ({ gl: new Float32Array(ns), cn: new Float32Array(ns * 4), qr: new Float32Array(ns).fill(1), eq: new Float32Array(ns).fill(1),
-      fst: new Float32Array(ns).fill(1), gam: new Float32Array(ns), dg: new Float32Array(ns) });
+      fst: new Float32Array(ns).fill(1), gam: new Float32Array(ns), dg: new Float32Array(ns), as: new Float32Array(ns).fill(2.5) });
     this.dyn = dyn();
     this.tdyn = dyn();
     this._initPaint();
@@ -500,12 +313,13 @@ export class AirflowViz {
       d.qr[i] = f.qr ? f.qr[i] : 1;
       d.eq[i] = f.eq ? f.eq[i] : 1;
       d.fst[i] = f.fst[i];
+      if (f.as) d.as[i] = f.as[i];
     }
     if (!this.haveAero) this._snap();
     this.haveAero = true;
   }
 
-  reset() { if (this.haveAero) this._snap(); }
+  reset() { if (this.haveAero) this._snap(); this.wake?.reset(); this._secKey = null; }
   setMode(m) { this.mode = m; }
   setSurfaces(s) {
     if (!s) return;
@@ -516,7 +330,7 @@ export class AirflowViz {
   _snap() {
     const c = this.cur, t = this.tgt;
     c.va.copy(t.va); c.w.copy(t.w); c.up.copy(t.up); c.h = t.h; c.mach = t.mach;
-    for (const k of ['gl', 'cn', 'qr', 'eq', 'fst', 'gam']) this.dyn[k].set(this.tdyn[k]);
+    for (const k of ['gl', 'cn', 'qr', 'eq', 'fst', 'gam', 'as']) this.dyn[k].set(this.tdyn[k]);
   }
 
   get active() { return this.enabled && this.ready && this.haveAero && this.cur.va.length() > 3; }
@@ -570,100 +384,10 @@ export class AirflowViz {
       e.V3 = new Float32Array(n * 3);                            // surface velocity (body axes, m/s)
       if (type === 'lift') this._initLift(e);
       else if (type === 'body' || type === 'pod') this._initBody(e, body);
-      e.loft = g.userData.loft && type !== 'base' && g.userData.loft.M >= 8 ? g.userData.loft : null;
-      if (e.loft) this._initLanes(e);
-      const nl = e.loft ? e.loft.R * e.loft.M : 0;
-      for (let k = 0; k < n; k++) a2.array[k * 4 + 1] = k < nl ? 2 : 1;      // 2: paint + flow lines
+      for (let k = 0; k < n; k++) a2.array[k * 4 + 1] = 1;
       a2.needsUpdate = true;
       this.paint.push(e);
     });
-  }
-
-  /** static data for the surface flow lines: along the rings of the wing / fin / body-flap lofts
-   *  (chordwise), across the rings of the fuselage / pod lofts (lengthwise) */
-  _initLanes(e) {
-    const { M, R } = e.loft, P = e.P;
-    e.TAU = new Float32Array(R * M); e.PSI = new Float32Array(R * M); e.DRIFT = new Float32Array(R * M);
-    if (e.type === 'lift') {
-      e.ringLE = new Int32Array(R); e.ringSpan = new Float32Array(R); e.ringChord = new Float32Array(R); e.ringXi0 = new Float32Array(R);
-      for (let r = 0; r < R; r++) {
-        let j0 = 0, span = 0;
-        for (let j = 0; j < M; j++) {
-          const k = r * M + j;
-          if (e.XI[k] < e.XI[r * M + j0]) j0 = j;
-          span += e.which === 'vt' ? -P[k * 3 + 2] : Math.abs(P[k * 3 + 1]);
-        }
-        e.ringLE[r] = j0; e.ringSpan[r] = span / M;
-        e.ringChord[r] = e.CHD[r * M + j0]; e.ringXi0[r] = e.XI[r * M + j0];
-      }
-    } else {
-      // arc-length fraction around each ring, ring tangent, perimeter
-      e.ASF = new Float32Array(R * M); e.CIRC = new Float32Array(R * M * 3); e.PER = new Float32Array(R);
-      for (let r = 0; r < R; r++) {
-        const b = r * M;
-        const d = (a, c) => Math.hypot(P[a * 3] - P[c * 3], P[a * 3 + 1] - P[c * 3 + 1], P[a * 3 + 2] - P[c * 3 + 2]);
-        let acc = 0;
-        for (let j = 0; j < M; j++) { e.ASF[b + j] = acc; acc += d(b + j, b + (j + 1) % M); }
-        e.PER[r] = acc;
-        for (let j = 0; j < M; j++) {
-          e.ASF[b + j] /= Math.max(acc, 1e-6);
-          const a = b + (j + 1) % M, c = b + (j + M - 1) % M;
-          const tx = P[a * 3] - P[c * 3], ty = P[a * 3 + 1] - P[c * 3 + 1], tz = P[a * 3 + 2] - P[c * 3 + 2];
-          const tl = Math.hypot(tx, ty, tz) || 1;
-          e.CIRC.set([tx / tl, ty / tl, tz / tl], (b + j) * 3);
-        }
-      }
-      e.laneN = e.type === 'pod' ? 28 : 52;
-    }
-  }
-
-  /** travel time (as metres at the free-stream speed) and lane coordinate of the surface streamline
-   *  through each vertex, integrated along the loft from the stagnation line with this frame's flow */
-  _lanes(e, U) {
-    const { M, R } = e.loft, P = e.P, V = e.V3, T = e.TAU, S = e.PSI, DR = e.DRIFT, B = e.a2.array;
-    const vmin = 0.03 * U;
-    const step = (k, kp, side) => {
-      const dx = P[k * 3] - P[kp * 3], dy = P[k * 3 + 1] - P[kp * 3 + 1], dz = P[k * 3 + 2] - P[kp * 3 + 2];
-      const ds = Math.hypot(dx, dy, dz) || 1e-6;
-      const vx = 0.5 * (V[k * 3] + V[kp * 3]), vy = 0.5 * (V[k * 3 + 1] + V[kp * 3 + 1]), vz = 0.5 * (V[k * 3 + 2] + V[kp * 3 + 2]);
-      const along = (vx * dx + vy * dy + vz * dz) / ds;
-      const cross = vx * side[0] + vy * side[1] + vz * side[2];
-      T[k] = T[kp] + ds * U / Math.max(Math.hypot(vx, vy, vz), vmin);
-      return ds * clamp(cross / Math.max(Math.abs(along), vmin), -1.5, 1.5);
-    };
-    const sd = [0, 0, 0];
-    if (e.type === 'lift') {
-      const lane = 0.32;
-      for (let r = 0; r < R; r++) {
-        const b = r * M, j0 = e.ringLE[r], span = e.ringSpan[r];
-        T[b + j0] = e.ringXi0[r] * e.ringChord[r];               // elevon / rudder lofts start at the hinge
-        S[b + j0] = span / lane;
-        for (const dir of [-1, 1]) {
-          let drift = 0;
-          for (let j = j0 + dir; j >= 0 && j < M; j += dir) {
-            const k = b + j;
-            sd[0] = e.STV[k * 3]; sd[1] = e.STV[k * 3 + 1]; sd[2] = e.STV[k * 3 + 2];
-            drift += step(k, k - dir, sd);
-            S[k] = (span - drift) / lane;
-          }
-        }
-      }
-    } else {
-      // circumferential drift of the streamline as a fraction of the ring perimeter (the lanes spread
-      // with the body as it widens behind the nose)
-      const N = e.laneN;
-      for (let j = 0; j < M; j++) { T[j] = 0; DR[j] = 0; S[j] = e.ASF[j] * N; }
-      for (let r = 1; r < R; r++) {
-        const per = Math.max(e.PER[r], 0.05);
-        for (let j = 0; j < M; j++) {
-          const k = r * M + j;
-          sd[0] = e.CIRC[k * 3]; sd[1] = e.CIRC[k * 3 + 1]; sd[2] = e.CIRC[k * 3 + 2];
-          DR[k] = DR[k - M] + clamp(step(k, k - M, sd) / per, -0.015, 0.015);
-          S[k] = (e.ASF[k] - DR[k]) * N;
-        }
-      }
-    }
-    for (let k = 0; k < R * M; k++) { B[k * 4 + 2] = T[k]; B[k * 4 + 3] = S[k]; }
   }
 
   _interpList(L, x) {
@@ -880,7 +604,6 @@ export class AirflowViz {
         e.V3[k * 3] = vx; e.V3[k * 3 + 1] = vy; e.V3[k * 3 + 2] = vz;
         if (e.type === 'lift' && cp < this.cpMin) this.cpMin = cp;
       }
-      if (e.loft) this._lanes(e, U);
       e.a1.needsUpdate = true; e.a2.needsUpdate = true;
     }
   }
@@ -892,43 +615,29 @@ export class AirflowViz {
       const t = new THREE.DataTexture(data, w, h, THREE.RGBAFormat, THREE.FloatType);
       t.minFilter = t.magFilter = THREE.NearestFilter; t.needsUpdate = true; return t;
     };
-    const st = new Float32Array(ns * 2 * 4);
-    fg.strips.forEach((s, i) => { st.set([s[0], s[1], s[2], s[6]], i * 4); st.set([s[3], s[4], s[5], s[7]], (ns + i) * 4); });
-    const nb = fg.body.length, bd = new Float32Array(nb * 2 * 4);
-    fg.body.forEach((b, i) => { bd.set([b[0], b[1], b[2], b[3]], i * 4); bd.set([b[4], 0, 0, 0], (nb + i) * 4); });
-    const sd = new Float32Array(fg.src.length * 4);
-    fg.src.forEach((s, i) => sd.set(s, i * 4));
-    this.gamData = new Float32Array(ns * 3 * 4);
-    this.texGam = tex(this.gamData, ns, 3);
-    const cu = {
-      uStrip: { value: tex(st, ns, 2) }, uGam: { value: this.texGam }, uBody: { value: tex(bd, nb, 2) }, uSrc: { value: tex(sd, fg.src.length, 1) },
-      uNS: { value: ns }, uNB: { value: nb }, uNSrc: { value: fg.src.length },
-      uVa: { value: new THREE.Vector3() }, uOm: { value: new THREE.Vector3() }, uD: { value: new THREE.Vector3(-1, 0, 0) },
-      uU: { value: 1 }, uMach: { value: 0 }, uGroundOn: { value: 0 }, uSB: { value: 0 }, uTime: { value: 0 },
-      uGround: { value: new THREE.Vector4(0, 0, -1, 1e4) },
-      uPC: { value: new THREE.Vector3() }, uPE1: { value: new THREE.Vector3() }, uPE2: { value: new THREE.Vector3() },
-    };
-    this.cu = cu;
     const rtOpts = { type: THREE.HalfFloatType, depthBuffer: false, stencilBuffer: false, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false };
-    // wake plane
-    this.wakeRT = new THREE.WebGLRenderTarget(256, 192, rtOpts);
-    this.wakePass = new FullscreenPass(WAKE_VEL, cu);
-    const noise = new Uint8Array(256 * 256 * 4);
-    for (let i = 0; i < noise.length; i++) noise[i] = Math.random() * 255;
-    this.noise = new THREE.DataTexture(noise, 256, 256, THREE.RGBAFormat);
-    this.noise.wrapS = this.noise.wrapT = THREE.RepeatWrapping;
-    this.noise.minFilter = THREE.LinearFilter; this.noise.magFilter = THREE.LinearFilter; this.noise.needsUpdate = true;
-    // section
+    // section: the unsteady solver, its panels / vortices / contour as textures, velocity grid, dye
     this.NP = 140;
-    this.nodeData = new Float32Array((this.NP + 1) * 4);
-    this.nodeTex = new THREE.DataTexture(this.nodeData, this.NP + 1, 1, THREE.RGBAFormat, THREE.FloatType);
-    this.nodeTex.minFilter = this.nodeTex.magFilter = THREE.NearestFilter;
-    this.secVelRT = new THREE.WebGLRenderTarget(448, 256, rtOpts);
-    this.secTraceRT = new THREE.WebGLRenderTarget(448, 256, rtOpts);
-    this.su = { uNodes: { value: this.nodeTex }, uN: { value: this.NP }, uGam: { value: 0 }, uVinf: { value: new THREE.Vector2(1, 0) },
-      uDom: { value: new THREE.Vector4(-1, -1, 3, 1) }, uVel: { value: this.secVelRT.texture }, uDir: { value: new THREE.Vector2(1, 0) }, uSref: { value: 0 } };
+    this.flow2 = new SectionFlow();
+    const ftex = (w, h) => { const d = new Float32Array(w * h * 4); const t = tex(d, w, h); return { d, t }; };
+    this.panTex = ftex(this.flow2.n, 1);
+    this.vortTex = ftex(64, Math.ceil(this.flow2.cap / 64));
+    this.contTex = ftex(this.NP + 1, 1);
+    this.secVelRT = new THREE.WebGLRenderTarget(512, 256, rtOpts);
+    const dyeOpts = { ...rtOpts, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter };
+    this.dyeRT = [new THREE.WebGLRenderTarget(1024, 512, dyeOpts), new THREE.WebGLRenderTarget(1024, 512, dyeOpts)];
+    this.dyeI = 0;
+    const v2 = () => new THREE.Vector2();
+    this.su = {
+      uPan: { value: this.panTex.t }, uVort: { value: this.vortTex.t }, uCont: { value: this.contTex.t },
+      uNP: { value: this.flow2.n - 1 }, uNV: { value: 0 }, uNC: { value: this.NP },
+      uC: { value: v2() }, uS: { value: v2() }, uN: { value: v2() }, uVinf: { value: v2() },
+      uCp: { value: v2() }, uSp: { value: v2() }, uNp: { value: v2() }, uRes: { value: new THREE.Vector2(1024, 512) },
+      uDye: { value: null }, uVel: { value: this.secVelRT.texture },
+      uDt: { value: 0 }, uTime: { value: 0 }, uRake: { value: 0.085 }, uInit: { value: 1 },
+    };
     this.secVelPass = new FullscreenPass(SEC_VEL, this.su);
-    this.secTracePass = new FullscreenPass(SEC_TRACE, this.su);
+    this.dyePass = new FullscreenPass(SEC_DYE, this.su);
     // plane meshes (drawn into the flow layer)
     const planeMat = (fs, extra) => new THREE.RawShaderMaterial({
       vertexShader: PLANE_VS, fragmentShader: fs, glslVersion: THREE.GLSL3,
@@ -944,58 +653,11 @@ export class AirflowViz {
       g.setIndex([0, 1, 2, 0, 2, 3]);
       return g;
     };
-    this.secMesh = new THREE.Mesh(quad(), planeMat(SEC_FS, { uTrace: { value: this.secTraceRT.texture }, uSpacing: { value: 0.07 }, uPulse: { value: 1 } }));
-    this.wakeMesh = new THREE.Mesh(quad(), planeMat(WAKE_FS, { uWake: { value: this.wakeRT.texture }, uNoise: { value: this.noise }, uSize: { value: new THREE.Vector2(30, 20) } }));
-    for (const m of [this.secMesh, this.wakeMesh]) { m.frustumCulled = false; m.matrixAutoUpdate = false; this.scene.add(m); }
-  }
-
-  /** wing legs of each half converge onto the centroid of that half's shed vorticity (Betz) half a span
-   *  behind the trailing edge; legs on the plane of symmetry, fin and body flap run straight */
-  _rollUp(d, e1, e2) {
-    const S = this.fg.strips, G = this.dyn.gam, D = this.gamData, ns = S.length;
-    let sTE = -1e9, span = 0;
-    for (const s of S) {
-      sTE = Math.max(sTE, (s[0] - 0.75 * s[6]) * d.x + s[1] * d.y + s[2] * d.z, (s[3] - 0.75 * s[6]) * d.x + s[4] * d.y + s[5] * d.z);
-      if (s[7] === 0) span = Math.max(span, Math.abs(s[1]), Math.abs(s[4]));
-    }
-    const sR = sTE + span;
-    const acc = [[0, 0, 0, 0], [0, 0, 0, 0]];
-    const edge = (s, which) => (which ? [s[3], s[4], s[5]] : [s[0], s[1], s[2]]);
-    this._acc = acc;
-    for (let i = 0; i < ns; i++) {
-      const s = S[i];
-      if (s[7] !== 0) continue;
-      for (const which of [0, 1]) {
-        const E = edge(s, which);
-        if (Math.abs(E[1]) < 0.05) continue;
-        const w = which ? G[i] : -G[i];
-        const a = acc[E[1] > 0 ? 1 : 0];
-        a[0] += w; a[1] += w * (E[0] * e1.x + E[1] * e1.y + E[2] * e1.z); a[2] += w * (E[0] * e2.x + E[1] * e2.y + E[2] * e2.z); a[3] += Math.abs(w);
-      }
-    }
-    for (let i = 0; i < ns; i++) {
-      const s = S[i];
-      D[i * 4] = G[i]; D[i * 4 + 1] = this.dyn.fst[i];
-      for (const which of [0, 1]) {
-        const E = edge(s, which);
-        const o = ((1 + which) * ns + i) * 4;
-        const a = acc[E[1] > 0 ? 1 : 0];
-        const sE = E[0] * d.x + E[1] * d.y + E[2] * d.z;
-        if (s[7] === 0 && Math.abs(E[1]) >= 0.05 && Math.abs(a[0]) > 0.01 * a[3]) {
-          const c1 = clamp(a[1] / a[0], -span, span), c2 = a[2] / a[0];
-          D[o] = c1 * e1.x + c2 * e2.x + sR * d.x; D[o + 1] = c1 * e1.y + c2 * e2.y + sR * d.y; D[o + 2] = c1 * e1.z + c2 * e2.z + sR * d.z;
-          D[o + 3] = 0.05 * 2 * span;
-        } else {
-          D[o] = E[0] + d.x * (sR - sE); D[o + 1] = E[1] + d.y * (sR - sE); D[o + 2] = E[2] + d.z * (sR - sE);
-          D[o + 3] = Math.max(0.22, 0.1 * s[6]);
-        }
-      }
-    }
-    this.texGam.needsUpdate = true;
-    const [aL, aR] = acc;
-    this._rollInfo = Math.abs(aL[0]) > 1 && Math.abs(aR[0]) > 1
-      ? { b: Math.abs(aR[1] / aR[0] - aL[1] / aL[0]), g: 0.5 * (Math.abs(aL[0]) + Math.abs(aR[0])) } : null;
-    return { sTE, span };
+    this.secMesh = new THREE.Mesh(quad(), planeMat(SEC_FS, { uDye: { value: this.dyeRT[0].texture }, uVel: { value: this.secVelRT.texture } }));
+    this.secMesh.frustumCulled = false; this.secMesh.matrixAutoUpdate = false; this.scene.add(this.secMesh);
+    // free wake
+    this.wake = new FreeWake(fg, this.lists, this.shuttle);
+    this.scene.add(this.wake.mesh);
   }
 
   // ---------------------------------------------------------------- section: 2-D panel solution
@@ -1020,162 +682,122 @@ export class AirflowViz {
     return { pts, s };
   }
 
-  /** Hess-Smith: N source panels + uniform vortex, Kutta condition; returns unit solutions for
-   *  free streams (1,0) and (0,1) in the solver frame (x aft, y up, lengths / chord) */
-  static hessSmith(xs, ys) {
-    const N = xs.length - 1;
-    const th = new Float64Array(N), cx = new Float64Array(N), cy = new Float64Array(N);
-    for (let j = 0; j < N; j++) { th[j] = Math.atan2(ys[j + 1] - ys[j], xs[j + 1] - xs[j]); cx[j] = 0.5 * (xs[j] + xs[j + 1]); cy[j] = 0.5 * (ys[j] + ys[j + 1]); }
-    const A = new Float64Array(N * N), B = new Float64Array(N * N);
-    for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) {
-      let beta, L;
-      if (i === j) { beta = Math.PI; L = 0; }
-      else {
-        const r1x = xs[j] - cx[i], r1y = ys[j] - cy[i], r2x = xs[j + 1] - cx[i], r2y = ys[j + 1] - cy[i];
-        beta = Math.atan2(r1x * r2y - r1y * r2x, r1x * r2x + r1y * r2y);
-        L = 0.5 * Math.log((r2x * r2x + r2y * r2y) / (r1x * r1x + r1y * r1y));      // ln(r2 / r1)
-      }
-      const sn = Math.sin(th[i] - th[j]), cs = Math.cos(th[i] - th[j]);
-      A[i * N + j] = (sn * L + cs * beta) / (2 * Math.PI);
-      B[i * N + j] = (sn * beta - cs * L) / (2 * Math.PI);
-    }
-    const n1 = N + 1, Mx = new Float64Array(n1 * n1), rhs = [new Float64Array(n1), new Float64Array(n1)];
-    for (let i = 0; i < N; i++) {
-      let sb = 0;
-      for (let j = 0; j < N; j++) { Mx[i * n1 + j] = A[i * N + j]; sb += B[i * N + j]; }
-      Mx[i * n1 + N] = -sb;
-      rhs[0][i] = Math.sin(th[i]);              // -(V . n), n = (-sin, cos), V = (1, 0)
-      rhs[1][i] = -Math.cos(th[i]);             // V = (0, 1)
-    }
-    let sa = 0;
-    for (let j = 0; j < N; j++) { Mx[N * n1 + j] = B[j] + B[(N - 1) * N + j]; sa += A[j] + A[(N - 1) * N + j]; }
-    Mx[N * n1 + N] = sa;
-    rhs[0][N] = -(Math.cos(th[0]) + Math.cos(th[N - 1]));
-    rhs[1][N] = -(Math.sin(th[0]) + Math.sin(th[N - 1]));
-    // Gaussian elimination with partial pivoting, two right-hand sides
-    for (let c = 0; c < n1; c++) {
-      let p = c;
-      for (let r = c + 1; r < n1; r++) if (Math.abs(Mx[r * n1 + c]) > Math.abs(Mx[p * n1 + c])) p = r;
-      if (p !== c) {
-        for (let k = 0; k < n1; k++) { const t = Mx[c * n1 + k]; Mx[c * n1 + k] = Mx[p * n1 + k]; Mx[p * n1 + k] = t; }
-        for (const R of rhs) { const t = R[c]; R[c] = R[p]; R[p] = t; }
-      }
-      const piv = Mx[c * n1 + c];
-      for (let r = c + 1; r < n1; r++) {
-        const f = Mx[r * n1 + c] / piv;
-        if (f === 0) continue;
-        for (let k = c; k < n1; k++) Mx[r * n1 + k] -= f * Mx[c * n1 + k];
-        for (const R of rhs) R[r] -= f * R[c];
-      }
-    }
-    for (const R of rhs) for (let r = n1 - 1; r >= 0; r--) {
-      let s = R[r];
-      for (let k = r + 1; k < n1; k++) s -= Mx[r * n1 + k] * R[k];
-      R[r] = s / Mx[r * n1 + r];
-    }
-    let per = 0;
-    for (let j = 0; j < N; j++) per += Math.hypot(xs[j + 1] - xs[j], ys[j + 1] - ys[j]);
-    return { q: rhs, per, N, A, B, th, cx };
-  }
-
-  _solveSection(camera) {
-    const sh = this.shuttle, c = this.cur, D = this.dyn;
+  /** section mode: drive the unsteady 2-D solver with the model's local flow at the chosen station,
+   *  upload its state, recompute the velocity grid and carry the dye on */
+  _section(renderer, dt, camera) {
+    const sh = this.shuttle, c = this.cur, D = this.dyn, F = this.flow2, su = this.su;
     // the wing facing the camera (hysteresis around the plane of symmetry)
     const cl = sh.model.worldToLocal(this._wp.copy(camera.position));
     if (Math.abs(cl.z) > 3) this.side = cl.z > 0 ? 1 : -1;
     const side = this.side;
     const ay = clamp(this.station * this.span, 2.6, this.span - 0.4);
-    const inner = ay < 7.25;
-    const key = `elevon_${side > 0 ? 'r' : 'l'}${inner ? 'i' : 'o'}`;
-    const defl = this.surf[key] || 0;
+    const defl = this.surf[`elevon_${side > 0 ? 'r' : 'l'}${ay < 7.25 ? 'i' : 'o'}`] || 0;
     const { pts, s } = this._sectionContour(ay, defl);
     const ch = s.chord;
-    // solver frame: x aft from the leading edge, y up from the chord line, in chords
-    const xs = pts.map((p) => (s.xle - p[0]) / ch), ys = pts.map((p) => (p[1] - s.yc) / ch);
-    const key2 = `${ay.toFixed(2)}|${defl.toFixed(1)}`;
-    if (this._hsKey !== key2) { this._hs = AirflowViz.hessSmith(xs, ys); this._hsKey = key2; }
-    const hs = this._hs;
-    // inflow at the section's quarter chord (body axes): free stream + rotation
+    // chord frame: x aft from the leading edge, y up from the chord line, in chords
+    const xs = pts.map((q) => (s.xle - q[0]) / ch), ys = pts.map((q) => (q[1] - s.yc) / ch);
+    // inflow at the section's quarter chord (body axes): free stream + rotation, as the model sees it
     const p = new THREE.Vector3(s.xle - 0.25 * ch, side * ay, -s.yc);
     const va = c.va, om = c.w;
-    const u = new THREE.Vector3(-(va.x + om.y * p.z - om.z * p.y), -(va.y + om.z * p.x - om.x * p.z), -(va.z + om.x * p.y - om.y * p.x));
-    const aft = -u.x, up = -u.z, U2d = Math.hypot(aft, up);
-    const aGeo = Math.atan2(up, aft);
-    // the model's strip circulation at this station, per unit span of the section (Kutta-Joukowski)
+    const ux = -(va.x + om.y * p.z - om.z * p.y), uz = -(va.z + om.x * p.y - om.y * p.x);
+    const aGeo = Math.atan2(-uz, -ux);
+    // the model at this station: normal-force coefficient of the strip (its four terms) and how much
+    // of it is still attached
     const [i0, i1, w] = this._interpList(this.lists[side > 0 ? 0 : 1], ay);
-    const gl = D.gl[i0] * (1 - w) + D.gl[i1] * w;
+    const at = (arr, k, n) => arr[i0 * n + k] * (1 - w) + arr[i1 * n + k] * w;
+    const cnM = (at(D.cn, 0, 4) + at(D.cn, 1, 4) + at(D.cn, 2, 4) + at(D.cn, 3, 4)) * at(D.eq, 0, 1);
+    const fst = at(D.fst, 0, 1);
+    // shape: camber line and half thickness from the contour (lower / upper points at equal stations)
+    const M = this.NP / 2, key = `${side}|${ay.toFixed(2)}`;
+    if (this._secKey !== key || Math.abs(defl - this._secDefl) > 0.05) {
+      const cx = [], ce = [], ct = [];
+      for (let k = 0; k <= M; k++) {
+        const lo = M - k, up = k === M ? 0 : M + k;
+        cx.push(0.5 * (xs[lo] + xs[up])); ce.push(0.5 * (ys[lo] + ys[up]));
+        ct.push(0.5 * Math.hypot(xs[up] - xs[lo], ys[up] - ys[lo]));
+      }
+      F.setShape(cx, ce, ct);
+      for (let j = 0; j <= this.NP; j++) this.contTex.d.set([xs[j], ys[j], 0, 0], j * 4);
+      this.contTex.t.needsUpdate = true;
+      this._secDefl = defl;
+      if (this._secKey !== key) {
+        this._secKey = key;
+        F.reset(this.secA ?? aGeo);
+        this.secA = F.alpha; this.secAd = F.alpha; this.secAcc = 0; this.secCnF = cnM; this.secCnD = cnM;
+        this.secHist = []; this.dcpF = new Float64Array(F.n - 1);
+        su.uInit.value = 1;
+      }
+    }
+    // angle of attack of the 2-D section: the local inflow less the downwash the model's own wing
+    // implies.  Lifting line with the strip's 3-D lift slope a_s (per radian of the streamwise angle,
+    // a_s / cos sweep):  a_i = C_L (1/a - 1/2pi),  C_L = cn cos a.  While attached the steady thin
+    // aerofoil at the model's normal force gives the same angle exactly (taken instead, with camber
+    // and flap); a small slow trim then matches the computed normal force to the model's.  After the
+    // stall the 2-D section keeps the lifting-line angle - its separated force has no tip venting.
     const sI = this.st[w < 0.5 ? i0 : i1];
-    const l = sI.qb.clone().sub(sI.qa);
-    const g2 = gl * u.clone().cross(l).length() / Math.max(Math.abs(l.y) * U2d, 1e-6);
-    // effective angle: the free-stream direction whose Kutta circulation equals the model's
-    const gx = hs.q[0][hs.N], gy = hs.q[1][hs.N];
-    const k = g2 / (Math.max(U2d, 1e-3) * ch * hs.per);
-    const R = Math.hypot(gx, gy), ph = Math.atan2(gy, gx);
-    const ac = Math.acos(clamp(k / Math.max(R, 1e-9), -1, 1));
-    const cand = [ph + ac, ph - ac];
-    const wrap = (a) => Math.atan2(Math.sin(a), Math.cos(a));
-    const aEff = Math.abs(wrap(cand[0] - aGeo)) < Math.abs(wrap(cand[1] - aGeo)) ? cand[0] : cand[1];
-    const ca = Math.cos(aEff), sa = Math.sin(aEff);
-    for (let j = 0; j <= hs.N; j++) {
-      const qj = j < hs.N ? hs.q[0][j] * ca + hs.q[1][j] * sa : 0;
-      this.nodeData.set([xs[j], ys[j], qj, 0], j * 4);
+    const lam = Math.atan2(Math.abs(sI.qb.x - sI.qa.x), Math.max(Math.abs(sI.qb.y - sI.qa.y), 1e-3));
+    const aS = Math.max(at(D.as, 0, 1), 0.5) / Math.max(Math.cos(lam), 0.3);
+    const aLL = aGeo - clamp(cnM * Math.cos(aGeo) * (1 / aS - 1 / (2 * Math.PI)), -0.45, 0.45);
+    const k = 0.5 * F.C1 - F.C0;
+    const aAtt = Math.abs(aGeo) > Math.PI / 2 ? aLL : (Math.asin(clamp((cnM / Math.PI - k) / Math.hypot(1, k), -1, 1)) - Math.atan(k)) / 2;
+    const aFF = fst * aAtt + (1 - fst) * aLL;
+    this.secTrim = this.secTrim || 0;
+    const dtn = Math.min(dt, 0.1) * this.vis / ch;           // chords travelled this frame
+    this.secAcc = Math.min(this.secAcc + dtn, 6 * F.dt);
+    let steps = 0, cnSum = 0;
+    while (this.secAcc >= F.dt) {
+      const aEff = clamp(aFF + this.secTrim, -Math.PI, Math.PI);
+      const a0 = Math.abs(Math.sin(aEff) - F.C0 * Math.cos(aEff));
+      const lesp = fst > 0.97 ? Infinity : Math.max(0.02, a0 * (0.12 + 0.95 * fst * fst));
+      F.step(aEff, lesp);
+      this.secA = aEff;
+      this.secAcc -= F.dt; steps++;
+      this.secCnD += (F.cnP - this.secCnD) * (1 - Math.exp(-F.dt / 0.25)); cnSum += this.secCnD;
+      this.secCnF += (F.cnP - this.secCnF) * (1 - Math.exp(-F.dt / 1.5));
+      let slope = fst * 2 * Math.PI * Math.cos(2 * aEff) + (1 - fst) * 2 * Math.cos(aEff);
+      if (Math.abs(slope) < 1) slope = slope < 0 ? -1 : 1;
+      this.secTrim = clamp(this.secTrim + (cnM - this.secCnF) / slope * F.dt / 2.5, -0.12, 0.12);
+      for (let j = 0; j < F.n - 1; j++) this.dcpF[j] += (F.dcp[j] - this.dcpF[j]) * 0.25;
     }
-    this.nodeTex.needsUpdate = true;
-    // surface Cp along the section (tangential speed at the panel midpoints)
-    const gm = hs.q[0][hs.N] * ca + hs.q[1][hs.N] * sa;
-    this.secCp = { x: [], cp: [], n: hs.N };
-    for (let i = 0; i < hs.N; i++) {
-      let vt = Math.cos(aEff - hs.th[i]);
-      for (let j = 0; j < hs.N; j++) vt += hs.B[i * hs.N + j] * (hs.q[0][j] * ca + hs.q[1][j] * sa) + hs.A[i * hs.N + j] * gm;
-      this.secCp.x.push(hs.cx[i]); this.secCp.cp.push(1 - vt * vt);
+    if (steps) {
+      this.secHist.push([F.t, cnSum / steps, cnM]);
+      while (this.secHist.length && F.t - this.secHist[0][0] > 12) this.secHist.shift();
     }
-    this.secCl = 2 * gm * hs.per;
-    const su = this.su;
-    su.uGam.value = hs.q[0][hs.N] * ca + hs.q[1][hs.N] * sa;
-    su.uVinf.value.set(ca, sa);
-    // domain (chords): 1.1 ahead, 2.2 behind the leading edge... trailing edge, +-1.15 across
-    const dom = su.uDom.value.set(-0.75, -0.7, 2.1, 0.7);
-    su.uDir.value.set(ca, sa);
-    su.uSref.value = Math.min(dom.x * ca + dom.y * sa, dom.x * ca + dom.w * sa, dom.z * ca + dom.y * sa, dom.z * ca + dom.w * sa);
+    // display domain: wind-aligned, turning slowly with the flow angle
+    const prevC = su.uC.value.clone(), prevS = su.uS.value.clone(), prevN = su.uN.value.clone();
+    this.secAd += (F.alpha - this.secAd) * (1 - Math.exp(-dtn / 0.6));
+    const ca = Math.cos(this.secAd), sa = Math.sin(this.secAd), hs = 1.6, hn = 0.8;
+    su.uC.value.set(0.5 + 0.6 * ca, 0.6 * sa);
+    su.uS.value.set(ca * hs, sa * hs);
+    su.uN.value.set(-sa * hn, ca * hn);
+    if (su.uInit.value > 0.5) { prevC.copy(su.uC.value); prevS.copy(su.uS.value); prevN.copy(su.uN.value); }
+    su.uCp.value.copy(prevC); su.uSp.value.copy(prevS); su.uNp.value.copy(prevN);
+    su.uVinf.value.set(Math.cos(F.alpha), Math.sin(F.alpha));
+    // solver state -> textures
+    const pd = this.panTex.d;
+    for (let j = 0; j < F.n; j++) pd.set([F.x[j], F.eta[j], j < F.n - 1 ? F.Gs[j] : 0, j < F.n - 1 ? F.sig[j] : 0], j * 4);
+    this.panTex.t.needsUpdate = true;
+    const vd = this.vortTex.d;
+    for (let q = 0; q < F.nv; q++) { vd[q * 4] = F.vx[q]; vd[q * 4 + 1] = F.vy[q]; vd[q * 4 + 2] = F.vg[q]; vd[q * 4 + 3] = F.vr[q]; }
+    this.vortTex.t.needsUpdate = true;
+    su.uNV.value = F.nv;
+    this.secVelPass.render(renderer, this.secVelRT);
+    if (steps || su.uInit.value > 0.5) {
+      su.uDt.value = steps * F.dt; su.uTime.value = F.t;
+      su.uDye.value = this.dyeRT[this.dyeI].texture;
+      this.dyeI ^= 1;
+      this.dyePass.render(renderer, this.dyeRT[this.dyeI]);
+      su.uInit.value = 0;
+      this.secMesh.material.uniforms.uDye.value = this.dyeRT[this.dyeI].texture;
+    }
     // plane quad in the model frame (local z = body y)
     const pos = this.secMesh.geometry.attributes.position;
-    const Z = side * ay;
-    const corner = (xn, yn) => [s.xle - xn * ch, s.yc + yn * ch, Z];
-    pos.array.set([...corner(dom.x, dom.y), ...corner(dom.z, dom.y), ...corner(dom.z, dom.w), ...corner(dom.x, dom.w)]);
+    const Z = side * ay, C = su.uC.value, S = su.uS.value, N = su.uN.value;
+    const corner = (u, v) => { const x = C.x + u * S.x + v * N.x, y = C.y + u * S.y + v * N.y; return [s.xle - x * ch, s.yc + y * ch, Z]; };
+    pos.array.set([...corner(-1, -1), ...corner(1, -1), ...corner(1, 1), ...corner(-1, 1)]);
     pos.needsUpdate = true;
-    this.secMesh.material.uniforms.uSpacing.value = 0.045;
-    // pulses: one every 0.4 s of display time; travel time is in chords / U
-    this.secMesh.material.uniforms.uPulse.value = ch / (this.vis * 0.45);
-    this.secInfo = { y: side * ay, ch, aGeo, aEff, defl, fst: D.fst[i0] * (1 - w) + D.fst[i1] * w };
+    this.secInfo = { y: side * ay, ch, aGeo, aEff: F.alpha, defl, fst, cnM, cnF: this.secCnF, sep: Math.abs(F.leRate) > 0.05 };
     this.clipLocal = { side, ay };
-  }
-
-  _wakePlane() {
-    const c = this.cur, U = c.va.length();
-    const d = c.va.clone().multiplyScalar(-1 / U);
-    const e1 = new THREE.Vector3(0, 1, 0).addScaledVector(d, -d.y);
-    if (e1.lengthSq() < 0.05) e1.set(0, 0, 1).addScaledVector(d, -d.z);
-    e1.normalize();
-    const e2 = new THREE.Vector3().crossVectors(d, e1);
-    const { sTE, span } = this._rollUp(d, e1, e2);
-    this.wakeInfo = this._rollInfo;
-    // centre: half a span behind the trailing edge, at the wing's height
-    let zc = 0, nz = 0;
-    for (const s of this.st) if (s.surf === SURF_WING) { zc += s.mid.dot(e2); nz++; }
-    zc /= Math.max(nz, 1);
-    const sT = sTE + 0.5 * span;
-    const W = span + 7, H = 0.75 * span + 3;
-    const cu = this.cu;
-    cu.uPC.value.copy(d).multiplyScalar(sT).addScaledVector(e2, zc);
-    cu.uPE1.value.copy(e1).multiplyScalar(W);
-    cu.uPE2.value.copy(e2).multiplyScalar(H);
-    this.wakeMesh.material.uniforms.uSize.value.set(2 * W, 2 * H);
-    const pos = this.wakeMesh.geometry.attributes.position;
-    const cP = cu.uPC.value, A = cu.uPE1.value, B = cu.uPE2.value;
-    const L = (a, b) => { const p = cP.clone().addScaledVector(A, a).addScaledVector(B, b); return [p.x, -p.z, p.y]; };    // FRD -> local
-    pos.array.set([...L(-1, -1), ...L(1, -1), ...L(1, 1), ...L(-1, 1)]);
-    pos.needsUpdate = true;
-    return { d };
   }
 
   /** per frame: smooth toward the latest aero state, repaint the skin, recompute the active plane */
@@ -1187,36 +809,38 @@ export class AirflowViz {
     const k = 1 - Math.exp(-Math.min(dt, 0.1) / 0.12);
     c.va.lerp(t.va, k); c.w.lerp(t.w, k); c.up.lerp(t.up, k).normalize();
     c.h += (t.h - c.h) * k; c.mach += (t.mach - c.mach) * k;
-    for (const key of ['gl', 'cn', 'qr', 'eq', 'fst', 'gam']) { const a = D[key], b = T[key]; for (let i = 0; i < a.length; i++) a[i] += (b[i] - a[i]) * k; }
+    for (const key of ['gl', 'cn', 'qr', 'eq', 'fst', 'gam', 'as']) { const a = D[key], b = T[key]; for (let i = 0; i < a.length; i++) a[i] += (b[i] - a[i]) * k; }
     this.time += dt;
-    PAINT.uPaintTime.value = this.time;
-    PAINT.uPaintVis.value = this.vis;
     PAINT.uPaintEmit.value = 0.06 * sunIntensity + 0.1;
     this._updatePaint();
-    const U = c.va.length();
-    const cu = this.cu;
-    cu.uVa.value.copy(c.va); cu.uOm.value.copy(c.w); cu.uD.value.copy(c.va).multiplyScalar(-1 / U);
-    cu.uU.value = U; cu.uMach.value = c.mach; cu.uSB.value = this.sb;
-    cu.uGround.value.set(c.up.x, c.up.y, c.up.z, c.h); cu.uGroundOn.value = c.h < 75 ? 1 : 0;
     const prev = renderer.getRenderTarget();
     if (this.mode === 'section') {
-      this._solveSection(camera);
-      this.secVelPass.render(renderer, this.secVelRT);
-      this.secTracePass.render(renderer, this.secTraceRT);
-      const s = this.secInfo, R2D = 180 / Math.PI;
-      this.info = `y = ${s.y.toFixed(1)} m 剖面，弦长 ${s.ch.toFixed(1)} m${Math.abs(s.defl) > 0.5 ? `，升降副翼 ${s.defl > 0 ? '下' : '上'}偏 ${Math.abs(s.defl).toFixed(1)}°` : ''}。` +
-        `几何迎角 ${(s.aGeo * R2D).toFixed(1)}°，有效迎角 ${(s.aEff * R2D).toFixed(1)}°，下洗 ${((s.aGeo - s.aEff) * R2D).toFixed(1)}°，Cl ${this.secCl.toFixed(2)}` +
-        (s.fst < 0.9 ? `。这里已部分失速（附着 ${(s.fst * 100).toFixed(0)}%）` : '') +
-        (c.mach > 0.95 ? '。剖面按不可压势流算，超声速时只能参考' : '');
+      this._section(renderer, dt, camera);
+      const q = this.secInfo, R2D = 180 / Math.PI;
+      this.info = `y = ${q.y.toFixed(1)} m 剖面，弦长 ${q.ch.toFixed(1)} m${Math.abs(q.defl) > 0.5 ? `，升降副翼${q.defl > 0 ? '下' : '上'}偏 ${Math.abs(q.defl).toFixed(1)}°` : ''}。` +
+        `来流 ${(q.aGeo * R2D).toFixed(1)}°，扣除下洗后 ${(q.aEff * R2D).toFixed(1)}°。` +
+        (q.fst < 0.5 ? '前缘分离，涡在脱落。' : q.fst < 0.97 ? '开始失速，前缘有涡脱落。' : '') +
+        `法向力系数：剖面（二维）${q.cnF.toFixed(2)}，模型 ${q.cnM.toFixed(2)}` +
+        (q.fst < 0.5 ? '（二维没有翼尖泄压，失速后偏大）' : '') +
+        (c.mach > 0.95 ? '。剖面按不可压流计算，超声速时只作参考' : '');
     } else if (this.mode === 'wake') {
-      this._wakePlane();
-      this.wakePass.render(renderer, this.wakeRT);
-      const w = this.wakeInfo;
-      this.info = w ? `尾涡间距 ${w.b.toFixed(1)} m，单侧环量 ${w.g.toFixed(0)} m²/s` : '';
+      if (this._lastMode !== 'wake') this.wake.reset();
+      this.wake.update(renderer, dt, D.gam, c.va, c.w, this.vis);
+      // root circulation and the spacing of the rolled-up tip vortices (centroids of the shed vorticity)
+      const L = this.lists[0];
+      let g0 = 0, m1 = 0;
+      for (const { i } of L) g0 = Math.max(g0, Math.abs(D.gam[i]));
+      for (let q = 0; q < L.length; q++) {
+        const gi = Math.abs(D.gam[L[q].i]), go = q + 1 < L.length ? Math.abs(D.gam[L[q + 1].i]) : 0;
+        m1 += (gi - go) * (q + 1 < L.length ? 0.5 * (L[q].c + L[q + 1].c) : this.span);
+      }
+      const gr = L.length ? Math.abs(D.gam[L[0].i]) : 0;
+      this.info = gr > 1 ? `翼根环量 ${gr.toFixed(0)} m²/s，翼尖涡卷起后间距约 ${(2 * m1 / gr).toFixed(1)} m（翼展 ${(2 * this.span).toFixed(1)} m）` : '';
     } else {
       const L = this.lift, Dr = this.drag;
       this.info = Number.isFinite(L) ? `升力 ${(L / 1e3).toFixed(0)} kN　阻力 ${(Dr / 1e3).toFixed(0)} kN　升阻比 ${(L / Math.max(Dr, 1)).toFixed(2)}　机翼最低 Cp ${this.cpMin.toFixed(2)}` : '';
     }
+    this._lastMode = this.mode;
     renderer.setRenderTarget(prev);
   }
 
@@ -1239,21 +863,36 @@ export class AirflowViz {
       pts.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y)));
       g.stroke();
     };
-    if (this.mode === 'section' && this.secCp) {
-      // -Cp up, x/c to the right
-      const { x, cp, n } = this.secCp;
-      let lo = -1, hi = 1;
-      for (const v of cp) { lo = Math.min(lo, -v); hi = Math.max(hi, -v); }
-      lo = Math.floor(lo * 2) / 2; hi = Math.ceil(Math.min(hi, 6) * 2) / 2;
-      const X = (v) => pad.l + clamp(v, 0, 1) * pw, Y = (v) => pad.t + (hi - clamp(v, lo, hi)) / (hi - lo) * ph;
-      line([[pad.l, Y(0)], [pad.l + pw, Y(0)]], 'rgba(255,255,255,0.25)', 1);
-      g.fillText(`${hi}`, 4, pad.t + 8); g.fillText(`${lo}`, 4, pad.t + ph); g.fillText('−Cp', 4, Y(0) + 3);
-      g.fillText('前缘', pad.l, H - 3); g.fillText('后缘', pad.l + pw - 24, H - 3);
-      const half = n >> 1, lower = [], upper = [];
-      for (let i = 0; i < n; i++) (i < half ? lower : upper).push([X(x[i]), Y(-cp[i])]);
-      line(lower, 'rgb(255,160,60)'); line(upper, 'rgb(90,170,255)');
-      g.fillStyle = 'rgb(90,170,255)'; g.fillText('上表面', pad.l + pw - 92, pad.t + 9);
-      g.fillStyle = 'rgb(255,160,60)'; g.fillText('下表面', pad.l + pw - 46, pad.t + 9);
+    if (this.mode === 'section' && this.secHist && this.secHist.length > 1) {
+      // left: normal-force coefficient over the last 12 chords of travel (computed / model);
+      // right: pressure difference lower - upper along the chord (smoothed over a few steps)
+      const H = this.secHist, t1 = H[H.length - 1][0], F = this.flow2;
+      const wl = pw * 0.56, gap = 30, wr = pw - wl - gap, xr = pad.l + wl + gap;
+      let lo = 0, hi = 0.5;
+      for (const [, a, b] of H) { lo = Math.min(lo, a, b); hi = Math.max(hi, a, b); }
+      lo = Math.floor(lo * 2) / 2; hi = Math.ceil(hi * 2) / 2;
+      const X = (t) => pad.l + (1 - (t1 - t) / 12) * wl, Y = (v) => pad.t + (hi - clamp(v, lo, hi)) / (hi - lo) * ph;
+      line([[pad.l, Y(0)], [pad.l + wl, Y(0)]], 'rgba(255,255,255,0.25)', 1);
+      g.fillText(`${hi}`, 4, pad.t + 8); g.fillText(`${lo}`, 4, pad.t + ph); g.fillText('Cn', 4, Y(0.5 * (lo + hi)) + 3);
+      g.setLineDash([4, 3]);
+      line(H.map(([t, , b]) => [X(t), Y(b)]), 'rgb(90,170,255)', 1.4);
+      g.setLineDash([]);
+      line(H.map(([t, a]) => [X(t), Y(a)]), 'rgba(255,255,255,0.9)', 1.2);
+      g.fillStyle = 'rgba(255,255,255,0.9)'; g.fillText('剖面（实时）', pad.l + 4, pad.t + 9);
+      g.fillStyle = 'rgb(90,170,255)'; g.fillText('模型', pad.l + 80, pad.t + 9);
+      g.fillStyle = 'rgba(255,255,255,0.55)'; g.fillText('过去 12 倍弦长', pad.l, pad.t + ph + 12);
+      const dc = this.dcpF;
+      let m2 = 1;
+      for (let j = 2; j < dc.length; j++) m2 = Math.max(m2, Math.abs(dc[j]));
+      m2 = Math.min(Math.ceil(m2), 8);
+      const XR = (x) => xr + x * wr, YR = (v) => pad.t + (m2 - clamp(v, -m2, m2)) / (2 * m2) * ph;
+      line([[xr, YR(0)], [xr + wr, YR(0)]], 'rgba(255,255,255,0.25)', 1);
+      const pts = [];
+      for (let j = 0; j < dc.length; j++) pts.push([XR(F.mx[j]), YR(dc[j])]);
+      line(pts, 'rgb(255,170,80)', 1.5);
+      g.fillStyle = 'rgba(255,255,255,0.55)';
+      g.fillText(`${m2}`, xr - 14, pad.t + 8); g.fillText('ΔCp', xr - 26, YR(0) + 3);
+      g.fillText('前缘', xr, pad.t + ph + 12); g.fillText('后缘', xr + wr - 24, pad.t + ph + 12);
       return;
     }
     // spanwise circulation (lift per unit span / rho U), left tip to right tip; the fuselage's share is in
@@ -1294,14 +933,15 @@ export class AirflowViz {
   /** draw the active plane into the flow layer; returns { texture, dist } or null */
   render(renderer, camera, depthTexture, model, exposure) {
     if (!this.active || !this.layer || !model.visible || this.mode === 'surface') return null;
-    const mesh = this.mode === 'section' ? this.secMesh : this.wakeMesh;
-    this.secMesh.visible = mesh === this.secMesh; this.wakeMesh.visible = mesh === this.wakeMesh;
+    const mesh = this.mode === 'section' ? this.secMesh : this.wake.mesh;
+    this.secMesh.visible = mesh === this.secMesh; this.wake.mesh.visible = mesh === this.wake.mesh;
     const u = mesh.material.uniforms;
     u.uDepth.value = depthTexture;
     u.uRes.value.set(this.layer.width, this.layer.height);
     u.uLogFar.value = Math.log2(camera.far + 1.0);
     u.uGain.value = 0.95 * this.gain / Math.max(exposure, 1e-3);
-    u.uTime.value = this.time;
+    if (u.uTime) u.uTime.value = this.time;
+    if (u.uCam) u.uCam.value.copy(camera.position);
     mesh.matrix.copy(model.matrixWorld); mesh.matrixWorld.copy(model.matrixWorld);
     const cc = renderer.getClearColor(new THREE.Color()), ca = renderer.getClearAlpha();
     renderer.setRenderTarget(this.layer);

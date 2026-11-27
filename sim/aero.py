@@ -119,6 +119,7 @@ class AeroResult:
     cn_parts: np.ndarray | None = None
     qr: np.ndarray | None = None
     etaq: np.ndarray | None = None       # dynamic-pressure ratio of fin blanketing / body-flap shielding
+    a_s: np.ndarray | None = None        # attached lift slope of each strip (per rad, 3-D, incl. sweep)
 
 
 class AeroModel:
@@ -483,6 +484,9 @@ class AeroModel:
         res.coef = {k: 0.0 for k in ("CL", "CD", "CY", "Cl", "Cm", "Cn")}
         res.hinge = {k: 0.0 for k in ("elevon_li", "elevon_lo", "elevon_ri", "elevon_ro",
                                        "bodyflap", "rudder", "speedbrake")}
+        n = self.N
+        res.gam = np.zeros(n); res.fst = np.ones(n); res.cn_parts = np.zeros((n, 4))
+        res.qr = np.zeros(n); res.etaq = np.ones(n); res.a_s = np.zeros(n)
 
     def _detail(self, res, c0, s, z, bparts, gear_f, chute_f, misc_f, rho, V, M, wsup):
         """Per-element forces (flap increments split out), component breakdown, coefficients,
@@ -612,3 +616,4 @@ class AeroModel:
         res.cn_parts = np.stack([cna, cnf, cnv, cns], 1)
         res.qr = s["qp"] / max(res.qbar, 1e-9)
         res.etaq = np.asarray(s["etaq"], dtype=float)
+        res.a_s = np.broadcast_to(np.asarray(s["a_s"], dtype=float), res.etaq.shape).copy()

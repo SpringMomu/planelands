@@ -802,7 +802,7 @@ class Simulator:
                 # flow visualisation (web/js/world/airflow.js): strip circulations + the flow they sit in
                 "flow": {"gam": rd(r.gam, 2), "fst": rd(r.fst), "va": rd(o["v_air"]), "w": rd(self.x[10:13], 4),
                          "up": rd(o["R"][2, :], 4), "h": round(float(o["agl"]), 2), "mach": round(float(r.mach), 3),
-                         "cn": rd(r.cn_parts.ravel(), 4), "qr": rd(r.qr), "eq": rd(r.etaq)}}
+                         "cn": rd(r.cn_parts.ravel(), 4), "qr": rd(r.qr), "eq": rd(r.etaq), "as": rd(r.a_s)}}
 
     def hello_message(self):
         return {"type": "hello", "version": 1, "geometry": self.geo.raw, "world": self.geo.world,

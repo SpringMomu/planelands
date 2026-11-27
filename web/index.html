@@ -122,12 +122,12 @@
     <div class="row chk" title="V 键切换"><label><input type="checkbox" id="show-flow"> 显示机体周围气流（V）</label></div>
     <div id="flow-opts" class="off">
       <div class="row seg" id="flow-mode"><label>显示</label>
-        <button data-mode="surface" class="on" title="机体表面的压力分布和表面流线">表面压力</button>
-        <button data-mode="section" title="切开靠近相机一侧的机翼，看剖面上的流动">机翼剖面</button>
-        <button data-mode="wake" title="机翼后方截面上的下洗和尾涡">尾流截面</button></div>
+        <button data-mode="surface" class="on" title="机体表面的压力分布">表面压力</button>
+        <button data-mode="section" title="切开靠近相机一侧的机翼，剖面上的非定常流动实时计算">机翼剖面</button>
+        <button data-mode="wake" title="各条带拖出的自由尾涡面，逐帧计算卷起">尾涡</button></div>
       <div class="row off" id="flow-station-row" title="剖面的展向位置，按半翼展计"><label>剖面位置</label><input type="range" id="flow-station" min="0.25" max="0.9" step="0.01" value="0.45"><output id="flow-station-o">45 %</output></div>
-      <div class="row" title="流线上的点按这个速度移动；实际空速太快，看不清"><label>动画速度</label><input type="range" id="flow-speed" min="3" max="40" step="1" value="15"><output id="flow-speed-o">15 m/s</output></div>
-      <p class="note">由 sim/aero.py 的条带载荷每秒更新 20 次。剖面是该处翼型的二维势流，尾流截面是马蹄涡系的横向速度。</p>
+      <div class="row" title="流场按慢动作计算：来流取这个速度，诱导速度和转动同比例缩小"><label>慢放速度</label><input type="range" id="flow-speed" min="3" max="40" step="1" value="15"><output id="flow-speed-o">15 m/s</output></div>
+      <p class="note">气动数据来自 sim/aero.py，每秒 20 次。剖面用二维离散涡方法逐帧推进，前缘何时脱涡由模型的分离系数决定；尾涡面由各条带的环量放出，按毕奥-萨伐尔定律逐帧移动。</p>
     </div>
     <div class="row chk"><label><input type="checkbox" id="show-trail" checked> 显示飞行轨迹</label></div>
     <div class="row chk"><label><input type="checkbox" id="show-hud"> 平视显示器 HUD（驾驶舱外也显示）</label></div>

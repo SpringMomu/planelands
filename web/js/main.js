@@ -131,8 +131,8 @@ async function main() {
   // sparks + dust where the airframe scrapes the runway, spray from the tyres on a wet runway; the air
   // they move in (wind, wake, wing-tip vortices)
   const sparks = new Sparks(), spray = new TireSpray(), wake = new WakeField();
-  // airflow around the orbiter from the simulator's aero model: surface pressure paint, wing section,
-  // wake plane (airflow.js)
+  // airflow around the orbiter from the simulator's aero model: surface pressure paint, unsteady wing
+  // section, free vortex wake (airflow.js)
   const airflow = new AirflowViz({ shuttle, geom: geometry });
   const scrapeQ = [];                // structural contacts from the simulator, emitted at their render time
   const weather = new Weather({ U, weatherData: A.weatherData, scene });
@@ -774,7 +774,7 @@ async function main() {
       cockpit.update({ st, dt, night, sunDir: sd, sunRad: light.sunRad, amb: light.amb, exposure, rain: weather.rainCam,
         wx: st ? { dt: dt * ts, vel: vel3, wind: wind3, fall: weather.fall } : null });
     }
-    // airflow: repaint the skin, solve the section / wake plane, cut the wing (before the scene is drawn)
+    // airflow: repaint the skin, step the section / wake, cut the wing (before the scene is drawn)
     if (st) airflow.setSurfaces(st.surf);
     airflow.update(renderer, dt, camera, U.uSunIntensity.value);
     shuttle.model.updateMatrixWorld(true);
